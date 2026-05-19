@@ -67,6 +67,8 @@ class ChatServer:
         self._name_to_ws: Dict[str, object] = {}
         # username → room_id
         self._user_room: Dict[str, str] = {}
+        # room_id → {seq: sender_username}  — for ack routing
+        self._seq_to_sender: Dict[str, Dict[int, str]] = {}
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -103,6 +105,7 @@ class ChatServer:
             room.members.pop(username, None)
             if not room.members:
                 del self._rooms[room_id]
+                self._seq_to_sender.pop(room_id, None)
                 log.info("room %s dissolved (empty)", room_id)
             else:
                 await self._broadcast(room, T.USER_LEFT, username=username)
@@ -211,13 +214,74 @@ class ChatServer:
                     if not text:
                         continue
                     room.seq += 1
+                    # Track seq → sender for ack routing
+                    self._seq_to_sender.setdefault(rid, {})[room.seq] = username
+                    reply_to  = payload.get("reply_to")
+                    client_mid = payload.get("client_mid", "")
+                    extra = {"reply_to": reply_to} if reply_to else {}
                     # Relay to everyone else; sender displays locally
                     await self._broadcast(room, T.NEW_MSG,
                                           exclude=username,
                                           sender=username,
                                           text=text,
                                           encrypted=bool(payload.get("encrypted")),
-                                          seq=room.seq)
+                                          seq=room.seq,
+                                          **extra)
+                    # Echo seq + client_mid back to sender for bubble tracking
+                    await self._send(ws, T.SEND_ACK, seq=room.seq, client_mid=client_mid)
+
+                # ── TYPING ───────────────────────────────────────────────────
+                elif mtype == T.TYPING:
+                    if username:
+                        rid = self._user_room.get(username)
+                        if rid and rid in self._rooms:
+                            room = self._rooms[rid]
+                            await self._broadcast(room, T.USER_TYPING,
+                                                  exclude=username,
+                                                  username=username,
+                                                  room_id=rid,
+                                                  typing=bool(payload.get("typing", False)))
+
+                # ── MSG_ACK ──────────────────────────────────────────────────
+                elif mtype == T.MSG_ACK:
+                    if username:
+                        rid = self._user_room.get(username)
+                        seq = payload.get("seq")
+                        status = str(payload.get("status", "delivered"))
+                        if rid and seq is not None:
+                            sender_name = self._seq_to_sender.get(rid, {}).get(int(seq))
+                            if sender_name and sender_name != username \
+                                    and sender_name in self._name_to_ws:
+                                await self._send(
+                                    self._name_to_ws[sender_name],
+                                    T.MSG_STATUS,
+                                    seq=int(seq), room_id=rid,
+                                    status=status, from_user=username,
+                                )
+
+                # ── FILE_* (user-to-user routing) ────────────────────────
+                elif mtype in (T.FILE_OFFER, T.FILE_ACCEPT, T.FILE_REJECT,
+                               T.FILE_CHUNK, T.FILE_DONE, T.FILE_ERROR):
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    to_user = str(payload.get("to", ""))
+                    if to_user not in self._name_to_ws:
+                        await self._send(ws, T.ERROR,
+                                         message=f"User '{to_user}' not connected")
+                        continue
+                    target_ws = self._name_to_ws[to_user]
+                    fwd_payload = dict(payload)
+                    fwd_payload["from"] = username
+                    try:
+                        await target_ws.send(pack(
+                            T(mtype), **fwd_payload
+                        ))
+                    except websockets.exceptions.ConnectionClosed:
+                        await self._evict(to_user)
+                        self._name_to_ws.pop(to_user, None)
+                        await self._send(ws, T.ERROR,
+                                         message=f"User '{to_user}' disconnected")
 
                 # ── LIST_ROOMS ───────────────────────────────────────────────
                 elif mtype == T.LIST_ROOMS:
