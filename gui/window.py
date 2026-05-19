@@ -605,7 +605,6 @@ class Composer(QWidget):
         self._input.setFocus()
 
     def _pick_file(self):
-        import pathlib
         from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
             self, "Send File", str(pathlib.Path.home()),
@@ -1041,8 +1040,6 @@ class MainWindow(QMainWindow):
         if not self._current_peer:
             self.statusBar().showMessage("No peer to send file to", 3000)
             return
-        import pathlib
-        from file_transfer import _guess_mime
         data = pathlib.Path(path).read_bytes()
         filename = pathlib.Path(path).name
         tid = self._ft_manager.register_outgoing(self._current_peer, filename, data)
@@ -1079,7 +1076,6 @@ class MainWindow(QMainWindow):
         self._bridge.send_frame(T.FILE_ACCEPT, to=from_user, transfer_id=tid)
 
     def _on_file_accept(self, p: dict):
-        from file_transfer import file_sha256 as _sha256
         from protocol import pack as _pack
         tid = p["transfer_id"]
         info = self._ft_manager.outgoing.get(tid)
@@ -1087,20 +1083,26 @@ class MainWindow(QMainWindow):
             return
         chunks = info["chunks"]
         total = len(chunks)
-        for i, chunk_b64 in enumerate(chunks):
+
+        def send_chunk(i: int):
+            if i >= total:
+                # All chunks sent — send FILE_DONE
+                self._bridge.send_frame(T.FILE_DONE,
+                                        to=info["to"], transfer_id=tid,
+                                        sha256=file_sha256(info["data"]))
+                if card := self._ft_cards.get(tid):
+                    card.set_done()
+                self._ft_manager.outgoing.pop(tid, None)
+                return
             raw = _pack(T.FILE_CHUNK,
                         to=info["to"], transfer_id=tid,
-                        index=i, total=total, data=chunk_b64)
+                        index=i, total=total, data=chunks[i])
             self._bridge.send_raw_frame(raw)
             if card := self._ft_cards.get(tid):
                 card.set_progress(int((i + 1) / total * 100))
+            QTimer.singleShot(0, lambda: send_chunk(i + 1))
 
-        sha = _sha256(info["data"])
-        self._bridge.send_frame(T.FILE_DONE,
-                                to=info["to"], transfer_id=tid, sha256=sha)
-        if card := self._ft_cards.get(tid):
-            card.set_done()
-        self._ft_manager.outgoing.pop(tid, None)
+        send_chunk(0)
 
     def _on_file_reject(self, p: dict):
         tid = p["transfer_id"]
@@ -1116,7 +1118,6 @@ class MainWindow(QMainWindow):
             card.set_progress(pct)
 
     def _on_file_done(self, p: dict):
-        from file_transfer import file_sha256 as _sha256
         tid = p["transfer_id"]
         path = self._ft_manager.finish_incoming(tid, p["sha256"])
         if card := self._ft_cards.pop(tid, None):
