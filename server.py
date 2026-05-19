@@ -283,6 +283,37 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message=f"User '{to_user}' disconnected")
 
+                # ── LIST_USERS ──────────────────────────────────────────────
+                elif mtype == T.LIST_USERS:
+                    users = sorted(u for u in self._name_to_ws if u != username)
+                    await self._send(ws, T.USER_LIST, users=users)
+
+                # ── SEND_DM (user-to-user direct message) ───────────────────
+                elif mtype == T.SEND_DM:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    to_user = str(payload.get("to", ""))
+                    if to_user not in self._name_to_ws:
+                        await self._send(ws, T.ERROR,
+                                         message=f"User '{to_user}' not online")
+                        continue
+                    text       = str(payload.get("text", ""))
+                    client_mid = payload.get("client_mid", "")
+                    target_ws  = self._name_to_ws[to_user]
+                    try:
+                        await target_ws.send(pack(
+                            T.RECV_DM,
+                            **{"from": username, "text": text, "client_mid": client_mid}
+                        ))
+                        await self._send(ws, T.DM_ACK,
+                                         client_mid=client_mid, to=to_user)
+                    except websockets.exceptions.ConnectionClosed:
+                        await self._evict(to_user)
+                        self._name_to_ws.pop(to_user, None)
+                        await self._send(ws, T.ERROR,
+                                         message=f"User '{to_user}' disconnected")
+
                 # ── LIST_ROOMS ───────────────────────────────────────────────
                 elif mtype == T.LIST_ROOMS:
                     rooms = [

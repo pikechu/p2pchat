@@ -24,6 +24,8 @@ class T(str, Enum):
     LIST_ROOMS  = "LIST_ROOMS"
     TYPING      = "TYPING"       # {typing: bool}
     MSG_ACK     = "MSG_ACK"      # {seq: int, status: "delivered"|"read"}
+    LIST_USERS  = "LIST_USERS"   # {} — request list of online usernames
+    SEND_DM     = "SEND_DM"      # {to, text, client_mid}
 
     # file transfer (client→server, routed user-to-user)
     FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
@@ -47,6 +49,9 @@ class T(str, Enum):
     USER_TYPING  = "USER_TYPING"  # {username, room_id, typing: bool}
     MSG_STATUS   = "MSG_STATUS"   # {seq, status, from_user, room_id}
     SEND_ACK     = "SEND_ACK"     # {seq, client_mid} — echoed to original sender
+    USER_LIST    = "USER_LIST"    # {users: [str]} — response to LIST_USERS
+    RECV_DM      = "RECV_DM"      # {from, text, client_mid} — routed by server
+    DM_ACK       = "DM_ACK"       # {client_mid, to} — echo back to DM sender
 
 
 def pack(msg_type: T, **payload) -> str:

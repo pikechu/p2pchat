@@ -82,6 +82,23 @@ def make_qss(theme: str = "light") -> str:
     return f"""
     * {{ outline: none; }}
 
+    QMainWindow {{ background: {t['bg']}; }}
+    #AppRoot     {{ background: {t['bg']}; }}
+    QStackedWidget {{ background: transparent; }}
+
+    QStatusBar {{
+        background: {t['titlebar']}; color: {t['fg3']};
+        font-size: 11px; border-top: 1px solid {t['line']};
+    }}
+
+    QListWidget {{
+        background: {t['bg_input']}; border: 1px solid {t['line']};
+        border-radius: 6px; outline: none;
+    }}
+    QListWidget::item {{ padding: 8px 12px; color: {t['fg']}; border-radius: 4px; }}
+    QListWidget::item:selected {{ background: {t['bg_active']}; color: {t['fg']}; }}
+    QListWidget::item:hover {{ background: {t['bg_hover']}; }}
+
     QWidget {{
         font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
         font-size: 13px;

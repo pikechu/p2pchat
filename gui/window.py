@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QLineEdit, QTextEdit,
     QDialog, QDialogButtonBox, QFormLayout, QSizePolicy,
     QFrame, QMessageBox, QMenu, QToolButton, QApplication,
-    QCheckBox, QComboBox, QStackedWidget,
+    QCheckBox, QComboBox, QStackedWidget, QListWidget,
 )
 
 from protocol import T, unpack
@@ -325,7 +325,8 @@ class ConvPanel(QWidget):
     def _filter(self, query: str):
         q = query.lower()
         for rid, row in self._rows.items():
-            row.setVisible(not q or q in rid.lower())
+            name = row._name_lbl.text().lower()
+            row.setVisible(not q or q in rid.lower() or q in name)
 
 
 # ── Reply bar (shown above composer input when replying) ──────────────────────
@@ -780,6 +781,9 @@ class MainWindow(QMainWindow):
         self._seq_bubbles:     dict[int, BubbleWidget] = {}
         self._msg_counter = 0
 
+        # DM state: "@peer" → peer username
+        self._dms: dict[str, str] = {}
+
         # File transfer state
         downloads = pathlib.Path.home() / "Downloads" / "P2PChat"
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
@@ -805,6 +809,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
+        central.setObjectName("AppRoot")
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
@@ -813,6 +818,9 @@ class MainWindow(QMainWindow):
         self._rail = Rail()
         self._rail.set_username(self._username)
         self._rail._settings_btn.clicked.connect(self._open_settings)
+        self._rail._btns["chats"].clicked.connect(self._on_rail_chats)
+        self._rail._btns["peers"].clicked.connect(self._on_rail_peers)
+        self._rail.set_active("chats")
         root.addWidget(self._rail)
 
         self._conv = ConvPanel(self._theme)
@@ -1005,6 +1013,30 @@ class MainWindow(QMainWindow):
             if seq in self._seq_bubbles:
                 self._seq_bubbles[seq].set_status(status)
 
+        elif mtype == T.USER_LIST:
+            self._show_peers_dialog(payload.get("users", []))
+
+        elif mtype == T.RECV_DM:
+            peer   = payload.get("from", "")
+            text   = payload.get("text", "")
+            dm_id  = f"@{peer}"
+            if dm_id not in self._dms:
+                self._dms[dm_id] = peer
+                self._conv.upsert_room(dm_id, f"@ {peer}", peer, 0, False)
+                # show "Direct Message" instead of "0 members"
+                if row := self._conv._rows.get(dm_id):
+                    row.set_preview("Direct Message")
+            if self._chat.current_room_id == dm_id:
+                self._chat.add_message(peer, text, ts, outgoing=False)
+            else:
+                self._conv.set_preview(dm_id, f"{peer}: {text}", ts)
+
+        elif mtype == T.DM_ACK:
+            client_mid = payload.get("client_mid", -1)
+            if client_mid in self._pending_bubbles:
+                bubble = self._pending_bubbles.pop(client_mid)
+                bubble.set_status("sent")
+
         elif mtype == T.FILE_OFFER:
             self._on_file_offer(payload)
         elif mtype == T.FILE_ACCEPT:
@@ -1033,6 +1065,64 @@ class MainWindow(QMainWindow):
             self._is_typing = False
             if self._bridge:
                 self._bridge.send_frame(T.TYPING, typing=False)
+
+    # ── Rail navigation ──────────────────────────────────────────────────────
+
+    def _on_rail_chats(self):
+        self._rail.set_active("chats")
+
+    def _on_rail_peers(self):
+        self._rail.set_active("peers")
+        if self._bridge:
+            self._bridge.send_frame(T.LIST_USERS)
+
+    def _start_dm(self, peer: str):
+        """Open (or focus) a DM conversation with peer."""
+        dm_id = f"@{peer}"
+        if dm_id not in self._dms:
+            self._dms[dm_id] = peer
+            self._conv.upsert_room(dm_id, f"@ {peer}", peer, 0, False)
+            if row := self._conv._rows.get(dm_id):
+                row.set_preview("Direct Message")
+        self._conv.set_active(dm_id)
+        self._current_peer = peer
+        self._chat.open_room(dm_id, f"@ {peer}", [peer, self._username], False)
+        self._rail.set_active("chats")
+
+    def _show_peers_dialog(self, users: list[str]):
+        """Display online users; double-click to start a DM."""
+        dlg = QDialog(self)
+        dlg.setObjectName("Dialog")
+        dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        dlg.setModal(True)
+        dlg.setMinimumWidth(280)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 18, 20, 18)
+        lay.setSpacing(10)
+
+        lay.addWidget(_lbl("Online Users", "DialogTitle"))
+
+        if not users:
+            lay.addWidget(_lbl("No other users online right now.", "EmptyDesc"))
+        else:
+            list_w = QListWidget()
+            list_w.addItems(users)
+            list_w.itemDoubleClicked.connect(
+                lambda item: (self._start_dm(item.text()), dlg.accept())
+            )
+            lay.addWidget(list_w)
+
+            hint = _lbl("Double-click to open a direct message", "FormLabel")
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(hint)
+
+        close_btn = _btn("Close", "BtnGhost")
+        close_btn.clicked.connect(dlg.reject)
+        lay.addWidget(close_btn)
+
+        self._style_dialog(dlg)
+        dlg.exec()
 
     # ── File transfer ─────────────────────────────────────────────────────────
 
@@ -1159,7 +1249,13 @@ class MainWindow(QMainWindow):
     def _on_room_selected(self, room_id: str):
         if room_id == self._chat.current_room_id:
             return
-        if self._chat.current_room_id:
+        # DM conversations are local — no server JOIN/LEAVE
+        if room_id.startswith("@"):
+            peer = self._dms.get(room_id, room_id[1:])
+            self._current_peer = peer
+            self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
+            return
+        if self._chat.current_room_id and not self._chat.current_room_id.startswith("@"):
             self._on_typing_stop()
             self._bridge.send_frame(T.LEAVE_ROOM)
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id)
@@ -1194,6 +1290,20 @@ class MainWindow(QMainWindow):
         rid = self._chat.current_room_id
         if not rid:
             return
+
+        # DM conversation — route directly to peer
+        if rid.startswith("@"):
+            peer = self._dms.get(rid, rid[1:])
+            self._msg_counter += 1
+            client_mid = self._msg_counter
+            self._bridge.send_frame(T.SEND_DM, to=peer, text=text,
+                                    client_mid=client_mid)
+            bubble = self._chat.add_message(
+                self._username, text, time.time(), outgoing=True, seq=0)
+            self._pending_bubbles[client_mid] = bubble
+            self._conv.set_preview(rid, f"You: {text}", time.time())
+            return
+
         key   = self._rooms.get(rid, {}).get("key")
         reply = self._chat.composer.pending_reply
 
