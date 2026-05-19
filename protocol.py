@@ -22,6 +22,16 @@ class T(str, Enum):
     LEAVE_ROOM  = "LEAVE_ROOM"
     SEND_MSG    = "SEND_MSG"
     LIST_ROOMS  = "LIST_ROOMS"
+    TYPING      = "TYPING"       # {typing: bool}
+    MSG_ACK     = "MSG_ACK"      # {seq: int, status: "delivered"|"read"}
+
+    # file transfer (client→server, routed user-to-user)
+    FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
+    FILE_ACCEPT = "FILE_ACCEPT"  # {to, transfer_id}
+    FILE_REJECT = "FILE_REJECT"  # {to, transfer_id, reason}
+    FILE_CHUNK  = "FILE_CHUNK"   # {to, transfer_id, index, total, data (base64)}
+    FILE_DONE   = "FILE_DONE"    # {to, transfer_id, sha256}
+    FILE_ERROR  = "FILE_ERROR"   # {to, transfer_id, message}
 
     # server → client
     WELCOME      = "WELCOME"
@@ -34,6 +44,9 @@ class T(str, Enum):
     USER_JOINED  = "USER_JOINED"
     USER_LEFT    = "USER_LEFT"
     ROOM_LIST    = "ROOM_LIST"
+    USER_TYPING  = "USER_TYPING"  # {username, room_id, typing: bool}
+    MSG_STATUS   = "MSG_STATUS"   # {seq, status, from_user, room_id}
+    SEND_ACK     = "SEND_ACK"     # {seq, client_mid} — echoed to original sender
 
 
 def pack(msg_type: T, **payload) -> str:
