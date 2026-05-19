@@ -1,0 +1,264 @@
+"""Design tokens from the Beam design system."""
+
+from PyQt6.QtGui import QFont, QFontDatabase
+
+# ── Colour palettes ───────────────────────────────────────────────────────────
+
+TOKENS: dict[str, dict[str, str]] = {
+    "light": {
+        "bg":             "#fcfdfe",
+        "bg_sidebar":     "#f5f7fa",
+        "bg_rail":        "#eef1f5",
+        "bg_chat":        "#ffffff",
+        "bg_hover":       "#edf0f5",
+        "bg_active":      "#dbeeff",
+        "bg_input":       "#ffffff",
+        "bubble_in":      "#f1f3f6",
+        "bubble_out":     "#d9eefb",
+        "fg":             "#0a0e14",
+        "fg2":            "#3b4350",
+        "fg3":            "#6b7585",
+        "fg4":            "#9aa3b2",
+        "accent":         "#0088cc",
+        "accent_soft":    "#dbeeff",
+        "ok":             "#16a34a",
+        "warn":           "#d97706",
+        "error":          "#dc2626",
+        "offline":        "#9ca3af",
+        "line":           "#e5e9f0",
+        "line_strong":    "#d0d6e0",
+        "titlebar":       "#f0f2f5",
+        "scrollbar":      "#d0d6e0",
+    },
+    "dark": {
+        "bg":             "#0f1318",
+        "bg_sidebar":     "#141920",
+        "bg_rail":        "#0c1015",
+        "bg_chat":        "#111720",
+        "bg_hover":       "#1a2030",
+        "bg_active":      "#0d3a52",
+        "bg_input":       "#1a1f28",
+        "bubble_in":      "#1e2530",
+        "bubble_out":     "#0d3a52",
+        "fg":             "#e8edf5",
+        "fg2":            "#b0bac8",
+        "fg3":            "#788090",
+        "fg4":            "#485060",
+        "accent":         "#36a8e0",
+        "accent_soft":    "#0d3a52",
+        "ok":             "#22c55e",
+        "warn":           "#f59e0b",
+        "error":          "#ef4444",
+        "offline":        "#9ca3af",
+        "line":           "#1e2530",
+        "line_strong":    "#2a3548",
+        "titlebar":       "#0c1015",
+        "scrollbar":      "#2a3548",
+    },
+}
+
+# Deterministic avatar gradient colours (cycled by name hash)
+AVATAR_STOPS = [
+    ("#0088cc", "#5fc4ee"),
+    ("#7c5cff", "#b48bff"),
+    ("#16a34a", "#6ee7b7"),
+    ("#d97706", "#fbbf24"),
+    ("#e11d48", "#fb7185"),
+    ("#0e7490", "#67e8f9"),
+    ("#475569", "#94a3b8"),
+    ("#65a30d", "#bef264"),
+]
+
+
+def avatar_stops(name: str) -> tuple[str, str]:
+    idx = sum(ord(c) for c in name) % len(AVATAR_STOPS)
+    return AVATAR_STOPS[idx]
+
+
+# ── QSS template ──────────────────────────────────────────────────────────────
+
+def make_qss(theme: str = "light") -> str:
+    t = TOKENS[theme]
+    return f"""
+    * {{ outline: none; }}
+
+    QWidget {{
+        font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+        font-size: 13px;
+        color: {t['fg']};
+        background: transparent;
+        border: none;
+    }}
+
+    /* ── Rail ──────────────────────────────────────────── */
+    #Rail {{
+        background: {t['bg_rail']};
+        border-right: 1px solid {t['line']};
+    }}
+    #RailBtn {{
+        background: transparent;
+        color: {t['fg3']};
+        border-radius: 8px;
+        font-size: 18px;
+        padding: 0;
+    }}
+    #RailBtn:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+    #RailBtn[active=true] {{ background: {t['accent_soft']}; color: {t['accent']}; }}
+    #RailAvatar {{ border-radius: 18px; }}
+
+    /* ── Conversation panel ─────────────────────────────── */
+    #ConvPanel {{ background: {t['bg_sidebar']}; border-right: 1px solid {t['line']}; }}
+    #ConvHeader {{ background: {t['bg_sidebar']}; border-bottom: 1px solid {t['line']}; padding: 14px 16px 10px; }}
+    #ConvTitle {{ font-size: 16px; font-weight: 600; color: {t['fg']}; }}
+    #NewRoomBtn {{
+        background: {t['accent']};
+        color: white;
+        border-radius: 6px;
+        font-size: 18px;
+        font-weight: 600;
+        padding: 0;
+    }}
+    #NewRoomBtn:hover {{ background: {t['accent']}; }}
+    #SearchBox {{
+        background: {t['bg_input']};
+        border: 1px solid {t['line']};
+        border-radius: 6px;
+        padding: 6px 10px 6px 28px;
+        font-size: 13px;
+        color: {t['fg']};
+    }}
+    #SearchBox:focus {{ border-color: {t['accent']}; }}
+    #ConvScroll {{ background: {t['bg_sidebar']}; border: none; }}
+    #ConvList {{ background: {t['bg_sidebar']}; }}
+
+    /* Conv row */
+    #ConvRow {{ background: transparent; border-bottom: 1px solid {t['line']}; }}
+    #ConvRow:hover {{ background: {t['bg_hover']}; }}
+    #ConvRow[active=true] {{ background: {t['bg_active']}; }}
+    #ConvRowName {{ font-size: 13.5px; font-weight: 600; color: {t['fg']}; }}
+    #ConvRowPreview {{ font-size: 12px; color: {t['fg3']}; }}
+    #ConvRowTime {{ font-family: "IBM Plex Mono", monospace; font-size: 10px; color: {t['fg4']}; }}
+    #UnreadBadge {{
+        background: {t['accent']}; color: white;
+        font-family: "IBM Plex Mono", monospace; font-size: 10px; font-weight: 600;
+        border-radius: 9px; padding: 0 5px; min-height: 18px; min-width: 18px;
+    }}
+
+    /* ── Chat panel ─────────────────────────────────────── */
+    #ChatPanel {{ background: {t['bg_chat']}; }}
+    #ChatHeader {{
+        background: {t['bg_chat']};
+        border-bottom: 1px solid {t['line']};
+        padding: 0 16px;
+        min-height: 52px; max-height: 52px;
+    }}
+    #ChatName {{ font-size: 14.5px; font-weight: 600; color: {t['fg']}; }}
+    #ChatSub  {{ font-family: "IBM Plex Mono", monospace; font-size: 11px; color: {t['fg3']}; }}
+    #HeaderBtn {{
+        background: transparent; color: {t['fg3']};
+        border-radius: 6px; font-size: 18px; padding: 0;
+    }}
+    #HeaderBtn:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+
+    /* Messages scroll */
+    #MsgsScroll {{ background: {t['bg_chat']}; border: none; }}
+    #MsgsContainer {{ background: {t['bg_chat']}; }}
+    QScrollBar:vertical {{
+        width: 6px; background: transparent; margin: 0;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {t['scrollbar']}; border-radius: 3px; min-height: 20px;
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+
+    /* Bubbles */
+    #BubbleIn  {{
+        background: {t['bubble_in']}; border-radius: 14px;
+        border-bottom-left-radius: 4px; padding: 8px 12px;
+    }}
+    #BubbleOut {{
+        background: {t['bubble_out']}; border-radius: 14px;
+        border-bottom-right-radius: 4px; padding: 8px 12px;
+    }}
+    #BubbleSender {{ font-size: 12px; font-weight: 600; color: {t['accent']}; margin-bottom: 2px; }}
+    #BubbleText   {{ font-size: 13.5px; color: {t['fg']}; line-height: 1.45; }}
+    #BubbleTime   {{ font-family: "IBM Plex Mono", monospace; font-size: 10px; color: {t['fg4']}; margin-top: 2px; }}
+    #SysMsg {{
+        font-family: "IBM Plex Mono", monospace; font-size: 11px; color: {t['fg4']};
+        background: {t['bg_hover']}; border-radius: 10px; padding: 3px 10px;
+    }}
+    #DayMark {{
+        font-family: "IBM Plex Mono", monospace; font-size: 10.5px; color: {t['fg4']};
+        background: {t['bg_hover']}; border-radius: 10px; padding: 3px 10px;
+    }}
+
+    /* Composer */
+    #ComposerBar {{ background: {t['bg_chat']}; border-top: 1px solid {t['line']}; padding: 10px 16px 12px; }}
+    #ComposerInner {{
+        background: {t['bg_input']}; border: 1px solid {t['line']};
+        border-radius: 10px; min-height: 40px;
+    }}
+    #ComposerInput {{
+        background: transparent; font-size: 13.5px; color: {t['fg']};
+        border: none; padding: 4px 8px;
+    }}
+    #SendBtn {{
+        background: {t['accent']}; color: white;
+        border-radius: 16px; font-size: 16px; font-weight: 600;
+        min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px;
+    }}
+    #ComposerIconBtn {{
+        background: transparent; color: {t['fg3']};
+        border-radius: 6px; font-size: 16px;
+        min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
+    }}
+    #ComposerIconBtn:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+
+    /* ── Empty / placeholder ────────────────────────────── */
+    #EmptyPanel {{ background: {t['bg_chat']}; }}
+    #EmptyTitle {{ font-size: 16px; font-weight: 600; color: {t['fg2']}; }}
+    #EmptyDesc  {{ font-size: 13px; color: {t['fg3']}; }}
+
+    /* ── Dialogs ────────────────────────────────────────── */
+    #Dialog {{ background: {t['bg']}; border: 1px solid {t['line_strong']}; border-radius: 10px; }}
+    #DialogTitle {{ font-size: 15px; font-weight: 600; color: {t['fg']}; }}
+    #FormLabel {{ font-size: 12px; font-weight: 500; color: {t['fg3']}; }}
+    #FormInput {{
+        background: {t['bg_input']}; border: 1px solid {t['line']};
+        border-radius: 6px; padding: 8px 10px; font-size: 13.5px; color: {t['fg']};
+    }}
+    #FormInput:focus {{ border-color: {t['accent']}; }}
+    #BtnPrimary {{
+        background: {t['accent']}; color: white;
+        border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 500;
+    }}
+    #BtnPrimary:hover {{ background: {t['accent']}; }}
+    #BtnGhost {{
+        background: transparent; color: {t['fg2']};
+        border: 1px solid {t['line']}; border-radius: 6px;
+        padding: 8px 16px; font-size: 13px;
+    }}
+    #BtnGhost:hover {{ background: {t['bg_hover']}; }}
+
+    /* ── Settings ───────────────────────────────────────── */
+    #SettingsPanel {{ background: {t['bg_chat']}; }}
+    #SettingsGroup {{
+        background: {t['bg_sidebar']}; border: 1px solid {t['line']};
+        border-radius: 8px; padding: 4px 0;
+    }}
+    #SettingsRow {{ background: transparent; border-bottom: 1px solid {t['line']}; padding: 12px 16px; }}
+    #SettingsRow:last-child {{ border-bottom: none; }}
+    #SettingsLabel {{ font-size: 13px; color: {t['fg']}; }}
+    #SettingsValue {{ font-family: "IBM Plex Mono", monospace; font-size: 11.5px; color: {t['fg3']}; }}
+    #SettingsSectionLabel {{
+        font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+        color: {t['fg4']}; letter-spacing: 0.08em;
+    }}
+    #StatusChip {{
+        font-family: "IBM Plex Mono", monospace; font-size: 10.5px; font-weight: 500;
+        border-radius: 12px; padding: 3px 8px;
+    }}
+    #StatusChipOk    {{ background: #dcfce7; color: {t['ok']}; }}
+    #StatusChipWarn  {{ background: #fef3c7; color: {t['warn']}; }}
+    #StatusChipAccent{{ background: {t['accent_soft']}; color: {t['accent']}; }}
+    """
