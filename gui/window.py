@@ -1113,7 +1113,7 @@ class MainWindow(QMainWindow):
     def _on_file_chunk(self, p: dict):
         tid = p["transfer_id"]
         self._ft_manager.add_chunk(tid, p["index"], p["total"], p["data"])
-        pct = int((p["index"] + 1) / p["total"] * 100)
+        pct = int((p["index"] + 1) / max(p["total"], 1) * 100)
         if card := self._ft_cards.get(tid):
             card.set_progress(pct)
 

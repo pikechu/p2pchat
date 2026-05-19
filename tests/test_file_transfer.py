@@ -82,3 +82,15 @@ def test_manager_finish_incoming_rejects_bad_sha():
 
     path = mgr.finish_incoming("t3", "deadbeef" * 8)
     assert path is None   # checksum mismatch
+
+
+def test_begin_incoming_sanitizes_traversal_filename():
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    mgr = FileTransferManager(downloads_dir=tmpdir)
+    # Adversarial filename with path traversal
+    mgr.begin_incoming("t_evil", "eve", "../../../evil.txt", 5, "text/plain")
+    # Stored filename must not contain path separators
+    stored = mgr.incoming["t_evil"]["filename"]
+    assert ".." not in stored
+    assert "/" not in stored
+    assert "\\" not in stored

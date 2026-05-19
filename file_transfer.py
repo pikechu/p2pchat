@@ -49,6 +49,8 @@ class FileTransferManager:
 
     def begin_incoming(self, transfer_id: str, from_user: str,
                        filename: str, size: int, mime: str):
+        # Sanitize filename to basename only, preventing path traversal
+        filename = pathlib.Path(filename).name or "file"
         total_chunks = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
         self.incoming[transfer_id] = {
             "from":     from_user,
