@@ -1,10 +1,13 @@
 """Main application window — Beam P2P Chat desktop client."""
 
 import json
+import pathlib
 import time
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
+from file_transfer import FileTransferManager, file_sha256
+
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QLinearGradient, QBrush,
     QAction,
@@ -23,7 +26,7 @@ from .bridge import WSBridge
 from .theme import make_qss, TOKENS
 from .widgets import (
     Avatar, StatusDot, BubbleWidget, SysMsgWidget,
-    DayMarkWidget, ConvRowWidget,
+    DayMarkWidget, ConvRowWidget, TypingWidget, EmojiPanel, FileCard,
 )
 
 
@@ -171,7 +174,6 @@ class Rail(QWidget):
         lay.setSpacing(4)
         lay.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # Logo mark
         mark = QLabel("B")
         mark.setObjectName("RailBtn")
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -233,7 +235,6 @@ class ConvPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # ── Header
         header = QWidget()
         header.setObjectName("ConvHeader")
         hlay = QVBoxLayout(header)
@@ -267,7 +268,6 @@ class ConvPanel(QWidget):
 
         lay.addWidget(header)
 
-        # ── Scrollable room list
         scroll = QScrollArea()
         scroll.setObjectName("ConvScroll")
         scroll.setWidgetResizable(True)
@@ -291,9 +291,9 @@ class ConvPanel(QWidget):
                     unread: int = 0):
         if room_id in self._rows:
             return
-        row = ConvRowWidget(room_id, name, creator, members, locked, unread, self._theme)
+        row = ConvRowWidget(room_id, name, creator, members, locked, unread,
+                            self._theme, conn_state="ok")
         row.clicked.connect(self._on_row_clicked)
-        # insert before the trailing stretch
         self._list_lay.insertWidget(self._list_lay.count() - 1, row)
         self._rows[room_id] = row
 
@@ -314,6 +314,10 @@ class ConvPanel(QWidget):
         if row := self._rows.get(room_id):
             row.set_preview(text, ts)
 
+    def set_conn_state(self, room_id: str, state: str):
+        if row := self._rows.get(room_id):
+            row.set_conn_state(state)
+
     def _on_row_clicked(self, room_id: str):
         self.set_active(room_id)
         self.room_selected.emit(room_id)
@@ -322,6 +326,55 @@ class ConvPanel(QWidget):
         q = query.lower()
         for rid, row in self._rows.items():
             row.setVisible(not q or q in rid.lower())
+
+
+# ── Reply bar (shown above composer input when replying) ──────────────────────
+
+class ReplyBar(QWidget):
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ReplyBar")
+        self.setFixedHeight(46)
+        self._sender = ""
+        self._text   = ""
+        self._seq    = 0
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 8, 6)
+        lay.setSpacing(8)
+
+        icon = QLabel("↩")
+        icon.setObjectName("ReplyIcon")
+        lay.addWidget(icon)
+
+        mid = QVBoxLayout()
+        mid.setSpacing(0)
+        self._name_lbl = QLabel()
+        self._name_lbl.setObjectName("ReplyName")
+        self._text_lbl = QLabel()
+        self._text_lbl.setObjectName("ReplyPreview")
+        mid.addWidget(self._name_lbl)
+        mid.addWidget(self._text_lbl)
+        lay.addLayout(mid, 1)
+
+        cancel_btn = QPushButton("×")
+        cancel_btn.setObjectName("ReplyCancel")
+        cancel_btn.setFixedSize(22, 22)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.clicked.connect(self.cancelled)
+        lay.addWidget(cancel_btn)
+
+    def set_reply(self, sender: str, text: str, seq: int):
+        self._sender = sender
+        self._text   = text
+        self._seq    = seq
+        self._name_lbl.setText(sender)
+        self._text_lbl.setText((text[:60] + "…") if len(text) > 60 else text)
+
+    def data(self) -> dict:
+        return {"sender": self._sender, "text": self._text, "seq": self._seq}
 
 
 # ── Chat header ───────────────────────────────────────────────────────────────
@@ -357,19 +410,26 @@ class ChatHeader(QWidget):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             lay.addWidget(btn)
 
-    def update_room(self, name: str, members: list[str], locked: bool):
+    def update_room(self, name: str, members: list[str], locked: bool,
+                    conn_state: str = "ok"):
         self._avatar.set_name(name)
         self._name_lbl.setText(("🔒 " if locked else "") + name)
         count = len(members)
         self._sub_lbl.setText(f"{count} member{'s' if count != 1 else ''}")
-        self._status_dot.set_state("ok")
+        self._status_dot.set_state(conn_state)
+
+    def set_conn_state(self, state: str):
+        self._status_dot.set_state(state)
 
 
 # ── Messages area ─────────────────────────────────────────────────────────────
 
 class MessagesArea(QScrollArea):
-    def __init__(self, parent=None):
+    reply_requested = pyqtSignal(str, str, int)   # sender, text, seq
+
+    def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
+        self._theme = theme
         self.setObjectName("MsgsScroll")
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -383,10 +443,12 @@ class MessagesArea(QScrollArea):
 
         self.setWidget(self._container)
         self._last_sender: str | None = None
-        self._last_day: str | None = None
+        self._last_day:    str | None = None
 
     def add_message(self, sender: str, text: str, ts: float,
-                    outgoing: bool = False, theme: str = "light"):
+                    outgoing: bool = False,
+                    seq: int = 0,
+                    quote: dict | None = None) -> BubbleWidget:
         # Day separator
         day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         if day != self._last_day:
@@ -398,19 +460,34 @@ class MessagesArea(QScrollArea):
             self._last_sender = None
 
         show_sender = sender != self._last_sender and not outgoing
-        bubble = BubbleWidget(sender, text, ts, outgoing, show_sender, theme)
-        align  = Qt.AlignmentFlag.AlignRight if outgoing else Qt.AlignmentFlag.AlignLeft
+        bubble = BubbleWidget(sender, text, ts, outgoing, show_sender,
+                              self._theme, seq=seq, quote=quote)
+        bubble.reply_requested.connect(self.reply_requested)
+        align = Qt.AlignmentFlag.AlignRight if outgoing else Qt.AlignmentFlag.AlignLeft
         self._lay.insertWidget(self._lay.count() - 1, bubble, alignment=align)
         self._last_sender = sender
-        # Scroll to bottom
         QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
             self.verticalScrollBar().maximum()))
+        return bubble
 
     def add_sys_msg(self, text: str):
         self._lay.insertWidget(self._lay.count() - 1,
                                SysMsgWidget(text),
                                alignment=Qt.AlignmentFlag.AlignHCenter)
         self._last_sender = None
+
+    def add_file_card(self, card):
+        wrapper = QWidget()
+        lay = QHBoxLayout(wrapper)
+        lay.setContentsMargins(16, 2, 16, 2)
+        if card._outgoing:
+            lay.addStretch()
+        lay.addWidget(card)
+        if not card._outgoing:
+            lay.addStretch()
+        self._lay.insertWidget(self._lay.count() - 1, wrapper)
+        QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
+            self.verticalScrollBar().maximum()))
 
     def clear(self):
         while self._lay.count() > 1:
@@ -424,15 +501,34 @@ class MessagesArea(QScrollArea):
 # ── Composer ──────────────────────────────────────────────────────────────────
 
 class Composer(QWidget):
-    send_message = pyqtSignal(str)
+    send_message   = pyqtSignal(str)
+    typing_started = pyqtSignal()
+    typing_stopped = pyqtSignal()
+    emoji_toggled  = pyqtSignal()
+    file_selected  = pyqtSignal(str)   # file path
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ComposerBar")
+        self._reply_data: dict | None = None
+        self._was_typing = False
 
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(16, 10, 16, 12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        # Reply bar (hidden until user triggers reply)
+        self._reply_bar = ReplyBar()
+        self._reply_bar.hide()
+        self._reply_bar.cancelled.connect(self.clear_reply)
+        outer.addWidget(self._reply_bar)
+
+        # Inner composer row
+        inner_wrap = QWidget()
+        inner_wrap.setObjectName("ComposerBarInner")
+        wrap_lay = QHBoxLayout(inner_wrap)
+        wrap_lay.setContentsMargins(16, 10, 16, 12)
+        wrap_lay.setSpacing(0)
 
         inner_frame = QFrame()
         inner_frame.setObjectName("ComposerInner")
@@ -442,36 +538,81 @@ class Composer(QWidget):
 
         attach = QPushButton("📎")
         attach.setObjectName("ComposerIconBtn")
+        attach.clicked.connect(self._pick_file)
         inner_lay.addWidget(attach)
 
         self._input = QLineEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setPlaceholderText("Message…")
         self._input.returnPressed.connect(self._on_send)
+        self._input.textChanged.connect(self._on_text_changed)
         inner_lay.addWidget(self._input)
 
-        emoji = QPushButton("😊")
-        emoji.setObjectName("ComposerIconBtn")
-        inner_lay.addWidget(emoji)
+        self._emoji_btn = QPushButton("😊")
+        self._emoji_btn.setObjectName("ComposerIconBtn")
+        self._emoji_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._emoji_btn.clicked.connect(self.emoji_toggled)
+        inner_lay.addWidget(self._emoji_btn)
 
         send = QPushButton("↑")
         send.setObjectName("SendBtn")
         send.clicked.connect(self._on_send)
         inner_lay.addWidget(send)
 
-        outer.addWidget(inner_frame)
+        wrap_lay.addWidget(inner_frame)
+        outer.addWidget(inner_wrap)
+
+    def _on_text_changed(self, text: str):
+        if text and not self._was_typing:
+            self._was_typing = True
+            self.typing_started.emit()
+        elif not text and self._was_typing:
+            self._was_typing = False
+            self.typing_stopped.emit()
 
     def _on_send(self):
         text = self._input.text().strip()
         if text:
             self.send_message.emit(text)
             self._input.clear()
+            self._was_typing = False
 
     def set_enabled(self, enabled: bool):
         self._input.setEnabled(enabled)
         self._input.setPlaceholderText(
             "Message…" if enabled else "Join a room to start chatting"
         )
+
+    def set_reply(self, sender: str, text: str, seq: int):
+        self._reply_bar.set_reply(sender, text, seq)
+        self._reply_data = self._reply_bar.data()
+        self._reply_bar.show()
+        self._input.setFocus()
+
+    def clear_reply(self):
+        self._reply_data = None
+        self._reply_bar.hide()
+
+    @property
+    def pending_reply(self) -> dict | None:
+        return self._reply_data
+
+    def insert_emoji(self, emoji: str):
+        pos = self._input.cursorPosition()
+        cur = self._input.text()
+        self._input.setText(cur[:pos] + emoji + cur[pos:])
+        self._input.setCursorPosition(pos + len(emoji))
+        self._input.setFocus()
+
+    def _pick_file(self):
+        import pathlib
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Send File", str(pathlib.Path.home()),
+            "All Files (*)"
+        )
+        if path:
+            self.file_selected.emit(path)
 
 
 # ── Empty / placeholder panel ─────────────────────────────────────────────────
@@ -497,9 +638,11 @@ class EmptyPanel(QWidget):
 # ── Full chat panel ───────────────────────────────────────────────────────────
 
 class ChatPanel(QWidget):
+    reply_requested = pyqtSignal(str, str, int)   # sender, text, seq
+
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
-        self._theme  = theme
+        self._theme   = theme
         self._room_id: str | None = None
         self.setObjectName("ChatPanel")
 
@@ -521,35 +664,89 @@ class ChatPanel(QWidget):
         chat_lay.setSpacing(0)
 
         self._header  = ChatHeader()
-        self._msgs    = MessagesArea()
+        self._msgs    = MessagesArea(theme=theme)
+        self._msgs.reply_requested.connect(self.reply_requested)
+
+        # Typing indicator (between messages and emoji panel)
+        self._typing = TypingWidget(theme=theme)
+
+        # Emoji panel (toggleable)
+        self._emoji_panel = EmojiPanel(theme=theme)
+        self._emoji_panel.hide()
+
         self._composer = Composer()
         self._composer.set_enabled(False)
+        self._composer.emoji_toggled.connect(self._toggle_emoji)
+        self._composer.typing_started.connect(self._on_typing_start)
+        self._composer.typing_stopped.connect(self._on_typing_stop)
+        self._emoji_panel.emoji_selected.connect(self._composer.insert_emoji)
 
         chat_lay.addWidget(self._header)
         chat_lay.addWidget(self._msgs)
+        chat_lay.addWidget(self._typing)
+        chat_lay.addWidget(self._emoji_panel)
         chat_lay.addWidget(self._composer)
         self._stack.addWidget(self._chat_widget)
 
         self._stack.setCurrentWidget(self._empty)
 
+        # Typing signals — forwarded from composer, emitted so MainWindow can bridge
+        self._typing_started_cb = None
+        self._typing_stopped_cb = None
+
+    def set_typing_callbacks(self, start_cb, stop_cb):
+        self._typing_started_cb = start_cb
+        self._typing_stopped_cb = stop_cb
+
+    def _on_typing_start(self):
+        if self._typing_started_cb:
+            self._typing_started_cb()
+
+    def _on_typing_stop(self):
+        if self._typing_stopped_cb:
+            self._typing_stopped_cb()
+
+    def _toggle_emoji(self):
+        self._emoji_panel.setVisible(not self._emoji_panel.isVisible())
+
     def open_room(self, room_id: str, name: str,
-                  members: list[str], locked: bool):
+                  members: list[str], locked: bool, conn_state: str = "ok"):
         self._room_id = room_id
-        self._header.update_room(name, members, locked)
+        self._header.update_room(name, members, locked, conn_state)
         self._msgs.clear()
         self._composer.set_enabled(True)
+        self._composer.clear_reply()
+        self._typing.hide_typing()
+        self._emoji_panel.hide()
         self._stack.setCurrentWidget(self._chat_widget)
 
     def close_room(self):
         self._room_id = None
         self._composer.set_enabled(False)
+        self._composer.clear_reply()
+        self._typing.hide_typing()
+        self._emoji_panel.hide()
         self._stack.setCurrentWidget(self._empty)
 
-    def add_message(self, sender: str, text: str, ts: float, outgoing: bool):
-        self._msgs.add_message(sender, text, ts, outgoing, self._theme)
+    def add_message(self, sender: str, text: str, ts: float,
+                    outgoing: bool, seq: int = 0,
+                    quote: dict | None = None) -> BubbleWidget:
+        return self._msgs.add_message(sender, text, ts, outgoing, seq=seq, quote=quote)
 
     def add_sys(self, text: str):
         self._msgs.add_sys_msg(text)
+
+    def add_file_card(self, card):
+        self._msgs.add_file_card(card)
+
+    def show_typing(self, username: str):
+        self._typing.show_typing(username)
+
+    def hide_typing(self, username: str = ""):
+        self._typing.hide_typing()
+
+    def set_conn_state(self, state: str):
+        self._header.set_conn_state(state)
 
     @property
     def send_message(self):
@@ -558,6 +755,10 @@ class ChatPanel(QWidget):
     @property
     def current_room_id(self) -> str | None:
         return self._room_id
+
+    @property
+    def composer(self) -> Composer:
+        return self._composer
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -571,8 +772,27 @@ class MainWindow(QMainWindow):
         self._theme      = theme
         self._bridge: WSBridge | None = None
 
-        # In-memory state
-        self._rooms: dict[str, dict] = {}   # room_id → {name, members, locked, key}
+        # Room state: room_id → {name, members, locked, key}
+        self._rooms: dict[str, dict] = {}
+
+        # Bubble tracking for delivery receipts
+        # client_mid (local int) → BubbleWidget, moved to seq key after SEND_ACK
+        self._pending_bubbles: dict[int, BubbleWidget] = {}
+        self._seq_bubbles:     dict[int, BubbleWidget] = {}
+        self._msg_counter = 0
+
+        # File transfer state
+        downloads = pathlib.Path.home() / "Downloads" / "P2PChat"
+        self._ft_manager = FileTransferManager(downloads_dir=downloads)
+        self._ft_cards: dict[str, "FileCard"] = {}
+        self._current_peer: str = ""
+
+        # Typing state
+        self._is_typing = False
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setSingleShot(True)
+        self._typing_timer.setInterval(3000)
+        self._typing_timer.timeout.connect(self._on_typing_stop)
 
         self._build_ui()
         self._apply_theme()
@@ -580,7 +800,6 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
         self.setMinimumSize(800, 560)
 
-        # Connect after UI is ready
         QTimer.singleShot(100, self._connect)
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -605,11 +824,13 @@ class MainWindow(QMainWindow):
 
         self._chat = ChatPanel(self._theme)
         self._chat.send_message.connect(self._on_send_message)
+        self._chat.reply_requested.connect(self._on_reply_requested)
+        self._chat.set_typing_callbacks(self._on_typing_start, self._on_typing_stop)
+        self._chat.composer.file_selected.connect(self._start_file_send)
         root.addWidget(self._chat)
 
     def _apply_theme(self):
         self.setStyleSheet(make_qss(self._theme))
-        self._theme_current = self._theme
 
     # ── WebSocket connection ──────────────────────────────────────────────────
 
@@ -634,6 +855,10 @@ class MainWindow(QMainWindow):
     def _on_disconnected(self, reason: str):
         self.statusBar().showMessage(f"Disconnected: {reason}")
         self._chat.close_room()
+        # Mark all conv rows offline
+        for rid in self._rooms:
+            self._conv.set_conn_state(rid, "offline")
+            self._chat.set_conn_state("offline")
 
     # ── Incoming frame dispatcher ─────────────────────────────────────────────
 
@@ -657,8 +882,8 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("⚠  " + payload.get("message", ""), 5000)
 
         elif mtype == T.ROOM_CREATED:
-            rid  = payload["room_id"]
-            name = payload["name"]
+            rid    = payload["room_id"]
+            name   = payload["name"]
             locked = payload.get("locked", False)
             pending = self._rooms.pop("__pending__", {})
             pw  = pending.get("_pending_pw", "")
@@ -667,6 +892,7 @@ class MainWindow(QMainWindow):
                                 "locked": locked, "key": key}
             self._conv.upsert_room(rid, name, self._username, 1, locked)
             self._conv.set_active(rid)
+            self._conv.set_conn_state(rid, "ok")
             self._chat.open_room(rid, name, [self._username], locked)
 
         elif mtype == T.ROOM_JOINED:
@@ -677,10 +903,13 @@ class MainWindow(QMainWindow):
             key     = self._rooms.get(rid, {}).get("_pending_key")
             self._rooms[rid] = {"name": name, "members": members,
                                 "locked": locked, "key": key}
-            self._conv.upsert_room(rid, name, self._username,
-                                   len(members), locked)
+            self._conv.upsert_room(rid, name, self._username, len(members), locked)
             self._conv.set_active(rid)
+            self._conv.set_conn_state(rid, "ok")
             self._chat.open_room(rid, name, members, locked)
+            # Track first non-self member as file transfer peer
+            others = [m for m in members if m != self._username]
+            self._current_peer = others[0] if others else ""
 
         elif mtype == T.ROOM_LEFT:
             rid = self._chat.current_room_id
@@ -713,19 +942,35 @@ class MainWindow(QMainWindow):
             sender    = payload.get("sender", "?")
             text      = payload.get("text", "")
             encrypted = payload.get("encrypted", False)
-            rid       = payload.get("room_id", "")
+            rid       = payload.get("room_id", self._chat.current_room_id or "")
+            seq       = payload.get("seq", 0)
+            reply_to  = payload.get("reply_to")
+
+            # Decrypt if needed
             if encrypted:
-                key = self._rooms.get(rid, {}).get("key")
+                key = self._rooms.get(rid, {}).get("key") or \
+                      self._rooms.get(self._chat.current_room_id or "", {}).get("key")
                 if key:
                     plain = decrypt(key, text)
                     text  = plain if plain else "[decryption failed]"
+                    # Also decrypt reply_to.text if it was encrypted
                 else:
-                    text = "[encrypted]"
-            if rid == self._chat.current_room_id:
-                self._chat.add_message(sender, text, ts, outgoing=False)
+                    text = "[encrypted — join with room password]"
+
+            active = (rid == self._chat.current_room_id) or \
+                     (rid == "" and self._chat.current_room_id is not None)
+
+            if active:
+                self._chat.add_message(sender, text, ts, outgoing=False,
+                                       seq=seq, quote=reply_to)
+                # Received while room is visible → mark as read
+                if seq and self._bridge:
+                    self._bridge.send_frame(T.MSG_ACK, seq=seq, status="read")
             else:
-                # Update preview even if not in view
                 self._conv.set_preview(rid, f"{sender}: {text}", ts)
+                # Delivered but not yet read
+                if seq and self._bridge:
+                    self._bridge.send_frame(T.MSG_ACK, seq=seq, status="delivered")
 
         elif mtype == T.ROOM_LIST:
             for r in payload.get("rooms", []):
@@ -734,6 +979,179 @@ class MainWindow(QMainWindow):
                     r.get("members", 0), r.get("locked", False)
                 )
 
+        # ── New protocol messages ─────────────────────────────────────────────
+
+        elif mtype == T.USER_TYPING:
+            uname  = payload.get("username", "")
+            typing = payload.get("typing", False)
+            rid    = payload.get("room_id", "")
+            if rid == self._chat.current_room_id:
+                if typing:
+                    self._chat.show_typing(uname)
+                else:
+                    self._chat.hide_typing(uname)
+
+        elif mtype == T.SEND_ACK:
+            # Server confirmed our message was received and assigned a seq
+            client_mid = payload.get("client_mid", -1)
+            seq        = payload.get("seq", 0)
+            if client_mid in self._pending_bubbles:
+                bubble = self._pending_bubbles.pop(client_mid)
+                self._seq_bubbles[seq] = bubble
+                bubble.set_status("sent")
+
+        elif mtype == T.MSG_STATUS:
+            seq    = payload.get("seq", 0)
+            status = payload.get("status", "delivered")
+            if seq in self._seq_bubbles:
+                self._seq_bubbles[seq].set_status(status)
+
+        elif mtype == T.FILE_OFFER:
+            self._on_file_offer(payload)
+        elif mtype == T.FILE_ACCEPT:
+            self._on_file_accept(payload)
+        elif mtype == T.FILE_REJECT:
+            self._on_file_reject(payload)
+        elif mtype == T.FILE_CHUNK:
+            self._on_file_chunk(payload)
+        elif mtype == T.FILE_DONE:
+            self._on_file_done(payload)
+        elif mtype == T.FILE_ERROR:
+            self._on_file_error(payload)
+
+    # ── Typing ────────────────────────────────────────────────────────────────
+
+    def _on_typing_start(self):
+        if not self._is_typing:
+            self._is_typing = True
+            if self._bridge:
+                self._bridge.send_frame(T.TYPING, typing=True)
+        self._typing_timer.start()
+
+    def _on_typing_stop(self):
+        self._typing_timer.stop()
+        if self._is_typing:
+            self._is_typing = False
+            if self._bridge:
+                self._bridge.send_frame(T.TYPING, typing=False)
+
+    # ── File transfer ─────────────────────────────────────────────────────────
+
+    def _start_file_send(self, path: str):
+        if not self._current_peer:
+            self.statusBar().showMessage("No peer to send file to", 3000)
+            return
+        import pathlib
+        from file_transfer import _guess_mime
+        data = pathlib.Path(path).read_bytes()
+        filename = pathlib.Path(path).name
+        tid = self._ft_manager.register_outgoing(self._current_peer, filename, data)
+        info = self._ft_manager.outgoing[tid]
+
+        card = FileCard(tid, filename, len(data), outgoing=True, theme=self._theme)
+        card.cancel_requested.connect(self._cancel_transfer)
+        self._ft_cards[tid] = card
+        self._chat.add_file_card(card)
+
+        self._bridge.send_frame(
+            T.FILE_OFFER,
+            to=self._current_peer,
+            transfer_id=tid,
+            filename=filename,
+            size=len(data),
+            mime=info["mime"],
+        )
+
+    def _on_file_offer(self, p: dict):
+        tid, from_user = p["transfer_id"], p["from"]
+        filename = p["filename"]
+        size = p["size"]
+        mime = p.get("mime", "")
+        self._ft_manager.begin_incoming(tid, from_user, filename, size, mime)
+        self._current_peer = from_user
+
+        card = FileCard(tid, filename, size, outgoing=False, theme=self._theme)
+        card.cancel_requested.connect(self._cancel_transfer)
+        self._ft_cards[tid] = card
+        self._chat.add_file_card(card)
+
+        # Auto-accept
+        self._bridge.send_frame(T.FILE_ACCEPT, to=from_user, transfer_id=tid)
+
+    def _on_file_accept(self, p: dict):
+        from file_transfer import file_sha256 as _sha256
+        from protocol import pack as _pack
+        tid = p["transfer_id"]
+        info = self._ft_manager.outgoing.get(tid)
+        if not info:
+            return
+        chunks = info["chunks"]
+        total = len(chunks)
+        for i, chunk_b64 in enumerate(chunks):
+            raw = _pack(T.FILE_CHUNK,
+                        to=info["to"], transfer_id=tid,
+                        index=i, total=total, data=chunk_b64)
+            self._bridge.send_raw_frame(raw)
+            if card := self._ft_cards.get(tid):
+                card.set_progress(int((i + 1) / total * 100))
+
+        sha = _sha256(info["data"])
+        self._bridge.send_frame(T.FILE_DONE,
+                                to=info["to"], transfer_id=tid, sha256=sha)
+        if card := self._ft_cards.get(tid):
+            card.set_done()
+        self._ft_manager.outgoing.pop(tid, None)
+
+    def _on_file_reject(self, p: dict):
+        tid = p["transfer_id"]
+        if card := self._ft_cards.pop(tid, None):
+            card.set_error(p.get("reason", "Rejected"))
+        self._ft_manager.cancel(tid)
+
+    def _on_file_chunk(self, p: dict):
+        tid = p["transfer_id"]
+        self._ft_manager.add_chunk(tid, p["index"], p["total"], p["data"])
+        pct = int((p["index"] + 1) / p["total"] * 100)
+        if card := self._ft_cards.get(tid):
+            card.set_progress(pct)
+
+    def _on_file_done(self, p: dict):
+        from file_transfer import file_sha256 as _sha256
+        tid = p["transfer_id"]
+        path = self._ft_manager.finish_incoming(tid, p["sha256"])
+        if card := self._ft_cards.pop(tid, None):
+            if path:
+                card.set_done(save_path=str(path))
+            else:
+                card.set_error("Checksum mismatch")
+
+    def _on_file_error(self, p: dict):
+        tid = p["transfer_id"]
+        if card := self._ft_cards.pop(tid, None):
+            card.set_error(p.get("message", "Transfer error"))
+        self._ft_manager.cancel(tid)
+
+    def _cancel_transfer(self, tid: str):
+        info = self._ft_manager.outgoing.get(tid)
+        if info:
+            self._bridge.send_frame(T.FILE_ERROR,
+                                    to=info["to"], transfer_id=tid,
+                                    message="Cancelled by sender")
+        else:
+            rec = self._ft_manager.incoming.get(tid)
+            if rec:
+                self._bridge.send_frame(T.FILE_REJECT,
+                                        to=rec["from"], transfer_id=tid,
+                                        reason="Cancelled by receiver")
+        self._ft_manager.cancel(tid)
+        self._ft_cards.pop(tid, None)
+
+    # ── Reply ─────────────────────────────────────────────────────────────────
+
+    @pyqtSlot(str, str, int)
+    def _on_reply_requested(self, sender: str, text: str, seq: int):
+        self._chat.composer.set_reply(sender, text, seq)
+
     # ── User actions ──────────────────────────────────────────────────────────
 
     @pyqtSlot(str)
@@ -741,8 +1159,8 @@ class MainWindow(QMainWindow):
         if room_id == self._chat.current_room_id:
             return
         if self._chat.current_room_id:
+            self._on_typing_stop()
             self._bridge.send_frame(T.LEAVE_ROOM)
-        room = self._rooms.get(room_id, {})
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id)
 
     @pyqtSlot()
@@ -752,12 +1170,10 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         v   = dlg.values()
-        rid_placeholder = "__pending__"
-        key = derive_key(rid_placeholder, v["password"]) if v["password"] else None
-        # key will be re-derived after ROOM_CREATED returns the real room_id
-        self._rooms.setdefault(rid_placeholder, {})["_pending_key"] = key
+        key = derive_key("__pending__", v["password"]) if v["password"] else None
+        self._rooms.setdefault("__pending__", {})["_pending_key"] = key
         if v["password"]:
-            self._rooms[rid_placeholder]["_pending_pw"] = v["password"]
+            self._rooms["__pending__"]["_pending_pw"] = v["password"]
         self._bridge.send_frame(T.CREATE_ROOM, name=v["name"], password=v["password"])
 
     @pyqtSlot()
@@ -777,16 +1193,39 @@ class MainWindow(QMainWindow):
         rid = self._chat.current_room_id
         if not rid:
             return
-        key = self._rooms.get(rid, {}).get("key")
+        key   = self._rooms.get(rid, {}).get("key")
+        reply = self._chat.composer.pending_reply
+
         if key:
             enc_text  = encrypt(key, text)
             encrypted = True
         else:
             enc_text  = text
             encrypted = False
-        self._bridge.send_frame(T.SEND_MSG, text=enc_text, encrypted=encrypted)
-        self._chat.add_message(self._username, text, time.time(), outgoing=True)
+
+        self._msg_counter += 1
+        client_mid = self._msg_counter
+
+        kwargs: dict = dict(text=enc_text, encrypted=encrypted, client_mid=client_mid)
+        if reply:
+            kwargs["reply_to"] = reply
+            self._chat.composer.clear_reply()
+
+        self._bridge.send_frame(T.SEND_MSG, **kwargs)
+
+        # Show locally; bubble tracked by client_mid until SEND_ACK arrives
+        bubble = self._chat.add_message(
+            self._username, text, time.time(),
+            outgoing=True, seq=0, quote=reply
+        )
+        self._pending_bubbles[client_mid] = bubble
+
         self._conv.set_preview(rid, f"You: {text}", time.time())
+
+        # Reset typing state after send
+        if self._is_typing:
+            self._is_typing = False
+            self._typing_timer.stop()
 
     @pyqtSlot()
     def _open_settings(self):
@@ -813,13 +1252,8 @@ class MainWindow(QMainWindow):
     def _style_dialog(self, dlg: QDialog):
         dlg.setStyleSheet(self.styleSheet())
 
-    def _on_room_created_fix_key(self, rid: str, pw: str):
-        """Re-derive key with the real room_id received from server."""
-        key = derive_key(rid, pw) if pw else None
-        if rid in self._rooms:
-            self._rooms[rid]["key"] = key
-
     def closeEvent(self, event):
+        self._on_typing_stop()
         if self._bridge:
             self._bridge.close()
             self._bridge.wait(1500)

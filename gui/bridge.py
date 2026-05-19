@@ -32,6 +32,13 @@ class WSBridge(QThread):
                 self._queue.put(pack(msg_type, **payload)), self._loop
             )
 
+    def send_raw_frame(self, raw_json: str):
+        """Enqueue an already-serialised JSON frame (large file chunks)."""
+        if self._loop and self._queue:
+            asyncio.run_coroutine_threadsafe(
+                self._queue.put(raw_json), self._loop
+            )
+
     def close(self):
         if self._loop and self._queue:
             asyncio.run_coroutine_threadsafe(
