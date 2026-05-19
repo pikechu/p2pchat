@@ -2,14 +2,14 @@
 
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QPainter, QPainterPath, QLinearGradient, QColor,
-    QBrush, QPen, QFont,
+    QBrush, QPen, QFont, QAction,
 )
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QSizePolicy,
-    QFrame,
+    QFrame, QPushButton, QGridLayout, QScrollArea, QMenu,
 )
 
 from .theme import TOKENS, avatar_stops
@@ -55,12 +55,12 @@ class Avatar(QWidget):
 # ── Status dot ────────────────────────────────────────────────────────────────
 
 class StatusDot(QWidget):
-    """7×7 px coloured dot: ok / warn / offline."""
+    """9×9 px coloured dot: ok (green) / warn (amber) / offline (gray)."""
 
     _COLORS = {
-        "ok":      "#16a34a",
-        "warn":    "#d97706",
-        "offline": "#9ca3af",
+        "ok":           "#16a34a",
+        "warn":         "#d97706",
+        "offline":      "#9ca3af",
         "dark_ok":      "#22c55e",
         "dark_warn":    "#f59e0b",
         "dark_offline": "#9ca3af",
@@ -86,42 +86,213 @@ class StatusDot(QWidget):
         p.drawEllipse(0, 0, 9, 9)
 
 
+# ── Quote bar (reply preview inside bubble) ───────────────────────────────────
+
+class QuoteBar(QFrame):
+    """Quoted message shown at the top of a reply bubble."""
+
+    def __init__(self, sender: str, text: str, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self.setObjectName("QuoteBar")
+        self._theme = theme
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(1)
+
+        name_lbl = QLabel(sender)
+        name_lbl.setObjectName("QuoteSender")
+        lay.addWidget(name_lbl)
+
+        preview = text[:80] + ("…" if len(text) > 80 else "")
+        text_lbl = QLabel(preview)
+        text_lbl.setObjectName("QuoteText")
+        text_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        lay.addWidget(text_lbl)
+
+
 # ── Message bubble ────────────────────────────────────────────────────────────
 
 class BubbleWidget(QFrame):
-    """Single message bubble — in (received) or out (sent)."""
+    """Single message bubble with optional quote, status ticks, right-click reply."""
+
+    reply_requested = pyqtSignal(str, str, int)   # sender, text, seq
 
     def __init__(self, sender: str, text: str, ts: float,
                  outgoing: bool = False, show_sender: bool = True,
-                 theme: str = "light", parent=None):
+                 theme: str = "light", seq: int = 0,
+                 quote: dict | None = None, parent=None):
         super().__init__(parent)
+        self._sender   = sender
+        self._text     = text
         self._outgoing = outgoing
         self._theme    = theme
+        self._seq      = seq
         self.setObjectName("BubbleOut" if outgoing else "BubbleIn")
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
-        self.setMaximumWidth(520)
+        self.setMaximumWidth(540)
 
         vlay = QVBoxLayout(self)
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(2)
 
+        # Sender name (incoming group messages)
         if show_sender and not outgoing and sender:
             name_lbl = QLabel(sender)
             name_lbl.setObjectName("BubbleSender")
             vlay.addWidget(name_lbl)
 
+        # Quoted reply bar
+        if quote:
+            quote_bar = QuoteBar(quote.get("sender", ""), quote.get("text", ""), theme)
+            vlay.addWidget(quote_bar)
+
+        # Message text
         msg_lbl = QLabel(text)
         msg_lbl.setObjectName("BubbleText")
         msg_lbl.setWordWrap(True)
         msg_lbl.setTextFormat(Qt.TextFormat.PlainText)
         vlay.addWidget(msg_lbl)
 
+        # Time + delivery tick row
+        bottom = QHBoxLayout()
+        bottom.setSpacing(3)
+        bottom.setContentsMargins(0, 0, 0, 0)
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
         time_lbl = QLabel(time_str)
         time_lbl.setObjectName("BubbleTime")
+        bottom.addWidget(time_lbl)
+
+        if outgoing:
+            self._tick = QLabel("✓")
+            self._tick.setObjectName("TickSent")
+            bottom.addWidget(self._tick)
+
         align = Qt.AlignmentFlag.AlignRight if outgoing else Qt.AlignmentFlag.AlignLeft
-        time_lbl.setAlignment(align)
-        vlay.addWidget(time_lbl)
+        bottom_w = QWidget()
+        bottom_w.setLayout(bottom)
+        bottom_lay = QHBoxLayout()
+        bottom_lay.setContentsMargins(0, 0, 0, 0)
+        if outgoing:
+            bottom_lay.addStretch()
+        bottom_lay.addWidget(bottom_w)
+        if not outgoing:
+            bottom_lay.addStretch()
+        vlay.addLayout(bottom_lay)
+
+        # Right-click context menu
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def set_status(self, status: str):
+        """Update delivery tick. status: 'sent' | 'delivered' | 'read'."""
+        if not hasattr(self, '_tick'):
+            return
+        t = TOKENS[self._theme]
+        if status == "delivered":
+            self._tick.setText("✓✓")
+            self._tick.setObjectName("TickDelivered")
+        elif status == "read":
+            self._tick.setText("✓✓")
+            self._tick.setObjectName("TickRead")
+            self._tick.setStyleSheet(f"color: {t['accent']};")
+        self._tick.style().unpolish(self._tick)
+        self._tick.style().polish(self._tick)
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        act = menu.addAction("↩  Reply")
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen == act:
+            self.reply_requested.emit(self._sender, self._text, self._seq)
+
+
+# ── Typing indicator ──────────────────────────────────────────────────────────
+
+class TypingWidget(QLabel):
+    """Shows 'Name is typing…' — shown/hidden by MainWindow."""
+
+    def __init__(self, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        self.setObjectName("TypingIndicator")
+        self.hide()
+        # Auto-hide after 8 seconds in case USER_TYPING=false never arrives
+        self._auto_hide = QTimer(self)
+        self._auto_hide.setSingleShot(True)
+        self._auto_hide.setInterval(8000)
+        self._auto_hide.timeout.connect(self.hide)
+
+    def show_typing(self, username: str):
+        self.setText(f"  {username} is typing…")
+        self.show()
+        self._auto_hide.start()
+
+    def hide_typing(self):
+        self._auto_hide.stop()
+        self.hide()
+
+
+# ── Emoji panel ───────────────────────────────────────────────────────────────
+
+EMOJI_ROWS = [
+    # Faces
+    "😀 😂 😍 🥰 😎 😭 😤 🤔 😱 😅 🤣 😊 😇 🥳 😴 🤗 😬 🙄 😏 😒",
+    # Hands / hearts
+    "👍 👎 👌 ✌️ 🤞 🙏 👏 🤝 💪 ☝️ ❤️ 🧡 💛 💚 💙 💜 🖤 💔 💕 💯",
+    # Symbols / objects
+    "🔥 ✨ 💥 🎉 🚀 🌟 ⭐ 🎯 🏆 🎊 🎵 🎨 💎 🔑 ⚡ 🌈 ☀️ ❄️ 🌊 🍀",
+    # Animals / nature
+    "🐶 🐱 🐸 🦊 🐼 🦁 🐺 🐷 🐮 🐙 🦋 🌸 🌺 🌻 🍁 🌿 🍄 🌵 🦄 🐲",
+    # Food / misc
+    "🍕 🍔 🍣 🍜 🍺 🍻 🥂 ☕ 🍵 🧃 🍎 🍓 🍊 🍋 🥑 🌮 🍩 🎂 🍦 🍫",
+]
+
+class EmojiPanel(QWidget):
+    """Collapsible emoji picker — emits emoji_selected(str) on click."""
+
+    emoji_selected = pyqtSignal(str)
+
+    def __init__(self, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        self.setObjectName("EmojiPanel")
+        self.setFixedHeight(196)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(2)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("EmojiScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        inner = QWidget()
+        inner.setObjectName("EmojiInner")
+        grid = QVBoxLayout(inner)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.setSpacing(2)
+
+        for row_str in EMOJI_ROWS:
+            row_w = QWidget()
+            row_lay = QHBoxLayout(row_w)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(2)
+            for emoji in row_str.split():
+                btn = QPushButton(emoji)
+                btn.setObjectName("EmojiBtn")
+                btn.setFixedSize(32, 32)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.clicked.connect(lambda checked, e=emoji: self.emoji_selected.emit(e))
+                row_lay.addWidget(btn)
+            row_lay.addStretch()
+            grid.addWidget(row_w)
+
+        grid.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
 
 
 # ── System / day messages ─────────────────────────────────────────────────────
@@ -149,10 +320,12 @@ class ConvRowWidget(QWidget):
 
     def __init__(self, room_id: str, name: str, creator: str,
                  members: int = 0, locked: bool = False,
-                 unread: int = 0, theme: str = "light", parent=None):
+                 unread: int = 0, theme: str = "light",
+                 conn_state: str = "offline", parent=None):
         super().__init__(parent)
-        self._room_id = room_id
-        self._theme   = theme
+        self._room_id    = room_id
+        self._theme      = theme
+        self._conn_state = conn_state
         self.setObjectName("ConvRow")
         self.setProperty("active", False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -163,8 +336,14 @@ class ConvRowWidget(QWidget):
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(10)
 
-        self._avatar = Avatar(name, 40)
-        lay.addWidget(self._avatar)
+        # Avatar with status dot overlay
+        av_container = QWidget()
+        av_container.setFixedSize(42, 42)
+        self._avatar = Avatar(name, 40, av_container)
+        self._avatar.move(0, 0)
+        self._dot = StatusDot(conn_state, theme, av_container)
+        self._dot.move(30, 30)   # bottom-right corner of 42×42
+        lay.addWidget(av_container)
 
         mid = QVBoxLayout()
         mid.setSpacing(2)
@@ -178,7 +357,6 @@ class ConvRowWidget(QWidget):
         top_row.addWidget(self._name_lbl)
         top_row.addStretch()
 
-        t = TOKENS[theme]
         self._time_lbl = QLabel("")
         self._time_lbl.setObjectName("ConvRowTime")
         top_row.addWidget(self._time_lbl)
@@ -206,6 +384,10 @@ class ConvRowWidget(QWidget):
         self.style().unpolish(self)
         self.style().polish(self)
 
+    def set_conn_state(self, state: str):
+        """state: 'ok' | 'warn' | 'offline'"""
+        self._dot.set_state(state)
+
     def set_preview(self, text: str, ts: float = 0):
         self._prev_lbl.setText(text[:50])
         if ts:
@@ -213,3 +395,127 @@ class ConvRowWidget(QWidget):
 
     def mousePressEvent(self, _):
         self.clicked.emit(self._room_id)
+
+
+# ── File / image transfer card ────────────────────────────────────────────────
+
+import os as _os
+
+class FileCard(QFrame):
+    """Shows a file transfer in progress or completed, inside a bubble row."""
+
+    cancel_requested = pyqtSignal(str)   # transfer_id
+
+    def __init__(self, transfer_id: str, filename: str, size: int,
+                 outgoing: bool = False, thumbnail_data: bytes | None = None,
+                 theme: str = "light", parent=None):
+        super().__init__(parent)
+        self._tid      = transfer_id
+        self._filename = filename
+        self._size     = size
+        self._outgoing = outgoing
+        self._theme    = theme
+        self.setObjectName("FileCard")
+        self.setFixedWidth(280)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+
+        # Thumbnail for images
+        self._thumb_lbl: QLabel | None = None
+        if thumbnail_data:
+            from PyQt6.QtGui import QPixmap
+            pix = QPixmap()
+            if pix.loadFromData(thumbnail_data):
+                pix = pix.scaledToWidth(260,
+                    Qt.TransformationMode.SmoothTransformation)
+                self._thumb_lbl = QLabel()
+                self._thumb_lbl.setPixmap(pix)
+                self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lay.addWidget(self._thumb_lbl)
+
+        # Filename + size row
+        name_row = QHBoxLayout()
+        name_row.setSpacing(6)
+        icon = QLabel(_file_icon(filename))
+        icon.setFixedWidth(22)
+        name_row.addWidget(icon)
+
+        info = QVBoxLayout()
+        info.setSpacing(0)
+        self._name_lbl = QLabel(filename)
+        self._name_lbl.setObjectName("FileCardName")
+        self._size_lbl = QLabel(_fmt_size(size))
+        self._size_lbl.setObjectName("FileCardSize")
+        info.addWidget(self._name_lbl)
+        info.addWidget(self._size_lbl)
+        name_row.addLayout(info)
+        name_row.addStretch()
+
+        self._cancel_btn = QPushButton("✕")
+        self._cancel_btn.setObjectName("FileCardCancel")
+        self._cancel_btn.setFixedSize(22, 22)
+        self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._tid))
+        name_row.addWidget(self._cancel_btn)
+        lay.addLayout(name_row)
+
+        # Progress bar
+        from PyQt6.QtWidgets import QProgressBar
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setObjectName("FileCardProgress")
+        self._progress.setFixedHeight(4)
+        self._progress.setTextVisible(False)
+        lay.addWidget(self._progress)
+
+        # Status label
+        self._status_lbl = QLabel("Waiting…" if not outgoing else "Sending…")
+        self._status_lbl.setObjectName("FileCardStatus")
+        lay.addWidget(self._status_lbl)
+
+    def set_progress(self, pct: int):
+        self._progress.setValue(pct)
+        self._status_lbl.setText(
+            f"{'Sending' if self._outgoing else 'Receiving'} {pct}%"
+        )
+
+    def set_done(self, save_path: str | None = None):
+        self._progress.setValue(100)
+        self._cancel_btn.hide()
+        if save_path:
+            self._status_lbl.setText(f"Saved → {_os.path.basename(save_path)}")
+        else:
+            self._status_lbl.setText("Sent ✓")
+
+    def set_error(self, message: str):
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self._status_lbl.setText(f"Failed: {message}")
+        self._status_lbl.setObjectName("FileCardError")
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
+
+
+def _file_icon(filename: str) -> str:
+    ext = _os.path.splitext(filename)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        return "🖼"
+    if ext in (".mp4", ".webm", ".mov", ".avi"):
+        return "🎬"
+    if ext in (".mp3", ".wav", ".ogg", ".flac"):
+        return "🎵"
+    if ext in (".pdf",):
+        return "📄"
+    if ext in (".zip", ".tar", ".gz", ".7z"):
+        return "🗜"
+    return "📎"
+
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"

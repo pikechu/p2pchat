@@ -240,6 +240,53 @@ def make_qss(theme: str = "light") -> str:
     }}
     #BtnGhost:hover {{ background: {t['bg_hover']}; }}
 
+    /* ── Quote bar (inside bubble) ─────────────────────── */
+    #QuoteBar {{
+        background: {t['bg_hover']};
+        border-left: 3px solid {t['accent']};
+        border-radius: 4px;
+        margin-bottom: 4px;
+    }}
+    #QuoteSender {{ font-size: 11.5px; font-weight: 600; color: {t['accent']}; }}
+    #QuoteText   {{ font-size: 12px; color: {t['fg3']}; }}
+
+    /* ── Status ticks ───────────────────────────────────── */
+    #TickSent      {{ font-size: 10px; color: {t['fg4']}; }}
+    #TickDelivered {{ font-size: 10px; color: {t['fg3']}; }}
+    #TickRead      {{ font-size: 10px; color: {t['accent']}; }}
+
+    /* ── Typing indicator ───────────────────────────────── */
+    #TypingIndicator {{
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 11px; color: {t['fg4']};
+        padding: 2px 20px 4px;
+    }}
+
+    /* ── Reply bar (above composer input) ───────────────── */
+    #ReplyBar {{
+        background: {t['accent_soft']};
+        border-left: 3px solid {t['accent']};
+        border-radius: 4px;
+    }}
+    #ReplyName    {{ font-size: 11.5px; font-weight: 600; color: {t['accent']}; }}
+    #ReplyPreview {{ font-size: 12px; color: {t['fg3']}; }}
+    #ReplyCancel  {{
+        background: transparent; color: {t['fg3']};
+        border-radius: 4px; font-size: 16px;
+        max-width: 22px; max-height: 22px; padding: 0;
+    }}
+    #ReplyCancel:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+
+    /* ── Emoji panel ────────────────────────────────────── */
+    #EmojiPanel {{ background: {t['bg_chat']}; border-top: 1px solid {t['line']}; }}
+    #EmojiScroll {{ background: transparent; border: none; }}
+    #EmojiInner  {{ background: transparent; }}
+    #EmojiBtn {{
+        background: transparent; font-size: 18px;
+        border: none; border-radius: 6px; padding: 0;
+    }}
+    #EmojiBtn:hover {{ background: {t['bg_hover']}; }}
+
     /* ── Settings ───────────────────────────────────────── */
     #SettingsPanel {{ background: {t['bg_chat']}; }}
     #SettingsGroup {{
@@ -261,4 +308,26 @@ def make_qss(theme: str = "light") -> str:
     #StatusChipOk    {{ background: #dcfce7; color: {t['ok']}; }}
     #StatusChipWarn  {{ background: #fef3c7; color: {t['warn']}; }}
     #StatusChipAccent{{ background: {t['accent_soft']}; color: {t['accent']}; }}
+
+    /* ── File card ─────────────────────────────────────────── */
+    #FileCard {{
+        background: {t['bg_hover']};
+        border: 1px solid {t['line']};
+        border-radius: 10px;
+    }}
+    #FileCardName  {{ font-size: 13px; font-weight: 600; color: {t['fg']}; }}
+    #FileCardSize  {{ font-family: "IBM Plex Mono", monospace; font-size: 11px; color: {t['fg3']}; }}
+    #FileCardStatus {{ font-family: "IBM Plex Mono", monospace; font-size: 11px; color: {t['fg3']}; }}
+    #FileCardError  {{ font-size: 11px; color: {t['error']}; }}
+    #FileCardCancel {{
+        background: transparent; color: {t['fg3']};
+        border-radius: 4px; font-size: 12px; padding: 0;
+    }}
+    #FileCardCancel:hover {{ background: {t['bg_hover']}; color: {t['error']}; }}
+    QProgressBar#FileCardProgress {{
+        background: {t['line']}; border-radius: 2px; border: none;
+    }}
+    QProgressBar#FileCardProgress::chunk {{
+        background: {t['accent']}; border-radius: 2px;
+    }}
     """
