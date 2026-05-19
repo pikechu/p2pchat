@@ -255,8 +255,35 @@ class ChatClient:
             elif mtype == T.NEW_MSG:
                 sender    = payload.get("sender", "?")
                 encrypted = payload.get("encrypted", False)
+                seq       = payload.get("seq", 0)
+                reply_to  = payload.get("reply_to")
                 log.debug("MSG  from=%s  encrypted=%s  room=%s", sender, encrypted, self._room_id)
+                if reply_to:
+                    q_name = reply_to.get("sender", "")
+                    q_text = reply_to.get("text", "")[:60]
+                    console.print(f"[dim]  ↩ {q_name}: {q_text}[/dim]")
                 self._show_msg(sender, payload.get("text", ""), encrypted, ts)
+                # Ack as read (terminal = message immediately visible)
+                if seq:
+                    import asyncio
+                    asyncio.ensure_future(self._send(T.MSG_ACK, seq=seq, status="read"))
+
+            elif mtype == T.USER_TYPING:
+                uname  = payload.get("username", "")
+                typing = payload.get("typing", False)
+                if typing:
+                    _sys(f"{uname} is typing…")
+                log.debug("USER_TYPING  user=%s  typing=%s", uname, typing)
+
+            elif mtype == T.SEND_ACK:
+                log.debug("SEND_ACK  seq=%s  mid=%s",
+                          payload.get("seq"), payload.get("client_mid"))
+
+            elif mtype == T.MSG_STATUS:
+                seq    = payload.get("seq")
+                status = payload.get("status", "")
+                user   = payload.get("from_user", "")
+                log.debug("MSG_STATUS  seq=%s  status=%s  from=%s", seq, status, user)
 
             elif mtype == T.ROOM_LIST:
                 rooms = payload.get("rooms", [])

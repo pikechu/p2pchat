@@ -878,6 +878,14 @@ class MainWindow(QMainWindow):
         mtype   = msg.get("type", "")
         payload = msg.get("payload", {})
         ts      = msg.get("ts", time.time())
+        try:
+            self._dispatch_frame(mtype, payload, ts)
+        except Exception as exc:
+            import traceback
+            self.statusBar().showMessage(f"Frame error ({mtype}): {exc}", 6000)
+            traceback.print_exc()
+
+    def _dispatch_frame(self, mtype: str, payload: dict, ts: float):
 
         if mtype == T.WELCOME:
             pass
