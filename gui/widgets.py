@@ -621,7 +621,9 @@ class ImageCard(QFrame):
 
 
 class VideoCard(QFrame):
-    """Video file card with open button for completed video transfers."""
+    """Video file card: shows progress + cancel while transferring, open button when done."""
+
+    cancel_requested = pyqtSignal(str)   # transfer_id
 
     def __init__(self, transfer_id: str, filename: str, size: int,
                  outgoing: bool = False, parent=None):
@@ -652,21 +654,53 @@ class VideoCard(QFrame):
         info.addWidget(size_lbl)
         row.addLayout(info, 1)
 
+        self._cancel_btn = QPushButton("✕")
+        self._cancel_btn.setObjectName("FileCardCancel")
+        self._cancel_btn.setFixedSize(22, 22)
+        self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._tid))
+        row.addWidget(self._cancel_btn)
+
         self._open_btn = QPushButton("▶ 打开")
         self._open_btn.setObjectName("BtnGhost")
         self._open_btn.setEnabled(False)
+        self._open_btn.hide()
         self._open_btn.clicked.connect(self._open)
         row.addWidget(self._open_btn)
         lay.addLayout(row)
 
+        from PyQt6.QtWidgets import QProgressBar
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setObjectName("FileCardProgress")
+        self._progress.setFixedHeight(4)
+        self._progress.setTextVisible(False)
+        lay.addWidget(self._progress)
+
+        self._status_lbl = QLabel("Waiting…" if not outgoing else "Sending…")
+        self._status_lbl.setObjectName("FileCardStatus")
+        lay.addWidget(self._status_lbl)
+
     def set_progress(self, pct: int):
-        pass  # video card has no progress bar; upload tracked elsewhere
+        self._progress.setValue(pct)
+        self._status_lbl.setText(
+            f"{'Sending' if self._outgoing else 'Receiving'} {pct}%"
+        )
 
     def set_error(self, message: str):
-        pass
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self._status_lbl.setText(f"Failed: {message}")
+        self._status_lbl.setObjectName("FileCardError")
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
 
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
+        self._progress.hide()
+        self._cancel_btn.hide()
+        self._status_lbl.hide()
+        self._open_btn.show()
         if save_path:
             self._open_btn.setEnabled(True)
 
