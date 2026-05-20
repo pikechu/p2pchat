@@ -8,10 +8,18 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
+
+
+def _resource(relative: str) -> str:
+    """Resolve path for both dev and PyInstaller packaged builds."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
 
 # Windows: force UTF-8 so chat messages with any charset render correctly
 # sys.stdout/stderr are None in --windowed (no console) packaged builds
@@ -35,6 +43,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Beam")
     app.setApplicationDisplayName("Beam — P2P Chat")
+
+    icon_path = _resource(os.path.join("assets", "icon.png"))
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     # Prompt for username if not supplied
     username = args.name

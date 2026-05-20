@@ -28,7 +28,11 @@ from rich.panel import Panel
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['PYTHONUTF8'] = '1'
 
-console = Console()
+if sys.platform == "win32" and sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+import io as _io
+console = Console(file=_io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace') if hasattr(sys.stdout, 'buffer') else sys.stdout)
 
 SERVICE_NAME = "p2pchat"
 SERVER_FILES = ["server.py", "protocol.py", "requirements-server.txt"]

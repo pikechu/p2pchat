@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
@@ -117,6 +118,9 @@ def build(debug: bool = False):
         elif d.is_file():
             d.unlink()
 
+    icon_ico = ROOT / "assets" / "icon.ico"
+    icon_png = ROOT / "assets" / "icon.png"
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -125,6 +129,12 @@ def build(debug: bool = False):
 
     if not debug:
         cmd.append("--windowed")   # hide console in release
+
+    if icon_ico.exists():
+        cmd += [f"--icon={icon_ico}"]
+
+    if icon_png.exists():
+        cmd += [f"--add-data={icon_png}{os.pathsep}assets"]
 
     for imp in HIDDEN_IMPORTS:
         cmd += ["--hidden-import", imp]
