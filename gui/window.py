@@ -22,7 +22,7 @@ if not _log.handlers:
 from file_transfer import (FileTransferManager, file_sha256,
                            split_file, reassemble_chunks, guess_mime)
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QLinearGradient, QBrush,
     QAction,
@@ -41,7 +41,8 @@ from .bridge import WSBridge
 from .theme import make_qss, TOKENS
 from .widgets import (
     Avatar, StatusDot, BubbleWidget, SysMsgWidget,
-    DayMarkWidget, ConvRowWidget, TypingWidget, EmojiPanel, FileCard,
+    DayMarkWidget, ConvRowWidget, TypingWidget, EmojiPanel,
+    FileCard, ImageCard, VideoCard,
 )
 
 
@@ -554,14 +555,28 @@ class Composer(QWidget):
 
         attach = QPushButton("📎")
         attach.setObjectName("ComposerIconBtn")
+        attach.setToolTip("发送文件")
         attach.clicked.connect(self._pick_file)
         inner_lay.addWidget(attach)
+
+        img_btn = QPushButton("🖼")
+        img_btn.setObjectName("ComposerIconBtn")
+        img_btn.setToolTip("发送图片")
+        img_btn.clicked.connect(self._pick_image)
+        inner_lay.addWidget(img_btn)
+
+        vid_btn = QPushButton("🎬")
+        vid_btn.setObjectName("ComposerIconBtn")
+        vid_btn.setToolTip("发送视频")
+        vid_btn.clicked.connect(self._pick_video)
+        inner_lay.addWidget(vid_btn)
 
         self._input = QLineEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setPlaceholderText("Message…")
         self._input.returnPressed.connect(self._on_send)
         self._input.textChanged.connect(self._on_text_changed)
+        self._input.installEventFilter(self)
         inner_lay.addWidget(self._input)
 
         self._emoji_btn = QPushButton("😊")
@@ -620,11 +635,49 @@ class Composer(QWidget):
         self._input.setCursorPosition(pos + len(emoji))
         self._input.setFocus()
 
+    def eventFilter(self, obj, event):
+        if obj is self._input and event.type() == QEvent.Type.KeyPress:
+            if (event.key() == Qt.Key.Key_V and
+                    event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                cb = QApplication.clipboard()
+                img = cb.image()
+                if not img.isNull():
+                    import tempfile
+                    tmp = pathlib.Path(tempfile.mktemp(suffix=".png"))
+                    img.save(str(tmp))
+                    self.file_selected.emit(str(tmp))
+                    return True
+                md = cb.mimeData()
+                if md and md.hasUrls():
+                    for url in md.urls():
+                        if url.isLocalFile():
+                            self.file_selected.emit(url.toLocalFile())
+                            return True
+        return super().eventFilter(obj, event)
+
     def _pick_file(self):
         from PyQt6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
             self, "Send File", str(pathlib.Path.home()),
             "All Files (*)"
+        )
+        if path:
+            self.file_selected.emit(path)
+
+    def _pick_image(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "发送图片", str(pathlib.Path.home()),
+            "Images (*.png *.jpg *.jpeg *.gif *.webp)"
+        )
+        if path:
+            self.file_selected.emit(path)
+
+    def _pick_video(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "发送视频", str(pathlib.Path.home()),
+            "Videos (*.mp4 *.webm *.mov *.avi)"
         )
         if path:
             self.file_selected.emit(path)
@@ -1408,6 +1461,7 @@ class MainWindow(QMainWindow):
         tid       = p["transfer_id"]
         filename  = p["filename"]
         size      = p["size"]
+        mime      = p.get("mime", "")
         from_user = p.get("from_user", "?")
         room_id   = p.get("room_id", "")
         sha       = p["sha256"]
@@ -1431,10 +1485,17 @@ class MainWindow(QMainWindow):
 
         # Update sender's upload card or create receiver's card in chat
         if card := self._ft_cards.pop(tid, None):
+            if mime.startswith("image/"):
+                card.show_thumbnail(data)
             card.set_done(save_path=str(save_path))
         elif room_id == self._chat.current_room_id:
-            new_card = FileCard(tid, filename, size, outgoing=False,
-                                theme=self._theme)
+            if mime.startswith("image/"):
+                new_card = ImageCard(tid, filename, data, outgoing=False)
+            elif mime.startswith("video/"):
+                new_card = VideoCard(tid, filename, size, outgoing=False)
+            else:
+                new_card = FileCard(tid, filename, size, outgoing=False,
+                                    theme=self._theme)
             new_card.set_done(save_path=str(save_path))
             self._chat.add_file_card(new_card)
 

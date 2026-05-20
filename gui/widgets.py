@@ -497,6 +497,17 @@ class FileCard(QFrame):
         self._status_lbl.style().unpolish(self._status_lbl)
         self._status_lbl.style().polish(self._status_lbl)
 
+    def show_thumbnail(self, data: bytes):
+        """Insert an image thumbnail at the top of the card (for images sent by self)."""
+        from PyQt6.QtGui import QPixmap
+        pix = QPixmap()
+        if pix.loadFromData(data):
+            pix = pix.scaledToWidth(260, Qt.TransformationMode.SmoothTransformation)
+            thumb = QLabel()
+            thumb.setPixmap(pix)
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.layout().insertWidget(0, thumb)
+
 
 def _file_icon(filename: str) -> str:
     ext = _os.path.splitext(filename)[1].lower()
@@ -519,3 +530,99 @@ def _fmt_size(n: int) -> str:
             return f"{n:.0f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+class ImageCard(QFrame):
+    """Inline image display for completed image transfers. Click to open."""
+
+    def __init__(self, transfer_id: str, filename: str, image_data: bytes,
+                 outgoing: bool = False, parent=None):
+        super().__init__(parent)
+        self._tid      = transfer_id
+        self._outgoing = outgoing
+        self._save_path: str | None = None
+        self.setObjectName("FileCard")
+        self.setFixedWidth(280)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(4)
+
+        from PyQt6.QtGui import QPixmap
+        pix = QPixmap()
+        if pix.loadFromData(image_data):
+            pix = pix.scaledToWidth(268, Qt.TransformationMode.SmoothTransformation)
+            img_lbl = QLabel()
+            img_lbl.setPixmap(pix)
+            img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(img_lbl)
+
+        cap_row = QHBoxLayout()
+        cap_row.setSpacing(4)
+        cap_row.addWidget(QLabel("🖼"))
+        name_lbl = QLabel(filename)
+        name_lbl.setObjectName("FileCardName")
+        cap_row.addWidget(name_lbl, 1)
+        lay.addLayout(cap_row)
+
+    def set_done(self, save_path: str | None = None):
+        self._save_path = save_path
+
+    def mousePressEvent(self, event):
+        if self._save_path and _os.path.exists(self._save_path):
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
+        super().mousePressEvent(event)
+
+
+class VideoCard(QFrame):
+    """Video file card with open button for completed video transfers."""
+
+    def __init__(self, transfer_id: str, filename: str, size: int,
+                 outgoing: bool = False, parent=None):
+        super().__init__(parent)
+        self._tid      = transfer_id
+        self._outgoing = outgoing
+        self._save_path: str | None = None
+        self.setObjectName("FileCard")
+        self.setFixedWidth(280)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        icon = QLabel("🎬")
+        icon.setFixedWidth(28)
+        row.addWidget(icon)
+
+        info = QVBoxLayout()
+        info.setSpacing(0)
+        name_lbl = QLabel(filename)
+        name_lbl.setObjectName("FileCardName")
+        size_lbl = QLabel(_fmt_size(size))
+        size_lbl.setObjectName("FileCardSize")
+        info.addWidget(name_lbl)
+        info.addWidget(size_lbl)
+        row.addLayout(info, 1)
+
+        self._open_btn = QPushButton("▶ 打开")
+        self._open_btn.setObjectName("BtnGhost")
+        self._open_btn.setEnabled(False)
+        self._open_btn.clicked.connect(self._open)
+        row.addWidget(self._open_btn)
+        lay.addLayout(row)
+
+    def set_done(self, save_path: str | None = None):
+        self._save_path = save_path
+        if save_path:
+            self._open_btn.setEnabled(True)
+
+    def _open(self):
+        if self._save_path and _os.path.exists(self._save_path):
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
