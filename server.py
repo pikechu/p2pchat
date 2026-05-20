@@ -85,8 +85,9 @@ class ChatServer:
         self._user_room: Dict[str, str] = {}
         # room_id → {seq: sender_username}  — for ack routing
         self._seq_to_sender: Dict[str, Dict[int, str]] = {}
-        # transfer_id → pending room-upload state
-        self._pending_uploads: Dict[str, dict] = {}
+        # transfer_id → {room_id, from_user, filename, size, mime}
+        # Chunks are NOT stored — relayed immediately to avoid memory blowup
+        self._transfer_meta: Dict[str, dict] = {}
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -127,6 +128,10 @@ class ChatServer:
                 log.info("room %s dissolved (empty)", room_id)
             else:
                 await self._broadcast(room, T.USER_LEFT, username=username)
+        # Clean up any in-progress transfers started by this user
+        stale = [t for t, m in self._transfer_meta.items() if m["from_user"] == username]
+        for t in stale:
+            self._transfer_meta.pop(t, None)
 
     async def _leave(self, username: str, ws):
         """Graceful leave — also notifies remaining members."""
@@ -310,6 +315,7 @@ class ChatServer:
                                          message=f"User '{to_user}' disconnected")
 
                 # ── FILE_ROOM_* (room-broadcast file sharing) ────────────
+                # Chunks are relayed immediately — never buffered server-side.
                 elif mtype == T.FILE_ROOM_SHARE:
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
@@ -327,54 +333,58 @@ class ChatServer:
                                          message=f"文件过大（最大 {MAX_FILE_BYTES//1024//1024} MB）")
                         continue
                     tid = str(payload.get("transfer_id", ""))
-                    self._pending_uploads[tid] = {
+                    fname = str(payload.get("filename", "file"))
+                    mime  = str(payload.get("mime", ""))
+                    self._transfer_meta[tid] = {
                         "room_id":   rid,
                         "from_user": username,
-                        "filename":  str(payload.get("filename", "file")),
+                        "filename":  fname,
                         "size":      size,
-                        "mime":      str(payload.get("mime", "")),
-                        "chunks":    [],
+                        "mime":      mime,
                     }
+                    # Announce to other room members so they can prepare a card
+                    room = self._rooms.get(rid)
+                    if room:
+                        await self._broadcast(room, T.FILE_ROOM_SHARE,
+                                              exclude=username,
+                                              transfer_id=tid, filename=fname,
+                                              size=size, mime=mime,
+                                              from_user=username, room_id=rid)
 
                 elif mtype == T.FILE_ROOM_CHUNK:
-                    tid   = str(payload.get("transfer_id", ""))
-                    entry = self._pending_uploads.get(tid)
-                    if entry is None:
+                    tid  = str(payload.get("transfer_id", ""))
+                    meta = self._transfer_meta.get(tid)
+                    if meta is None:
                         continue
-                    idx   = int(payload.get("index", 0))
-                    total = int(payload.get("total", 1))
-                    # Grow list to fit
-                    while len(entry["chunks"]) < total:
-                        entry["chunks"].append(None)
-                    entry["chunks"][idx] = payload.get("data", "")
+                    room = self._rooms.get(meta["room_id"])
+                    if room:
+                        # Relay chunk immediately — no storage
+                        await self._broadcast(room, T.FILE_ROOM_CHUNK,
+                                              exclude=username,
+                                              transfer_id=tid,
+                                              index=int(payload.get("index", 0)),
+                                              total=int(payload.get("total", 1)),
+                                              data=payload.get("data", ""))
 
                 elif mtype == T.FILE_ROOM_DONE:
-                    tid   = str(payload.get("transfer_id", ""))
-                    entry = self._pending_uploads.pop(tid, None)
-                    if entry is None:
+                    tid  = str(payload.get("transfer_id", ""))
+                    meta = self._transfer_meta.pop(tid, None)
+                    if meta is None:
                         continue
-                    room = self._rooms.get(entry["room_id"])
-                    if not room:
-                        continue
-                    sha = str(payload.get("sha256", ""))
-                    log.info("file '%s' (%d B) shared by %s in room %s",
-                             entry["filename"], entry["size"],
-                             entry["from_user"], entry["room_id"])
-                    for m_ws in list(room.members.values()):
-                        try:
-                            await m_ws.send(pack(
-                                T.FILE_ROOM_AVAILABLE,
-                                transfer_id=tid,
-                                filename=entry["filename"],
-                                size=entry["size"],
-                                mime=entry["mime"],
-                                from_user=entry["from_user"],
-                                room_id=entry["room_id"],
-                                sha256=sha,
-                                chunks=entry["chunks"],
-                            ))
-                        except websockets.exceptions.ConnectionClosed:
-                            pass
+                    room = self._rooms.get(meta["room_id"])
+                    if room:
+                        log.info("file '%s' (%d B) shared by %s in room %s",
+                                 meta["filename"], meta["size"],
+                                 meta["from_user"], meta["room_id"])
+                        await self._broadcast(room, T.FILE_ROOM_DONE,
+                                              exclude=username,
+                                              transfer_id=tid,
+                                              sha256=str(payload.get("sha256", "")),
+                                              filename=meta["filename"],
+                                              size=meta["size"],
+                                              mime=meta["mime"],
+                                              from_user=meta["from_user"],
+                                              room_id=meta["room_id"])
 
                 # ── LIST_USERS ──────────────────────────────────────────────
                 elif mtype == T.LIST_USERS:

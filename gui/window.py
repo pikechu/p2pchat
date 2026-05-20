@@ -1269,8 +1269,12 @@ class MainWindow(QMainWindow):
             self._on_file_done(payload)
         elif mtype == T.FILE_ERROR:
             self._on_file_error(payload)
-        elif mtype == T.FILE_ROOM_AVAILABLE:
-            self._on_file_room_available(payload)
+        elif mtype == T.FILE_ROOM_SHARE:
+            self._on_file_room_share(payload)
+        elif mtype == T.FILE_ROOM_CHUNK:
+            self._on_file_room_chunk(payload)
+        elif mtype == T.FILE_ROOM_DONE:
+            self._on_file_room_done(payload)
         elif mtype == T.FILE_ROOM_ERROR:
             self._on_file_room_error(payload)
 
@@ -1384,20 +1388,39 @@ class MainWindow(QMainWindow):
         chunks = split_file(data)
         total  = len(chunks)
 
-        card = FileCard(tid, filename, len(data), outgoing=True, theme=self._theme)
-        card.cancel_requested.connect(self._cancel_transfer)
+        mime = guess_mime(filename)
+        if mime.startswith("image/"):
+            card = ImageCard(tid, filename, data, outgoing=True)
+        elif mime.startswith("video/"):
+            card = VideoCard(tid, filename, len(data), outgoing=True)
+        else:
+            card = FileCard(tid, filename, len(data), outgoing=True, theme=self._theme)
+        if hasattr(card, "cancel_requested"):
+            card.cancel_requested.connect(self._cancel_transfer)
         self._ft_cards[tid] = card
         self._chat.add_file_card(card)
 
         self._bridge.send_frame(T.FILE_ROOM_SHARE,
                                 room_id=rid, transfer_id=tid,
-                                filename=filename, size=len(data),
-                                mime=guess_mime(filename))
+                                filename=filename, size=len(data), mime=mime)
 
         def _send_chunk(i: int):
             if i >= total:
                 self._bridge.send_frame(T.FILE_ROOM_DONE,
                                         transfer_id=tid, sha256=sha)
+                # Sender: save locally and mark done immediately
+                self._ft_cards.pop(tid, None)
+                save_path = self._ft_manager._dir / filename
+                stem, suffix = save_path.stem, save_path.suffix
+                counter = 1
+                while save_path.exists():
+                    save_path = self._ft_manager._dir / f"{stem}_{counter}{suffix}"
+                    counter += 1
+                save_path.write_bytes(data)
+                card.set_done(save_path=str(save_path))
+                room_name = self._rooms.get(rid, {}).get("name", rid)
+                self._files_panel.add_file(filename, self._username,
+                                           room_name, len(data), str(save_path))
                 return
             self._bridge.send_raw_frame(_pack(T.FILE_ROOM_CHUNK,
                                               transfer_id=tid, index=i,
@@ -1496,49 +1519,68 @@ class MainWindow(QMainWindow):
         self._ft_manager.cancel(tid)
         self._ft_cards.pop(tid, None)
 
-    def _on_file_room_available(self, p: dict):
+    def _on_file_room_share(self, p: dict):
+        """Server relayed a FILE_ROOM_SHARE announcement — another user is sending a file."""
         tid       = p["transfer_id"]
         filename  = p["filename"]
-        size      = p["size"]
+        size      = int(p["size"])
         mime      = p.get("mime", "")
         from_user = p.get("from_user", "?")
         room_id   = p.get("room_id", "")
-        sha       = p["sha256"]
-        chunks    = p.get("chunks", [])
 
-        data = reassemble_chunks([c for c in chunks if c is not None])
-        if file_sha256(data) != sha:
-            _log.error("FILE_ROOM_AVAILABLE checksum mismatch tid=%s", tid)
+        self._ft_manager.begin_incoming(tid, from_user, filename, size, mime)
+
+        if room_id != self._chat.current_room_id:
+            return
+        card = FileCard(tid, filename, size, outgoing=False, theme=self._theme)
+        self._ft_cards[tid] = card
+        self._chat.add_file_card(card)
+
+    def _on_file_room_chunk(self, p: dict):
+        """Server relayed a FILE_ROOM_CHUNK — accumulate into ft_manager."""
+        tid   = p["transfer_id"]
+        index = int(p.get("index", 0))
+        total = int(p.get("total", 1))
+        self._ft_manager.add_chunk(tid, index, total, p.get("data", ""))
+        pct = int((index + 1) / max(total, 1) * 100)
+        if card := self._ft_cards.get(tid):
+            card.set_progress(pct)
+
+    def _on_file_room_done(self, p: dict):
+        """Server relayed FILE_ROOM_DONE — verify checksum, save, update UI."""
+        tid       = p["transfer_id"]
+        sha       = p["sha256"]
+        filename  = p.get("filename", "")
+        size      = int(p.get("size", 0))
+        mime      = p.get("mime", "")
+        from_user = p.get("from_user", "?")
+        room_id   = p.get("room_id", "")
+
+        save_path = self._ft_manager.finish_incoming(tid, sha)
+        if save_path is None:
+            _log.error("FILE_ROOM_DONE checksum mismatch tid=%s", tid)
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("校验失败")
             return
 
-        # Save to downloads dir (sender gets a local copy too)
-        save_path = self._ft_manager._dir / filename
-        stem, suffix = save_path.stem, save_path.suffix
-        counter = 1
-        while save_path.exists():
-            save_path = self._ft_manager._dir / f"{stem}_{counter}{suffix}"
-            counter += 1
-        save_path.write_bytes(data)
-
-        # Update sender's upload card or create receiver's card in chat
+        # Replace progress FileCard with appropriate display card
         if card := self._ft_cards.pop(tid, None):
             if mime.startswith("image/"):
-                card.show_thumbnail(data)
-            card.set_done(save_path=str(save_path))
-        elif room_id == self._chat.current_room_id:
-            if mime.startswith("image/"):
+                data = save_path.read_bytes()
                 new_card = ImageCard(tid, filename, data, outgoing=False)
+                new_card.set_done(save_path=str(save_path))
+                self._chat.add_file_card(new_card)
+                card.setParent(None)
+                card.deleteLater()
             elif mime.startswith("video/"):
                 new_card = VideoCard(tid, filename, size, outgoing=False)
+                new_card.set_done(save_path=str(save_path))
+                self._chat.add_file_card(new_card)
+                card.setParent(None)
+                card.deleteLater()
             else:
-                new_card = FileCard(tid, filename, size, outgoing=False,
-                                    theme=self._theme)
-            new_card.set_done(save_path=str(save_path))
-            self._chat.add_file_card(new_card)
+                card.set_done(save_path=str(save_path))
 
-        # Add to files panel
         room_name = self._rooms.get(room_id, {}).get("name", room_id)
         self._files_panel.add_file(filename, from_user, room_name,
                                    size, str(save_path))
