@@ -89,7 +89,9 @@ def make_qss(theme: str = "light") -> str:
     QStatusBar {{
         background: {t['titlebar']}; color: {t['fg3']};
         font-size: 11px; border-top: 1px solid {t['line']};
+        padding: 0px; margin: 0px;
     }}
+    QStatusBar::item {{ border: none; }}
 
     QListWidget {{
         background: {t['bg_input']}; border: 1px solid {t['line']};

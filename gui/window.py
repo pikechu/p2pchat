@@ -988,6 +988,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Beam — P2P Chat")
         self.resize(1100, 720)
         self.setMinimumSize(800, 560)
+        self.statusBar().setSizeGripEnabled(False)
 
         QTimer.singleShot(100, self._connect)
 

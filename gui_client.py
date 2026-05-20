@@ -24,7 +24,7 @@ if sys.platform == "win32":
 
 def main():
     parser = argparse.ArgumentParser(description="Beam P2P Chat — GUI client")
-    parser.add_argument("--server", default="ws://localhost:8765",
+    parser.add_argument("--server", default="ws://106.55.8.122:8765",
                         help="Server WebSocket URL")
     parser.add_argument("--name",   default="",
                         help="Your display name")
