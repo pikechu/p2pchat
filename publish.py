@@ -46,7 +46,7 @@ def _parse_target(target: str) -> tuple[str, str, list[str], list[str]]:
 
 def _run(cmd: list[str]) -> tuple[int, str]:
     """运行本地命令，返回 (returncode, combined_output)。"""
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     out = (r.stdout + r.stderr).strip()
     return r.returncode, out
 
@@ -54,7 +54,7 @@ def _run(cmd: list[str]) -> tuple[int, str]:
 def _ssh(target: str, port_args: list[str], cmd: str) -> tuple[int, str]:
     full = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
             *port_args, target, cmd]
-    r = subprocess.run(full, capture_output=True, text=True)
+    r = subprocess.run(full, capture_output=True, text=True, encoding='utf-8', errors='replace')
     out = (r.stdout + r.stderr).strip()
     return r.returncode, out
 
@@ -63,7 +63,7 @@ def _scp(files: list[str], target: str, remote_dir: str,
          port_args: list[str]) -> tuple[int, str]:
     cmd = ["scp", "-o", "ConnectTimeout=10", *port_args,
            *files, f"{target}:{remote_dir}/"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     return r.returncode, (r.stdout + r.stderr).strip()
 
 

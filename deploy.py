@@ -15,6 +15,7 @@ P2P Chat — 一键部署服务端到 VPS
   - VPS 已安装 Python 3 + pip3（Ubuntu/Debian 可自动安装）
 """
 
+import os
 import argparse
 import base64
 import subprocess
@@ -23,6 +24,9 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['PYTHONUTF8'] = '1'
 
 console = Console()
 
@@ -50,7 +54,7 @@ def _ssh(target: str, port_args: list[str], cmd: str,
          desc: str, check: bool = True) -> subprocess.CompletedProcess:
     full_cmd = ["ssh", "-o", "ConnectTimeout=10", *port_args, target, cmd]
     console.print(f"  [dim]▶ {cmd[:90]}[/dim]")
-    result = subprocess.run(full_cmd, capture_output=True, text=True)
+    result = subprocess.run(full_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     if check and result.returncode != 0:
         console.print(f"[red]✗ {desc} 失败[/red]")
         err = (result.stderr or result.stdout).strip()
@@ -65,7 +69,7 @@ def _scp(files: list[str], target: str, remote_dir: str,
     cmd = ["scp", "-o", "ConnectTimeout=10", *port_args,
            *files, f"{target}:{remote_dir}/"]
     console.print(f"  [dim]▶ scp {' '.join(files)} → {target}:{remote_dir}/[/dim]")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     if result.returncode != 0:
         console.print("[red]✗ 文件上传失败[/red]")
         err = (result.stderr or result.stdout).strip()
