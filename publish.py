@@ -162,7 +162,7 @@ def task_vps_update(target: str, port_args: list[str], scp_args: list[str],
         scp_req_code, _ = _scp([req], target, remote_dir, scp_args)
         if scp_req_code == 0:
             _ssh(target, port_args,
-                 f"cd {remote_dir} && pip3 install -q -r {req}")
+                 f"cd {remote_dir} && python3 -m pip install -q -r {req}")
 
     # 重启服务
     code, out = _ssh(target, port_args,

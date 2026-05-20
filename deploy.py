@@ -115,7 +115,7 @@ def _step_install(target: str, port_args: list[str], remote_dir: str) -> None:
              "安装 python3")
 
     _ssh(target, port_args,
-         f"cd {remote_dir} && pip3 install -q -r requirements-server.txt",
+         f"cd {remote_dir} && python3 -m pip install -q -r requirements-server.txt",
          "安装依赖")
     console.print("[green]  ✓ 依赖已安装[/green]")
 
