@@ -14,9 +14,12 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 
 # Windows: force UTF-8 so chat messages with any charset render correctly
+# sys.stdout/stderr are None in --windowed (no console) packaged builds
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stdout:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 def main():
