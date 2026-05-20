@@ -113,6 +113,15 @@ def _step_install(target: str, port_args: list[str], remote_dir: str) -> None:
         _ssh(target, port_args,
              "sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip",
              "安装 python3")
+    else:
+        # python3 存在但 pip 可能没装
+        pip_check = _ssh(target, port_args,
+                         "python3 -m pip --version", "检测 pip", check=False)
+        if pip_check.returncode != 0:
+            console.print("  [yellow]pip 未找到，尝试 apt 安装...[/yellow]")
+            _ssh(target, port_args,
+                 "sudo apt-get update -qq && sudo apt-get install -y python3-pip",
+                 "安装 pip")
 
     _ssh(target, port_args,
          f"cd {remote_dir} && python3 -m pip install -q -r requirements-server.txt",
