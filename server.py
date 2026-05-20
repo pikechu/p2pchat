@@ -12,6 +12,7 @@ Run:  python server.py [--host 0.0.0.0] [--port 8765]
 
 import asyncio
 import argparse
+import hashlib
 import logging
 import random
 import time
@@ -44,12 +45,17 @@ def _new_room_id(existing: set) -> str:
 
 # ── Data model ───────────────────────────────────────────────────────────────
 
+def _hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+
 @dataclass
 class Room:
     id: str
     name: str
     creator: str
     locked: bool = False          # True when a password was set at creation
+    password_hash: str = ""       # SHA-256 of the creation password; "" = open
     created_at: float = field(default_factory=time.time)
     seq: int = 0
     # username → websocket
@@ -158,12 +164,14 @@ class ChatServer:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
                     room_name = str(payload.get("name", f"{username}'s room"))[:64]
-                    locked    = bool(payload.get("password", ""))
+                    pw        = str(payload.get("password", ""))
+                    locked    = bool(pw)
                     # leave current room if any
                     if username in self._user_room:
                         await self._leave(username, ws)
                     rid  = _new_room_id(set(self._rooms))
-                    room = Room(id=rid, name=room_name, creator=username, locked=locked)
+                    room = Room(id=rid, name=room_name, creator=username,
+                                locked=locked, password_hash=_hash_password(pw) if pw else "")
                     room.members[username] = ws
                     self._rooms[rid]       = room
                     self._user_room[username] = rid
@@ -182,6 +190,11 @@ class ChatServer:
                                          message=f"Room '{rid}' does not exist")
                         continue
                     room = self._rooms[rid]
+                    if room.locked:
+                        pw = str(payload.get("password", ""))
+                        if _hash_password(pw) != room.password_hash:
+                            await self._send(ws, T.ERROR, message="Wrong password")
+                            continue
                     if username in self._user_room:
                         await self._leave(username, ws)
                     room.members[username] = ws

@@ -1,0 +1,377 @@
+"""
+Integration tests: full chat flow — create room, join, send messages, leave.
+Starts a real server subprocess; tests run over real WebSocket connections.
+"""
+import asyncio
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+import pytest
+import websockets
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from protocol import T, pack, unpack
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="module")
+def server_port():
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=os.path.join(os.path.dirname(__file__), ".."),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.8)
+    yield port
+    proc.terminate()
+    proc.wait()
+
+
+@pytest.fixture()
+def event_loop():
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+async def _connect(port: int, name: str):
+    """Connect and set username. Returns the websocket."""
+    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+    frame = unpack(await ws.recv())
+    assert frame["type"] == T.WELCOME
+    await ws.send(pack(T.SET_NAME, name=name))
+    frame = unpack(await ws.recv())   # SYSTEM "welcome, <name>"
+    assert frame["type"] == T.SYSTEM
+    return ws
+
+
+async def _recv(ws, timeout=3) -> dict:
+    return unpack(await asyncio.wait_for(ws.recv(), timeout=timeout))
+
+
+# ── SET_NAME ──────────────────────────────────────────────────────────────────
+
+def test_set_name_welcome(server_port, event_loop):
+    async def run():
+        ws = await websockets.connect(f"ws://127.0.0.1:{server_port}")
+        frame = unpack(await ws.recv())
+        assert frame["type"] == T.WELCOME
+
+        await ws.send(pack(T.SET_NAME, name="tester_name"))
+        frame = await _recv(ws)
+        assert frame["type"] == T.SYSTEM
+        await ws.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_duplicate_name_rejected(server_port, event_loop):
+    async def run():
+        ws1 = await _connect(server_port, "dup_user")
+        ws2 = await websockets.connect(f"ws://127.0.0.1:{server_port}")
+        await ws2.recv()  # WELCOME
+
+        await ws2.send(pack(T.SET_NAME, name="dup_user"))
+        frame = await _recv(ws2)
+        assert frame["type"] == T.ERROR
+
+        await ws1.close()
+        await ws2.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── CREATE_ROOM ───────────────────────────────────────────────────────────────
+
+def test_create_room_returns_room_id(server_port, event_loop):
+    async def run():
+        ws = await _connect(server_port, "creator1")
+        await ws.send(pack(T.CREATE_ROOM, name="My Room"))
+        frame = await _recv(ws)
+        assert frame["type"] == T.ROOM_CREATED
+        assert "room_id" in frame["payload"]
+        assert len(frame["payload"]["room_id"]) == 6
+        await ws.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_create_room_with_password_is_locked(server_port, event_loop):
+    async def run():
+        ws = await _connect(server_port, "creator2")
+        await ws.send(pack(T.CREATE_ROOM, name="Secret", password="pw123"))
+        frame = await _recv(ws)
+        assert frame["type"] == T.ROOM_CREATED
+        assert frame["payload"].get("locked") is True
+        await ws.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── JOIN_ROOM ─────────────────────────────────────────────────────────────────
+
+def test_join_room_notifies_creator(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_j1")
+        await alice.send(pack(T.CREATE_ROOM, name="Join Test"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_j1")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+
+        frame_bob = await _recv(bob)
+        assert frame_bob["type"] == T.ROOM_JOINED
+        assert frame_bob["payload"]["room_id"] == room_id
+
+        frame_alice = await _recv(alice)
+        assert frame_alice["type"] == T.USER_JOINED
+        assert frame_alice["payload"]["username"] == "bob_j1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_join_locked_room_wrong_password_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_pw1")
+        await alice.send(pack(T.CREATE_ROOM, name="Locked", password="correct"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_pw1")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id, password="wrong"))
+        frame = await _recv(bob)
+        assert frame["type"] == T.ERROR
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_join_locked_room_correct_password_succeeds(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_pw2")
+        await alice.send(pack(T.CREATE_ROOM, name="Locked2", password="secret"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_pw2")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id, password="secret"))
+        frame = await _recv(bob)
+        assert frame["type"] == T.ROOM_JOINED
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_join_nonexistent_room_returns_error(server_port, event_loop):
+    async def run():
+        ws = await _connect(server_port, "lost_user")
+        await ws.send(pack(T.JOIN_ROOM, room_id="XXXXXX"))
+        frame = await _recv(ws)
+        assert frame["type"] == T.ERROR
+        await ws.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── SEND_MSG / NEW_MSG ────────────────────────────────────────────────────────
+
+def test_send_msg_delivered_to_other_members(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_msg1")
+        await alice.send(pack(T.CREATE_ROOM, name="Chat Room"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_msg1")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(bob)    # ROOM_JOINED
+        await _recv(alice)  # USER_JOINED
+
+        await alice.send(pack(T.SEND_MSG, room_id=room_id, text="hello bob"))
+        frame = await _recv(bob)
+        assert frame["type"] == T.NEW_MSG
+        assert frame["payload"]["text"] == "hello bob"
+        assert frame["payload"]["sender"] == "alice_msg1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_send_msg_not_echoed_to_sender(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_msg2")
+        await alice.send(pack(T.CREATE_ROOM, name="Echo Test"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_msg2")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(bob)    # ROOM_JOINED
+        await _recv(alice)  # USER_JOINED
+
+        await alice.send(pack(T.SEND_MSG, room_id=room_id, text="test"))
+        # alice should NOT receive NEW_MSG; she gets SEND_ACK instead
+        frame = await _recv(alice)
+        assert frame["type"] != T.NEW_MSG
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_multiple_members_all_receive_message(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_multi")
+        await alice.send(pack(T.CREATE_ROOM, name="Multi Room"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_multi")
+        carol = await _connect(server_port, "carol_multi")
+
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(bob)
+        await _recv(alice)  # USER_JOINED bob
+
+        await carol.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(carol)
+        await _recv(alice)  # USER_JOINED carol
+        await _recv(bob)    # USER_JOINED carol
+
+        await alice.send(pack(T.SEND_MSG, room_id=room_id, text="hi all"))
+
+        frame_bob = await _recv(bob)
+        frame_carol = await _recv(carol)
+        assert frame_bob["type"] == T.NEW_MSG
+        assert frame_carol["type"] == T.NEW_MSG
+        assert frame_bob["payload"]["text"] == "hi all"
+        assert frame_carol["payload"]["text"] == "hi all"
+
+        await alice.close()
+        await bob.close()
+        await carol.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── LEAVE_ROOM ────────────────────────────────────────────────────────────────
+
+def test_leave_room_notifies_remaining_members(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_leave")
+        await alice.send(pack(T.CREATE_ROOM, name="Leave Test"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_leave")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(bob)
+        await _recv(alice)  # USER_JOINED
+
+        await bob.send(pack(T.LEAVE_ROOM, room_id=room_id))
+        frame_bob = await _recv(bob)
+        assert frame_bob["type"] == T.ROOM_LEFT
+
+        frame_alice = await _recv(alice)
+        assert frame_alice["type"] == T.USER_LEFT
+        assert frame_alice["payload"]["username"] == "bob_leave"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_destroyed_when_last_member_leaves(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_last")
+        await alice.send(pack(T.CREATE_ROOM, name="Temp Room"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        await alice.send(pack(T.LEAVE_ROOM, room_id=room_id))
+        await _recv(alice)  # ROOM_LEFT
+
+        # Room should be gone — another user can't join it
+        bob = await _connect(server_port, "bob_last")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        frame = await _recv(bob)
+        assert frame["type"] == T.ERROR
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── LIST_ROOMS ────────────────────────────────────────────────────────────────
+
+def test_list_rooms_contains_created_room(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_list")
+        await alice.send(pack(T.CREATE_ROOM, name="Listed Room"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_list")
+        await bob.send(pack(T.LIST_ROOMS))
+        frame = await _recv(bob)
+        assert frame["type"] == T.ROOM_LIST
+        room_ids = [r["id"] for r in frame["payload"].get("rooms", [])]
+        assert room_id in room_ids
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+# ── DM ────────────────────────────────────────────────────────────────────────
+
+def test_dm_delivered_to_recipient(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_dm")
+        bob = await _connect(server_port, "bob_dm")
+
+        await alice.send(pack(T.SEND_DM, to="bob_dm", text="hey", client_mid="mid1"))
+        frame = await _recv(bob)
+        assert frame["type"] == T.RECV_DM
+        assert frame["payload"]["from"] == "alice_dm"
+        assert frame["payload"]["text"] == "hey"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_dm_to_unknown_user_returns_error(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "alice_dm2")
+        await alice.send(pack(T.SEND_DM, to="ghost", text="hello", client_mid="mid2"))
+        frame = await _recv(alice)
+        assert frame["type"] == T.ERROR
+        await alice.close()
+
+    event_loop.run_until_complete(run())
