@@ -732,8 +732,12 @@ class ChatPanel(QWidget):
         chat_lay.setSpacing(0)
 
         self._header  = ChatHeader()
-        self._msgs    = MessagesArea(theme=theme)
-        self._msgs.reply_requested.connect(self.reply_requested)
+
+        # Per-room message areas — keyed by room_id
+        self._msgs_by_room: dict[str, MessagesArea] = {}
+        self._msgs_stack = QStackedWidget()
+        self._msgs_placeholder = QWidget()   # shown when no room is active
+        self._msgs_stack.addWidget(self._msgs_placeholder)
 
         # Typing indicator (between messages and emoji panel)
         self._typing = TypingWidget(theme=theme)
@@ -750,7 +754,7 @@ class ChatPanel(QWidget):
         self._emoji_panel.emoji_selected.connect(self._composer.insert_emoji)
 
         chat_lay.addWidget(self._header)
-        chat_lay.addWidget(self._msgs)
+        chat_lay.addWidget(self._msgs_stack, 1)
         chat_lay.addWidget(self._typing)
         chat_lay.addWidget(self._emoji_panel)
         chat_lay.addWidget(self._composer)
@@ -781,31 +785,54 @@ class ChatPanel(QWidget):
                   members: list[str], locked: bool, conn_state: str = "ok"):
         self._room_id = room_id
         self._header.update_room(name, members, locked, conn_state)
-        self._msgs.clear()
+
+        if room_id not in self._msgs_by_room:
+            msgs = MessagesArea(theme=self._theme)
+            msgs.reply_requested.connect(self.reply_requested)
+            self._msgs_by_room[room_id] = msgs
+            self._msgs_stack.addWidget(msgs)
+
+        self._msgs_stack.setCurrentWidget(self._msgs_by_room[room_id])
         self._composer.set_enabled(True)
         self._composer.clear_reply()
         self._typing.hide_typing()
         self._emoji_panel.hide()
         self._stack.setCurrentWidget(self._chat_widget)
 
-    def close_room(self):
+    def close_room(self, remove_history: bool = False):
+        rid = self._room_id
         self._room_id = None
+        self._msgs_stack.setCurrentWidget(self._msgs_placeholder)
+
+        if remove_history and rid and rid in self._msgs_by_room:
+            msgs = self._msgs_by_room.pop(rid)
+            self._msgs_stack.removeWidget(msgs)
+            msgs.deleteLater()
+
         self._composer.set_enabled(False)
         self._composer.clear_reply()
         self._typing.hide_typing()
         self._emoji_panel.hide()
         self._stack.setCurrentWidget(self._empty)
 
+    def _active_msgs(self) -> MessagesArea | None:
+        w = self._msgs_stack.currentWidget()
+        return w if isinstance(w, MessagesArea) else None
+
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool, seq: int = 0,
-                    quote: dict | None = None) -> BubbleWidget:
-        return self._msgs.add_message(sender, text, ts, outgoing, seq=seq, quote=quote)
+                    quote: dict | None = None) -> BubbleWidget | None:
+        if msgs := self._active_msgs():
+            return msgs.add_message(sender, text, ts, outgoing, seq=seq, quote=quote)
+        return None
 
     def add_sys(self, text: str):
-        self._msgs.add_sys_msg(text)
+        if msgs := self._active_msgs():
+            msgs.add_sys_msg(text)
 
     def add_file_card(self, card):
-        self._msgs.add_file_card(card)
+        if msgs := self._active_msgs():
+            msgs.add_file_card(card)
 
     def show_typing(self, username: str):
         self._typing.show_typing(username)
@@ -840,7 +867,8 @@ class _FileRow(QWidget):
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(10)
 
-        icon = QLabel("📄")
+        from .widgets import _file_icon
+        icon = QLabel(_file_icon(filename))
         icon.setFixedWidth(26)
         lay.addWidget(icon)
 
@@ -928,6 +956,8 @@ class MainWindow(QMainWindow):
 
         # Room state: room_id → {name, members, locked, key}
         self._rooms: dict[str, dict] = {}
+        # True when we're leaving a room to join/create another (don't remove sidebar entry)
+        self._implicit_leave: bool = False
 
         # Bubble tracking for delivery receipts
         # client_mid (local int) → BubbleWidget, moved to seq key after SEND_ACK
@@ -1102,9 +1132,15 @@ class MainWindow(QMainWindow):
         elif mtype == T.ROOM_LEFT:
             rid = self._chat.current_room_id
             if rid:
-                self._rooms.pop(rid, None)
-                self._conv.remove_room(rid)
-                self._chat.close_room()
+                if self._implicit_leave:
+                    # Switching to another room — preserve sidebar entry and history
+                    self._implicit_leave = False
+                    self._chat.close_room(remove_history=False)
+                else:
+                    # Explicit leave or room dissolved — discard
+                    self._rooms.pop(rid, None)
+                    self._conv.remove_room(rid)
+                    self._chat.close_room(remove_history=True)
 
         elif mtype == T.USER_JOINED:
             uname = payload.get("username", "")
@@ -1533,6 +1569,7 @@ class MainWindow(QMainWindow):
             return
         if self._chat.current_room_id and not self._chat.current_room_id.startswith("@"):
             self._on_typing_stop()
+            self._implicit_leave = True
             self._bridge.send_frame(T.LEAVE_ROOM)
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id)
 
@@ -1552,6 +1589,8 @@ class MainWindow(QMainWindow):
         if v["password"]:
             self._rooms["__pending__"]["_pending_pw"] = v["password"]
         _log.info("CREATE_ROOM request: name=%r locked=%s", v["name"], bool(v["password"]))
+        if self._chat.current_room_id:
+            self._implicit_leave = True
         self._bridge.send_frame(T.CREATE_ROOM, name=v["name"], password=v["password"])
 
     @pyqtSlot()
@@ -1568,6 +1607,8 @@ class MainWindow(QMainWindow):
         rid = v["room_id"]
         key = derive_key(rid, v["password"]) if v["password"] else None
         self._rooms.setdefault(rid, {})["_pending_key"] = key
+        if self._chat.current_room_id:
+            self._implicit_leave = True
         self._bridge.send_frame(T.JOIN_ROOM, room_id=rid, password=v["password"])
 
     @pyqtSlot(str)
@@ -1585,7 +1626,8 @@ class MainWindow(QMainWindow):
                                     client_mid=client_mid)
             bubble = self._chat.add_message(
                 self._username, text, time.time(), outgoing=True, seq=0)
-            self._pending_bubbles[client_mid] = bubble
+            if bubble:
+                self._pending_bubbles[client_mid] = bubble
             self._conv.set_preview(rid, f"You: {text}", time.time())
             return
 
@@ -1614,7 +1656,8 @@ class MainWindow(QMainWindow):
             self._username, text, time.time(),
             outgoing=True, seq=0, quote=reply
         )
-        self._pending_bubbles[client_mid] = bubble
+        if bubble:
+            self._pending_bubbles[client_mid] = bubble
 
         self._conv.set_preview(rid, f"You: {text}", time.time())
 
