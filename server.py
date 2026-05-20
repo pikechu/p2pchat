@@ -2,7 +2,7 @@
 P2P Chat — Relay Server
 
 Responsibilities:
-  - Room lifecycle (create / join / leave / auto-destroy when empty)
+  - Room lifecycle (create / join / leave / persist permanently until creator deletes)
   - Message routing (broadcast to room members)
   - Username uniqueness enforcement
 
@@ -13,7 +13,9 @@ Run:  python server.py [--host 0.0.0.0] [--port 8765]
 import asyncio
 import argparse
 import hashlib
+import json
 import logging
+import pathlib
 import random
 import time
 from dataclasses import dataclass, field
@@ -73,6 +75,8 @@ class Room:
 
 MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB per room-shared file
 
+_ROOMS_FILE = pathlib.Path.home() / ".p2pchat_rooms.json"
+
 
 class ChatServer:
     def __init__(self):
@@ -87,7 +91,40 @@ class ChatServer:
         self._seq_to_sender: Dict[str, Dict[int, str]] = {}
         # transfer_id → {room_id, from_user, filename, size, mime}
         # Chunks are NOT stored — relayed immediately to avoid memory blowup
+        self._load_rooms()
         self._transfer_meta: Dict[str, dict] = {}
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load_rooms(self):
+        if not _ROOMS_FILE.exists():
+            return
+        try:
+            data = json.loads(_ROOMS_FILE.read_text(encoding="utf-8"))
+            for r in data.get("rooms", []):
+                room = Room(
+                    id=r["id"], name=r["name"], creator=r["creator"],
+                    locked=r.get("locked", False),
+                    password_hash=r.get("password_hash", ""),
+                    created_at=r.get("created_at", time.time()),
+                )
+                self._rooms[room.id] = room
+            log.info("loaded %d room(s) from %s", len(self._rooms), _ROOMS_FILE)
+        except Exception as exc:
+            log.error("failed to load rooms: %s", exc)
+
+    def _save_rooms(self):
+        try:
+            data = {"rooms": [
+                {"id": r.id, "name": r.name, "creator": r.creator,
+                 "locked": r.locked, "password_hash": r.password_hash,
+                 "created_at": r.created_at}
+                for r in self._rooms.values()
+            ]}
+            _ROOMS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                                   encoding="utf-8")
+        except Exception as exc:
+            log.error("failed to save rooms: %s", exc)
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -116,18 +153,22 @@ class ChatServer:
         for u in dead:
             await self._evict(u)
 
+    async def _broadcast_global(self, msg_type: T, **payload):
+        """Broadcast to every connected user."""
+        for ws in list(self._name_to_ws.values()):
+            await self._send(ws, msg_type, **payload)
+
     async def _evict(self, username: str):
         """Remove a user from their room without sending a LEAVE frame."""
         room_id = self._user_room.pop(username, None)
         if room_id and room_id in self._rooms:
             room = self._rooms[room_id]
             room.members.pop(username, None)
-            if not room.members:
-                del self._rooms[room_id]
-                self._seq_to_sender.pop(room_id, None)
-                log.info("room %s dissolved (empty)", room_id)
-            else:
+            # Rooms persist even when empty — never auto-delete
+            if room.members:
                 await self._broadcast(room, T.USER_LEFT, username=username)
+            else:
+                log.info("room %s is now empty (persisted)", room_id)
         # Clean up any in-progress transfers started by this user
         stale = [t for t, m in self._transfer_meta.items() if m["from_user"] == username]
         for t in stale:
@@ -195,6 +236,7 @@ class ChatServer:
                     self._user_room[username] = rid
                     await self._send(ws, T.ROOM_CREATED,
                                      room_id=rid, name=room_name, locked=locked)
+                    self._save_rooms()
                     log.info("room %s '%s' created by %s", rid, room_name, username)
 
                 # ── JOIN_ROOM ────────────────────────────────────────────────
@@ -221,6 +263,7 @@ class ChatServer:
                                      room_id=rid,
                                      name=room.name,
                                      locked=room.locked,
+                                     creator=room.creator,
                                      members=list(room.members))
                     await self._broadcast(room, T.USER_JOINED,
                                           exclude=username, username=username)
@@ -428,9 +471,33 @@ class ChatServer:
                             "locked":  r.locked,
                         }
                         for r in self._rooms.values()
-                        if r.members
                     ]
                     await self._send(ws, T.ROOM_LIST, rooms=rooms)
+
+                # ── DELETE_ROOM ──────────────────────────────────────────────
+                elif mtype == T.DELETE_ROOM:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    rid = str(payload.get("room_id", "")).strip().upper()
+                    room = self._rooms.get(rid)
+                    if room is None:
+                        await self._send(ws, T.ERROR,
+                                         message=f"Room '{rid}' does not exist")
+                        continue
+                    if room.creator != username:
+                        await self._send(ws, T.ERROR,
+                                         message="Only the creator can delete this room")
+                        continue
+                    # Kick all current members out
+                    for uname, mws in list(room.members.items()):
+                        self._user_room.pop(uname, None)
+                        await self._send(mws, T.ROOM_LEFT)
+                    del self._rooms[rid]
+                    self._seq_to_sender.pop(rid, None)
+                    self._save_rooms()
+                    log.info("room %s deleted by creator %s", rid, username)
+                    await self._broadcast_global(T.ROOM_DELETED, room_id=rid)
 
                 else:
                     await self._send(ws, T.ERROR, message=f"Unknown type '{mtype}'")

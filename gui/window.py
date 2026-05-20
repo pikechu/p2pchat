@@ -239,9 +239,10 @@ class Rail(QWidget):
 # ── Conversation list panel ───────────────────────────────────────────────────
 
 class ConvPanel(QWidget):
-    room_selected = pyqtSignal(str)   # room_id
-    create_room   = pyqtSignal()
-    join_room     = pyqtSignal()
+    room_selected      = pyqtSignal(str)   # room_id
+    room_right_clicked = pyqtSignal(str)   # room_id
+    create_room        = pyqtSignal()
+    join_room          = pyqtSignal()
 
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
@@ -312,6 +313,7 @@ class ConvPanel(QWidget):
         row = ConvRowWidget(room_id, name, creator, members, locked, unread,
                             self._theme, conn_state="ok")
         row.clicked.connect(self._on_row_clicked)
+        row.right_clicked.connect(self.room_right_clicked)
         self._list_lay.insertWidget(self._list_lay.count() - 1, row)
         self._rows[room_id] = row
 
@@ -754,6 +756,7 @@ class ChatPanel(QWidget):
         self._composer.typing_started.connect(self._on_typing_start)
         self._composer.typing_stopped.connect(self._on_typing_stop)
         self._emoji_panel.emoji_selected.connect(self._composer.insert_emoji)
+        self._emoji_panel.emoji_selected.connect(lambda _: self._emoji_panel.hide())
 
         chat_lay.addWidget(self._header)
         chat_lay.addWidget(self._msgs_stack, 1)
@@ -1015,6 +1018,7 @@ class MainWindow(QMainWindow):
         self._side_stack.setFixedWidth(300)
         self._conv = ConvPanel(self._theme)
         self._conv.room_selected.connect(self._on_room_selected)
+        self._conv.room_right_clicked.connect(self._on_room_right_clicked)
         self._conv.create_room.connect(self._on_create_room)
         self._conv.join_room.connect(self._on_join_room)
         self._side_stack.addWidget(self._conv)           # index 0: chats
@@ -1110,7 +1114,8 @@ class MainWindow(QMainWindow):
             pw  = pending.get("_pending_pw", "")
             key = derive_key(rid, pw) if pw else None
             self._rooms[rid] = {"name": name, "members": [self._username],
-                                "locked": locked, "key": key}
+                                "locked": locked, "key": key,
+                                "creator": self._username}
             self._conv.upsert_room(rid, name, self._username, 1, locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
@@ -1121,9 +1126,10 @@ class MainWindow(QMainWindow):
             name    = payload["name"]
             members = payload.get("members", [])
             locked  = payload.get("locked", False)
+            creator = payload.get("creator", "")
             key     = self._rooms.get(rid, {}).get("_pending_key")
             self._rooms[rid] = {"name": name, "members": members,
-                                "locked": locked, "key": key}
+                                "locked": locked, "key": key, "creator": creator}
             self._conv.upsert_room(rid, name, self._username, len(members), locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
@@ -1201,10 +1207,24 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ROOM_LIST:
             for r in payload.get("rooms", []):
+                rid     = r["id"]
+                creator = r.get("creator", "")
                 self._conv.upsert_room(
-                    r["id"], r["name"], r.get("creator", ""),
+                    rid, r["name"], creator,
                     r.get("members", 0), r.get("locked", False)
                 )
+                if rid not in self._rooms:
+                    self._rooms[rid] = {"name": r["name"], "members": [],
+                                        "locked": r.get("locked", False),
+                                        "key": None, "creator": creator}
+
+        elif mtype == T.ROOM_DELETED:
+            rid = payload.get("room_id", "")
+            self._rooms.pop(rid, None)
+            self._conv.remove_room(rid)
+            if self._chat.current_room_id == rid:
+                self._chat.close_room(remove_history=True)
+                self.statusBar().showMessage("该聊天室已被创建者删除", 5000)
 
         # ── New protocol messages ─────────────────────────────────────────────
 
@@ -1277,6 +1297,24 @@ class MainWindow(QMainWindow):
             self._on_file_room_done(payload)
         elif mtype == T.FILE_ROOM_ERROR:
             self._on_file_room_error(payload)
+
+    # ── Room management ───────────────────────────────────────────────────────
+
+    def _on_room_right_clicked(self, room_id: str):
+        room = self._rooms.get(room_id, {})
+        if room.get("creator") != self._username:
+            return
+        from PyQt6.QtGui import QCursor
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除聊天室")
+        if menu.exec(QCursor.pos()) == delete_action:
+            reply = QMessageBox.question(
+                self, "删除聊天室",
+                f"确定要永久删除聊天室「{room.get('name', room_id)}」吗？\n所有成员将被踢出，无法恢复。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._bridge.send_frame(T.DELETE_ROOM, room_id=room_id)
 
     # ── Typing ────────────────────────────────────────────────────────────────
 

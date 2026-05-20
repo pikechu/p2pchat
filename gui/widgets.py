@@ -316,7 +316,8 @@ class DayMarkWidget(QLabel):
 # ── Conversation row ──────────────────────────────────────────────────────────
 
 class ConvRowWidget(QWidget):
-    clicked = pyqtSignal(str)   # emits room_id
+    clicked       = pyqtSignal(str)   # emits room_id on left-click
+    right_clicked = pyqtSignal(str)   # emits room_id on right-click
 
     def __init__(self, room_id: str, name: str, creator: str,
                  members: int = 0, locked: bool = False,
@@ -393,8 +394,11 @@ class ConvRowWidget(QWidget):
         if ts:
             self._time_lbl.setText(datetime.fromtimestamp(ts).strftime("%H:%M"))
 
-    def mousePressEvent(self, _):
-        self.clicked.emit(self._room_id)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit(self._room_id)
+        else:
+            self.clicked.emit(self._room_id)
 
 
 # ── File / image transfer card ────────────────────────────────────────────────

@@ -305,7 +305,8 @@ def test_leave_room_notifies_remaining_members(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
-def test_room_destroyed_when_last_member_leaves(server_port, event_loop):
+def test_room_persists_when_last_member_leaves(server_port, event_loop):
+    """Rooms are permanent — they survive even when all members leave."""
     async def run():
         alice = await _connect(server_port, "alice_last")
         await alice.send(pack(T.CREATE_ROOM, name="Temp Room"))
@@ -314,14 +315,54 @@ def test_room_destroyed_when_last_member_leaves(server_port, event_loop):
         await alice.send(pack(T.LEAVE_ROOM, room_id=room_id))
         await _recv(alice)  # ROOM_LEFT
 
-        # Room should be gone — another user can't join it
+        # Room should still exist — another user can join it
         bob = await _connect(server_port, "bob_last")
         await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
         frame = await _recv(bob)
+        assert frame["type"] == T.ROOM_JOINED
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_only_creator_can_delete_room(server_port, event_loop):
+    """Only the room creator can delete it via DELETE_ROOM."""
+    async def run():
+        alice = await _connect(server_port, "alice_del")
+        await alice.send(pack(T.CREATE_ROOM, name="Alice Room"))
+        room_id = (await _recv(alice))["payload"]["room_id"]
+
+        bob = await _connect(server_port, "bob_del")
+        await bob.send(pack(T.JOIN_ROOM, room_id=room_id))
+        await _recv(bob)   # ROOM_JOINED
+        await _recv(alice)  # USER_JOINED
+
+        # Bob (non-creator) tries to delete → error
+        await bob.send(pack(T.DELETE_ROOM, room_id=room_id))
+        frame = await _recv(bob)
+        assert frame["type"] == T.ERROR
+
+        # Alice (creator) deletes → success, ROOM_DELETED broadcast to all
+        await alice.send(pack(T.DELETE_ROOM, room_id=room_id))
+        # Both members get ROOM_LEFT; all connected get ROOM_DELETED
+        frames_alice = {(await _recv(alice))["type"], (await _recv(alice))["type"]}
+        frames_bob   = {(await _recv(bob))["type"],   (await _recv(bob))["type"]}
+        assert T.ROOM_LEFT    in frames_alice
+        assert T.ROOM_DELETED in frames_alice
+        assert T.ROOM_LEFT    in frames_bob
+        assert T.ROOM_DELETED in frames_bob
+
+        # Room is gone — nobody can join
+        carol = await _connect(server_port, "carol_del")
+        await carol.send(pack(T.JOIN_ROOM, room_id=room_id))
+        frame = await _recv(carol)
         assert frame["type"] == T.ERROR
 
         await alice.close()
         await bob.close()
+        await carol.close()
 
     event_loop.run_until_complete(run())
 
