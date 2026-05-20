@@ -106,13 +106,15 @@ def _step_upload(target: str, port_args: list[str], remote_dir: str) -> None:
 def _step_install(target: str, port_args: list[str], remote_dir: str) -> None:
     console.print("\n[bold cyan]2/5  安装 Python 依赖[/bold cyan]")
 
-    # 确认 python3 + python3-venv 存在
-    py_check = _ssh(target, port_args, "which python3", "检测 python3", check=False)
-    if py_check.returncode != 0:
-        console.print("  [yellow]python3 未找到，尝试 apt 安装...[/yellow]")
+    # 确保 python3 + python3-venv 都已安装
+    venv_check = _ssh(target, port_args,
+                      "python3 -m venv --help", "检测 venv", check=False)
+    if venv_check.returncode != 0:
+        console.print("  [yellow]python3-venv 未找到，尝试 apt 安装...[/yellow]")
         _ssh(target, port_args,
-             "sudo apt-get update -qq && sudo apt-get install -y python3 python3-venv",
-             "安装 python3")
+             "sudo apt-get update -qq && "
+             "sudo apt-get install -y python3 python3-venv",
+             "安装 python3-venv")
 
     # 创建 venv（若已存在则幂等跳过），然后安装依赖
     venv = f"{remote_dir}/venv"

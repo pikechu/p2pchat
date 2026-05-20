@@ -11,7 +11,7 @@ import sys
 import time
 
 import pytest
-import websockets
+import websockets.legacy.client as ws_connect
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -55,7 +55,7 @@ def event_loop():
 
 async def _connect(port: int, name: str):
     """Connect and set username. Returns the websocket."""
-    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+    ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
     frame = unpack(await ws.recv())
     assert frame["type"] == T.WELCOME
     await ws.send(pack(T.SET_NAME, name=name))
@@ -72,7 +72,7 @@ async def _recv(ws, timeout=3) -> dict:
 
 def test_set_name_welcome(server_port, event_loop):
     async def run():
-        ws = await websockets.connect(f"ws://127.0.0.1:{server_port}")
+        ws = await ws_connect.connect(f"ws://127.0.0.1:{server_port}")
         frame = unpack(await ws.recv())
         assert frame["type"] == T.WELCOME
 
@@ -87,7 +87,7 @@ def test_set_name_welcome(server_port, event_loop):
 def test_duplicate_name_rejected(server_port, event_loop):
     async def run():
         ws1 = await _connect(server_port, "dup_user")
-        ws2 = await websockets.connect(f"ws://127.0.0.1:{server_port}")
+        ws2 = await ws_connect.connect(f"ws://127.0.0.1:{server_port}")
         await ws2.recv()  # WELCOME
 
         await ws2.send(pack(T.SET_NAME, name="dup_user"))

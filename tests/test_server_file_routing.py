@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import websockets
+import websockets.legacy.client as ws_connect
 from protocol import T, pack, unpack
 
 
@@ -38,7 +38,7 @@ def event_loop():
 
 
 async def _connect(port, name):
-    ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+    ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
     await ws.recv()   # WELCOME
     await ws.send(pack(T.SET_NAME, name=name))
     await ws.recv()   # SYSTEM
