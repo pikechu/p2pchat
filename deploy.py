@@ -106,26 +106,20 @@ def _step_upload(target: str, port_args: list[str], remote_dir: str) -> None:
 def _step_install(target: str, port_args: list[str], remote_dir: str) -> None:
     console.print("\n[bold cyan]2/5  安装 Python 依赖[/bold cyan]")
 
-    # 确认 python3 存在，否则尝试 apt 安装
+    # 确认 python3 + python3-venv 存在
     py_check = _ssh(target, port_args, "which python3", "检测 python3", check=False)
     if py_check.returncode != 0:
         console.print("  [yellow]python3 未找到，尝试 apt 安装...[/yellow]")
         _ssh(target, port_args,
-             "sudo apt-get update -qq && sudo apt-get install -y python3 python3-pip",
+             "sudo apt-get update -qq && sudo apt-get install -y python3 python3-venv",
              "安装 python3")
-    else:
-        # python3 存在但 pip 可能没装
-        pip_check = _ssh(target, port_args,
-                         "python3 -m pip --version", "检测 pip", check=False)
-        if pip_check.returncode != 0:
-            console.print("  [yellow]pip 未找到，尝试 apt 安装...[/yellow]")
-            _ssh(target, port_args,
-                 "sudo apt-get update -qq && sudo apt-get install -y python3-pip",
-                 "安装 pip")
 
+    # 创建 venv（若已存在则幂等跳过），然后安装依赖
+    venv = f"{remote_dir}/venv"
     _ssh(target, port_args,
-         f"cd {remote_dir} && python3 -m pip install -q -r requirements-server.txt",
-         "安装依赖")
+         f"python3 -m venv {venv} && "
+         f"{venv}/bin/pip install -q -r {remote_dir}/requirements-server.txt",
+         "创建 venv 并安装依赖")
     console.print("[green]  ✓ 依赖已安装[/green]")
 
 
@@ -133,9 +127,7 @@ def _step_service(target: str, port_args: list[str],
                   remote_dir: str, port: int) -> None:
     console.print("\n[bold cyan]3/5  配置 systemd 服务[/bold cyan]")
 
-    # 获取 python3 实际路径
-    py_path = _ssh(target, port_args, "which python3", "查找 python3")
-    python_bin = py_path.stdout.strip() or "/usr/bin/python3"
+    python_bin = f"{remote_dir}/venv/bin/python3"
 
     service = f"""\
 [Unit]
