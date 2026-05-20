@@ -3,7 +3,7 @@
 import asyncio
 import traceback
 
-import websockets
+import websockets.legacy.client as _ws_legacy
 import websockets.exceptions
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -25,12 +25,14 @@ class WSBridge(QThread):
 
     # ── public API (called from GUI thread) ───────────────────────────────────
 
-    def send_frame(self, msg_type: T, **payload):
-        """Enqueue a frame to be sent to the server (thread-safe)."""
+    def send_frame(self, msg_type: T, **payload) -> bool:
+        """Enqueue a frame to be sent. Returns False when not connected."""
         if self._loop and self._queue:
             asyncio.run_coroutine_threadsafe(
                 self._queue.put(pack(msg_type, **payload)), self._loop
             )
+            return True
+        return False
 
     def send_raw_frame(self, raw_json: str):
         """Enqueue an already-serialised JSON frame (large file chunks)."""
@@ -59,7 +61,7 @@ class WSBridge(QThread):
 
     async def _connect(self):
         try:
-            async with websockets.connect(
+            async with _ws_legacy.connect(
                 self._url, open_timeout=30,
                 ping_interval=20, ping_timeout=60,
             ) as ws:

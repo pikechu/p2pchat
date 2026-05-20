@@ -1270,6 +1270,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_create_room(self):
+        if not self._bridge or not self._bridge._queue:
+            self.statusBar().showMessage("⚠  Not connected to server", 4000)
+            return
         dlg = RoomDialog("create", self)
         self._style_dialog(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -1283,6 +1286,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_join_room(self):
+        if not self._bridge or not self._bridge._queue:
+            self.statusBar().showMessage("⚠  Not connected to server", 4000)
+            return
         dlg = RoomDialog("join", self)
         self._style_dialog(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted:
