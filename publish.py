@@ -77,7 +77,8 @@ def _git_has_changes() -> bool:
 
 def _git_changed_files() -> list[str]:
     _, out = _run(["git", "status", "--porcelain"])
-    return [line[3:].strip() for line in out.splitlines() if line.strip()]
+    files = [line[3:].strip() for line in out.splitlines() if line.strip()]
+    return [f for f in files if "__pycache__" not in f and not f.endswith(".pyc")]
 
 
 def _auto_commit_message(files: list[str]) -> str:
@@ -140,6 +141,13 @@ def task_vps_update(target: str, port_args: list[str], scp_args: list[str],
     existing = [f for f in SERVER_FILES if Path(f).exists()]
     if not existing:
         result.update(status="fail", detail="找不到服务端文件")
+        return
+
+    # 确保目录存在且当前用户可写
+    code, out = _ssh(target, port_args,
+                     f"sudo mkdir -p {remote_dir} && sudo chown $(whoami):$(whoami) {remote_dir}")
+    if code != 0:
+        result.update(status="fail", detail=f"准备目录失败: {out}")
         return
 
     # scp 上传
