@@ -913,9 +913,11 @@ class MainWindow(QMainWindow):
             pending_room = "__pending__" in self._rooms
             if pending_room:
                 _log.error("CREATE_ROOM error: %s", msg)
+                self._rooms.pop("__pending__", None)
+                QMessageBox.critical(self, "创建房间失败", msg)
             else:
                 _log.warning("server error: %s", msg)
-            self.statusBar().showMessage("⚠  " + msg, 5000)
+                QMessageBox.warning(self, "错误", msg)
 
         elif mtype == T.ROOM_CREATED:
             rid    = payload["room_id"]
@@ -1293,7 +1295,7 @@ class MainWindow(QMainWindow):
     def _on_create_room(self):
         if not self._bridge or not self._bridge._queue:
             _log.error("CREATE_ROOM aborted: not connected to server")
-            self.statusBar().showMessage("⚠  Not connected to server", 4000)
+            QMessageBox.critical(self, "未连接", "尚未连接到服务器，无法创建房间。\n请检查服务器地址后重试。")
             return
         dlg = RoomDialog("create", self)
         self._style_dialog(dlg)
@@ -1310,7 +1312,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_join_room(self):
         if not self._bridge or not self._bridge._queue:
-            self.statusBar().showMessage("⚠  Not connected to server", 4000)
+            _log.error("JOIN_ROOM aborted: not connected to server")
+            QMessageBox.critical(self, "未连接", "尚未连接到服务器，无法加入房间。\n请检查服务器地址后重试。")
             return
         dlg = RoomDialog("join", self)
         self._style_dialog(dlg)
