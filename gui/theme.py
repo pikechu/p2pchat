@@ -238,6 +238,27 @@ def make_qss(theme: str = "light") -> str:
 
     /* ── Dialogs ────────────────────────────────────────── */
     #Dialog {{ background: {t['bg']}; border: 1px solid {t['line_strong']}; border-radius: 10px; }}
+
+    /* ── QMessageBox (overrides the transparent QWidget rule) ── */
+    QMessageBox {{
+        background: {t['bg']};
+    }}
+    QMessageBox QLabel {{
+        background: {t['bg']};
+        color: {t['fg']};
+        font-size: 13px;
+    }}
+    QMessageBox QPushButton {{
+        background: {t['bg_input']};
+        color: {t['fg']};
+        border: 1px solid {t['line']};
+        border-radius: 6px;
+        padding: 5px 18px;
+        font-size: 13px;
+    }}
+    QMessageBox QPushButton:hover {{
+        background: {t['bg_hover']};
+    }}
     #DialogTitle {{ font-size: 15px; font-weight: 600; color: {t['fg']}; }}
     #FormLabel {{ font-size: 12px; font-weight: 500; color: {t['fg3']}; }}
     #FormInput {{
