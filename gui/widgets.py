@@ -566,6 +566,12 @@ class ImageCard(QFrame):
         cap_row.addWidget(name_lbl, 1)
         lay.addLayout(cap_row)
 
+    def set_progress(self, pct: int):
+        pass  # image is shown immediately; no progress indicator needed
+
+    def set_error(self, message: str):
+        pass
+
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
 
@@ -615,6 +621,12 @@ class VideoCard(QFrame):
         self._open_btn.clicked.connect(self._open)
         row.addWidget(self._open_btn)
         lay.addLayout(row)
+
+    def set_progress(self, pct: int):
+        pass  # video card has no progress bar; upload tracked elsewhere
+
+    def set_error(self, message: str):
+        pass
 
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
