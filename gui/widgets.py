@@ -389,6 +389,16 @@ class ConvRowWidget(QWidget):
         """state: 'ok' | 'warn' | 'offline'"""
         self._dot.set_state(state)
 
+    def set_members(self, count: int):
+        if not self._prev_lbl.text() or self._prev_lbl.text().endswith("member") or \
+                self._prev_lbl.text().endswith("members"):
+            self._prev_lbl.setText(f"{count} member{'s' if count != 1 else ''}")
+
+    def set_room_name(self, name: str):
+        locked = self._name_lbl.text().startswith("🔒")
+        self._name_lbl.setText(("🔒 " if locked else "") + name)
+        self._avatar.set_name(name)
+
     def set_preview(self, text: str, ts: float = 0):
         self._prev_lbl.setText(text[:50])
         if ts:

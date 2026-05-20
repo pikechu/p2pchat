@@ -370,4 +370,44 @@ def make_qss(theme: str = "light") -> str:
     QProgressBar#FileCardProgress::chunk {{
         background: {t['accent']}; border-radius: 2px;
     }}
+
+    /* ── Room info panel ──────────────────────────────────── */
+    #RoomInfoPanel {{
+        background: {t['bg_sidebar']};
+        border-left: 1px solid {t['line']};
+    }}
+    #InfoPanelTitle {{ font-size: 13px; font-weight: 600; color: {t['fg']}; }}
+    #InfoRoomName   {{ font-size: 14px; font-weight: 600; color: {t['fg']}; }}
+    #InfoMeta       {{ font-size: 12px; color: {t['fg3']}; }}
+    #InfoSep        {{ color: {t['line']}; }}
+    #InfoCloseBtn   {{
+        background: transparent; color: {t['fg3']}; border: none;
+        border-radius: 4px; font-size: 16px; padding: 0;
+    }}
+    #InfoCloseBtn:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+    #InfoEditBtn {{
+        background: {t['bg_hover']}; color: {t['fg2']};
+        border: 1px solid {t['line']}; border-radius: 4px;
+        font-size: 12px; padding: 2px 6px;
+    }}
+    #InfoEditBtn:hover {{ background: {t['accent_soft']}; color: {t['accent']}; }}
+
+    /* ── Room search dialog ────────────────────────────────── */
+    #SearchResultRow {{
+        background: {t['bg_chat']};
+        border-bottom: 1px solid {t['line']};
+        border-radius: 0px;
+    }}
+    #SearchResultRow:hover {{ background: {t['bg_hover']}; }}
+    #DialogCloseBtn {{
+        background: transparent; color: {t['fg3']}; border: none;
+        border-radius: 4px; font-size: 18px; padding: 0;
+    }}
+    #DialogCloseBtn:hover {{ background: {t['bg_hover']}; color: {t['fg']}; }}
+    #PrimaryBtn {{
+        background: {t['accent']}; color: white;
+        border: none; border-radius: 6px;
+        font-size: 12px; font-weight: 500;
+    }}
+    #PrimaryBtn:hover {{ background: {t['accent']}; opacity: 0.9; }}
     """

@@ -66,6 +66,7 @@ class Room:
     locked: bool = False          # True when a password was set at creation
     password_hash: str = ""       # SHA-256 of the creation password; "" = open
     created_at: float = field(default_factory=time.time)
+    icon: str = ""                # optional emoji icon set by creator
     seq: int = 0
     # username → websocket
     members: Dict[str, object] = field(default_factory=dict)
@@ -107,6 +108,7 @@ class ChatServer:
                     locked=r.get("locked", False),
                     password_hash=r.get("password_hash", ""),
                     created_at=r.get("created_at", time.time()),
+                    icon=r.get("icon", ""),
                 )
                 self._rooms[room.id] = room
             log.info("loaded %d room(s) from %s", len(self._rooms), _ROOMS_FILE)
@@ -118,7 +120,7 @@ class ChatServer:
             data = {"rooms": [
                 {"id": r.id, "name": r.name, "creator": r.creator,
                  "locked": r.locked, "password_hash": r.password_hash,
-                 "created_at": r.created_at}
+                 "created_at": r.created_at, "icon": r.icon}
                 for r in self._rooms.values()
             ]}
             _ROOMS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
@@ -235,7 +237,8 @@ class ChatServer:
                     self._rooms[rid]       = room
                     self._user_room[username] = rid
                     await self._send(ws, T.ROOM_CREATED,
-                                     room_id=rid, name=room_name, locked=locked)
+                                     room_id=rid, name=room_name, locked=locked,
+                                     creator=username, created_at=room.created_at)
                     self._save_rooms()
                     log.info("room %s '%s' created by %s", rid, room_name, username)
 
@@ -264,6 +267,8 @@ class ChatServer:
                                      name=room.name,
                                      locked=room.locked,
                                      creator=room.creator,
+                                     created_at=room.created_at,
+                                     icon=room.icon,
                                      members=list(room.members))
                     await self._broadcast(room, T.USER_JOINED,
                                           exclude=username, username=username)
@@ -464,11 +469,13 @@ class ChatServer:
                 elif mtype == T.LIST_ROOMS:
                     rooms = [
                         {
-                            "id":      r.id,
-                            "name":    r.name,
-                            "creator": r.creator,
-                            "members": len(r.members),
-                            "locked":  r.locked,
+                            "id":         r.id,
+                            "name":       r.name,
+                            "creator":    r.creator,
+                            "members":    len(r.members),
+                            "locked":     r.locked,
+                            "created_at": r.created_at,
+                            "icon":       r.icon,
                         }
                         for r in self._rooms.values()
                     ]
@@ -498,6 +505,53 @@ class ChatServer:
                     self._save_rooms()
                     log.info("room %s deleted by creator %s", rid, username)
                     await self._broadcast_global(T.ROOM_DELETED, room_id=rid)
+
+                # ── SET_ROOM_NAME ────────────────────────────────────────────
+                elif mtype == T.SET_ROOM_NAME:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    rid = str(payload.get("room_id", "")).strip().upper()
+                    new_name = str(payload.get("name", "")).strip()
+                    room = self._rooms.get(rid)
+                    if room is None:
+                        await self._send(ws, T.ERROR,
+                                         message=f"Room '{rid}' does not exist")
+                        continue
+                    if room.creator != username:
+                        await self._send(ws, T.ERROR,
+                                         message="Only the creator can rename this room")
+                        continue
+                    if not new_name:
+                        await self._send(ws, T.ERROR, message="Room name cannot be empty")
+                        continue
+                    room.name = new_name
+                    self._save_rooms()
+                    log.info("room %s renamed to '%s' by %s", rid, new_name, username)
+                    await self._broadcast_global(T.ROOM_NAME_UPDATED,
+                                                 room_id=rid, name=new_name)
+
+                # ── SET_ROOM_ICON ────────────────────────────────────────────
+                elif mtype == T.SET_ROOM_ICON:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    rid = str(payload.get("room_id", "")).strip().upper()
+                    icon = str(payload.get("icon", "")).strip()
+                    room = self._rooms.get(rid)
+                    if room is None:
+                        await self._send(ws, T.ERROR,
+                                         message=f"Room '{rid}' does not exist")
+                        continue
+                    if room.creator != username:
+                        await self._send(ws, T.ERROR,
+                                         message="Only the creator can change this room's icon")
+                        continue
+                    room.icon = icon
+                    self._save_rooms()
+                    log.info("room %s icon set to '%s' by %s", rid, icon, username)
+                    await self._broadcast_global(T.ROOM_ICON_UPDATED,
+                                                 room_id=rid, icon=icon)
 
                 else:
                     await self._send(ws, T.ERROR, message=f"Unknown type '{mtype}'")

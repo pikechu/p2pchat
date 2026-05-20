@@ -26,7 +26,9 @@ class T(str, Enum):
     MSG_ACK     = "MSG_ACK"      # {seq: int, status: "delivered"|"read"}
     LIST_USERS  = "LIST_USERS"   # {} — request list of online usernames
     SEND_DM     = "SEND_DM"      # {to, text, client_mid}
-    DELETE_ROOM = "DELETE_ROOM"  # {room_id} — creator only
+    DELETE_ROOM    = "DELETE_ROOM"    # {room_id} — creator only
+    SET_ROOM_NAME  = "SET_ROOM_NAME"  # {room_id, name} — creator only
+    SET_ROOM_ICON  = "SET_ROOM_ICON"  # {room_id, icon} — creator only
 
     # file transfer (client→server, routed user-to-user)
     FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
@@ -61,7 +63,9 @@ class T(str, Enum):
     USER_LIST    = "USER_LIST"    # {users: [str]} — response to LIST_USERS
     RECV_DM      = "RECV_DM"      # {from, text, client_mid} — routed by server
     DM_ACK       = "DM_ACK"       # {client_mid, to} — echo back to DM sender
-    ROOM_DELETED = "ROOM_DELETED" # {room_id} — broadcast when creator deletes room
+    ROOM_DELETED      = "ROOM_DELETED"      # {room_id} — broadcast when creator deletes room
+    ROOM_NAME_UPDATED = "ROOM_NAME_UPDATED" # {room_id, name} — broadcast on rename
+    ROOM_ICON_UPDATED = "ROOM_ICON_UPDATED" # {room_id, icon} — broadcast on icon change
 
 
 def pack(msg_type: T, **payload) -> str:

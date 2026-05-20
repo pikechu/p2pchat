@@ -242,7 +242,7 @@ class ConvPanel(QWidget):
     room_selected      = pyqtSignal(str)   # room_id
     room_right_clicked = pyqtSignal(str)   # room_id
     create_room        = pyqtSignal()
-    join_room          = pyqtSignal()
+    search_rooms       = pyqtSignal()
 
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
@@ -266,11 +266,11 @@ class ConvPanel(QWidget):
         title_row.addWidget(title_lbl)
         title_row.addStretch()
 
-        join_btn = _btn("⊕", "NewRoomBtn")
-        join_btn.setFixedSize(28, 28)
-        join_btn.setToolTip("Join room")
-        join_btn.clicked.connect(self.join_room)
-        title_row.addWidget(join_btn)
+        search_btn = _btn("🔍", "NewRoomBtn")
+        search_btn.setFixedSize(28, 28)
+        search_btn.setToolTip("搜索聊天室")
+        search_btn.clicked.connect(self.search_rooms)
+        title_row.addWidget(search_btn)
 
         new_btn = _btn("+", "NewRoomBtn")
         new_btn.setFixedSize(28, 28)
@@ -309,6 +309,7 @@ class ConvPanel(QWidget):
                     members: int = 0, locked: bool = False,
                     unread: int = 0):
         if room_id in self._rows:
+            self._rows[room_id].set_members(members)
             return
         row = ConvRowWidget(room_id, name, creator, members, locked, unread,
                             self._theme, conn_state="ok")
@@ -316,6 +317,14 @@ class ConvPanel(QWidget):
         row.right_clicked.connect(self.room_right_clicked)
         self._list_lay.insertWidget(self._list_lay.count() - 1, row)
         self._rows[room_id] = row
+
+    def update_members(self, room_id: str, count: int):
+        if row := self._rows.get(room_id):
+            row.set_members(count)
+
+    def update_room_name(self, room_id: str, name: str):
+        if row := self._rows.get(room_id):
+            row.set_room_name(name)
 
     def remove_room(self, room_id: str):
         row = self._rows.pop(room_id, None)
@@ -344,9 +353,9 @@ class ConvPanel(QWidget):
 
     def _filter(self, query: str):
         q = query.lower()
-        for rid, row in self._rows.items():
+        for row in self._rows.values():
             name = row._name_lbl.text().lower()
-            row.setVisible(not q or q in rid.lower() or q in name)
+            row.setVisible(not q or q in name)
 
 
 # ── Reply bar (shown above composer input when replying) ──────────────────────
@@ -401,6 +410,8 @@ class ReplyBar(QWidget):
 # ── Chat header ───────────────────────────────────────────────────────────────
 
 class ChatHeader(QWidget):
+    info_toggled = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ChatHeader")
@@ -424,20 +435,27 @@ class ChatHeader(QWidget):
         self._status_dot = StatusDot("offline")
         lay.addWidget(self._status_dot)
 
-        for icon in ("🔍", "⋯"):
-            btn = QPushButton(icon)
-            btn.setObjectName("HeaderBtn")
-            btn.setFixedSize(32, 32)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            lay.addWidget(btn)
+        info_btn = QPushButton("⋯")
+        info_btn.setObjectName("HeaderBtn")
+        info_btn.setFixedSize(32, 32)
+        info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        info_btn.clicked.connect(self.info_toggled)
+        lay.addWidget(info_btn)
 
     def update_room(self, name: str, members: list[str], locked: bool,
-                    conn_state: str = "ok"):
+                    conn_state: str = "ok", icon: str = ""):
         self._avatar.set_name(name)
         self._name_lbl.setText(("🔒 " if locked else "") + name)
         count = len(members)
         self._sub_lbl.setText(f"{count} member{'s' if count != 1 else ''}")
         self._status_dot.set_state(conn_state)
+
+    def update_member_count(self, count: int):
+        self._sub_lbl.setText(f"{count} member{'s' if count != 1 else ''}")
+
+    def update_room_name(self, name: str, locked: bool = False):
+        self._avatar.set_name(name)
+        self._name_lbl.setText(("🔒 " if locked else "") + name)
 
     def set_conn_state(self, state: str):
         self._status_dot.set_state(state)
@@ -701,10 +719,304 @@ class EmptyPanel(QWidget):
         icon.setStyleSheet("font-size: 48px;")
         lay.addWidget(icon)
         lay.addWidget(_lbl("Select or create a room", "EmptyTitle"))
-        sub = _lbl("Use + to create a room or ⊕ to join one with a room ID", "EmptyDesc")
+        sub = _lbl("使用 + 创建聊天室，或 🔍 搜索并加入", "EmptyDesc")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setWordWrap(True)
         lay.addWidget(sub)
+
+
+# ── Room info panel (right sidebar) ──────────────────────────────────────────
+
+class RoomInfoPanel(QWidget):
+    rename_requested     = pyqtSignal(str, str)  # room_id, new_name
+    icon_change_requested = pyqtSignal(str, str) # room_id, new_icon
+
+    _ICON_CHOICES = ["💬", "🎮", "🎵", "📚", "🏠", "🌟", "🔥", "💡",
+                     "🎯", "🚀", "🌈", "🎲", "🍀", "⚡", "🎸", "🏆"]
+
+    def __init__(self, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self.setObjectName("RoomInfoPanel")
+        self.setFixedWidth(240)
+        self._room_id  = ""
+        self._is_creator = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(12)
+
+        # Header row
+        hdr = QHBoxLayout()
+        title = _lbl("聊天室信息", "InfoPanelTitle")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        close_btn = _btn("×", "InfoCloseBtn")
+        close_btn.setFixedSize(24, 24)
+        close_btn.clicked.connect(self.hide)
+        hdr.addWidget(close_btn)
+        lay.addLayout(hdr)
+
+        # Room avatar (large) + icon selector row
+        av_wrap = QWidget()
+        av_lay = QVBoxLayout(av_wrap)
+        av_lay.setContentsMargins(0, 0, 0, 0)
+        av_lay.setSpacing(4)
+        av_lay.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._big_avatar = Avatar("?", 64)
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon_lbl.setStyleSheet("font-size: 36px;")
+        self._icon_lbl.hide()
+        av_lay.addWidget(self._big_avatar, alignment=Qt.AlignmentFlag.AlignHCenter)
+        av_lay.addWidget(self._icon_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        # Change icon button (creator only)
+        self._change_icon_btn = _btn("更换图标", "InfoEditBtn")
+        self._change_icon_btn.setFixedHeight(26)
+        self._change_icon_btn.hide()
+        self._change_icon_btn.clicked.connect(self._on_change_icon)
+        av_lay.addWidget(self._change_icon_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(av_wrap)
+
+        # Icon picker row (hidden until change icon clicked)
+        self._icon_picker = QWidget()
+        self._icon_picker.hide()
+        ip_lay = QGridLayout(self._icon_picker)
+        ip_lay.setContentsMargins(0, 0, 0, 0)
+        ip_lay.setSpacing(4)
+        for i, emoji in enumerate(self._ICON_CHOICES):
+            btn = QPushButton(emoji)
+            btn.setFixedSize(28, 28)
+            btn.setObjectName("EmojiBtn")
+            btn.clicked.connect(lambda checked, e=emoji: self._apply_icon(e))
+            ip_lay.addWidget(btn, i // 4, i % 4)
+        clear_btn = _btn("✕", "EmojiBtn")
+        clear_btn.setFixedSize(28, 28)
+        clear_btn.setToolTip("清除图标")
+        clear_btn.clicked.connect(lambda: self._apply_icon(""))
+        ip_lay.addWidget(clear_btn, len(self._ICON_CHOICES) // 4,
+                         len(self._ICON_CHOICES) % 4)
+        lay.addWidget(self._icon_picker)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setObjectName("InfoSep")
+        lay.addWidget(sep)
+
+        # Name row
+        name_row = QHBoxLayout()
+        self._name_display = _lbl("", "InfoRoomName")
+        self._name_display.setWordWrap(True)
+        name_row.addWidget(self._name_display, 1)
+        self._rename_btn = _btn("✏️", "InfoEditBtn")
+        self._rename_btn.setFixedSize(26, 26)
+        self._rename_btn.setToolTip("修改名称")
+        self._rename_btn.hide()
+        self._rename_btn.clicked.connect(self._on_rename)
+        name_row.addWidget(self._rename_btn)
+        lay.addLayout(name_row)
+
+        # Creator / created-at labels
+        self._creator_lbl  = _lbl("", "InfoMeta")
+        self._created_lbl  = _lbl("", "InfoMeta")
+        lay.addWidget(self._creator_lbl)
+        lay.addWidget(self._created_lbl)
+
+        lay.addStretch()
+
+    def update_room(self, room_id: str, name: str, creator: str,
+                    created_at: float, icon: str, is_creator: bool):
+        self._room_id    = room_id
+        self._is_creator = is_creator
+        self._current_icon = icon
+
+        self._big_avatar.set_name(name)
+        if icon:
+            self._icon_lbl.setText(icon)
+            self._icon_lbl.show()
+            self._big_avatar.hide()
+        else:
+            self._icon_lbl.hide()
+            self._big_avatar.show()
+
+        self._name_display.setText(name)
+        self._creator_lbl.setText(f"创建者：{creator}")
+        from datetime import datetime as _dt
+        ts_str = _dt.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M") if created_at else ""
+        self._created_lbl.setText(f"创建时间：{ts_str}")
+
+        self._rename_btn.setVisible(is_creator)
+        self._change_icon_btn.setVisible(is_creator)
+        self._icon_picker.hide()
+
+    def update_name(self, name: str):
+        self._name_display.setText(name)
+        self._big_avatar.set_name(name)
+
+    def update_icon(self, icon: str):
+        self._current_icon = icon
+        if icon:
+            self._icon_lbl.setText(icon)
+            self._icon_lbl.show()
+            self._big_avatar.hide()
+        else:
+            self._icon_lbl.hide()
+            self._big_avatar.show()
+
+    def _on_rename(self):
+        from PyQt6.QtWidgets import QInputDialog
+        new_name, ok = QInputDialog.getText(
+            self, "修改聊天室名称", "新名称：",
+            text=self._name_display.text()
+        )
+        if ok and new_name.strip():
+            self.rename_requested.emit(self._room_id, new_name.strip())
+
+    def _on_change_icon(self):
+        self._icon_picker.setVisible(not self._icon_picker.isVisible())
+
+    def _apply_icon(self, emoji: str):
+        self._icon_picker.hide()
+        self.icon_change_requested.emit(self._room_id, emoji)
+
+
+# ── Room search dialog ────────────────────────────────────────────────────────
+
+class RoomSearchDialog(QDialog):
+    join_requested = pyqtSignal(str, str)  # room_id, password
+
+    def __init__(self, rooms: dict, current_username: str, parent=None):
+        super().__init__(parent)
+        self._rooms = rooms
+        self._username = current_username
+        self.setObjectName("Dialog")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.setMinimumHeight(480)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+
+        # Title
+        title_row = QHBoxLayout()
+        title_lbl = _lbl("🔍  搜索聊天室", "DialogTitle")
+        title_row.addWidget(title_lbl)
+        title_row.addStretch()
+        close_btn = _btn("×", "DialogCloseBtn")
+        close_btn.setFixedSize(28, 28)
+        close_btn.clicked.connect(self.reject)
+        title_row.addWidget(close_btn)
+        lay.addLayout(title_row)
+
+        # Search input
+        self._search = QLineEdit()
+        self._search.setObjectName("SearchBox")
+        self._search.setPlaceholderText("输入聊天室名称搜索（留空显示全部）…")
+        self._search.textChanged.connect(self._filter)
+        lay.addWidget(self._search)
+
+        # Results list
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._results_widget = QWidget()
+        self._results_lay = QVBoxLayout(self._results_widget)
+        self._results_lay.setContentsMargins(0, 0, 0, 0)
+        self._results_lay.setSpacing(4)
+        self._results_lay.addStretch()
+        scroll.setWidget(self._results_widget)
+        lay.addWidget(scroll, 1)
+
+        self._row_widgets: list[tuple[str, QWidget]] = []
+        self._populate()
+
+    def _populate(self):
+        # Clear existing rows
+        while self._results_lay.count() > 1:
+            item = self._results_lay.takeAt(0)
+            if w := item.widget():
+                w.deleteLater()
+        self._row_widgets.clear()
+
+        # Show all non-DM rooms
+        for rid, info in self._rooms.items():
+            if rid.startswith("@"):
+                continue
+            row_w = self._make_room_row(rid, info)
+            self._results_lay.insertWidget(self._results_lay.count() - 1, row_w)
+            self._row_widgets.append((rid, row_w))
+
+        if not self._row_widgets:
+            empty = _lbl("暂无聊天室", "EmptyDesc")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._results_lay.insertWidget(0, empty)
+
+    def _make_room_row(self, room_id: str, info: dict) -> QWidget:
+        w = QWidget()
+        w.setObjectName("SearchResultRow")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(8)
+
+        av = Avatar(info.get("name", room_id), 36)
+        icon = info.get("icon", "")
+        if icon:
+            icon_lbl = QLabel(icon)
+            icon_lbl.setStyleSheet("font-size: 22px;")
+            icon_lbl.setFixedSize(36, 36)
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(icon_lbl)
+        else:
+            lay.addWidget(av)
+
+        meta = QVBoxLayout()
+        meta.setSpacing(2)
+        name_str = ("🔒 " if info.get("locked") else "") + info.get("name", room_id)
+        name_lbl = _lbl(name_str, "ConvRowName")
+        members  = info.get("members", [])
+        count = len(members) if isinstance(members, list) else members
+        sub_lbl = _lbl(f"👥 {count}  ·  创建者: {info.get('creator', '')}", "ConvRowPreview")
+        meta.addWidget(name_lbl)
+        meta.addWidget(sub_lbl)
+        lay.addLayout(meta, 1)
+
+        members_set = set(members) if isinstance(members, list) else set()
+        if self._username in members_set:
+            status = _lbl("已加入", "InfoMeta")
+            lay.addWidget(status)
+        else:
+            join_btn = _btn("加入", "PrimaryBtn")
+            join_btn.setFixedSize(52, 30)
+            join_btn.clicked.connect(lambda checked, r=room_id, lk=info.get("locked", False):
+                                     self._on_join(r, lk))
+            lay.addWidget(join_btn)
+
+        w.setProperty("room_id", room_id)
+        w.setProperty("room_name", info.get("name", ""))
+        return w
+
+    def _filter(self, query: str):
+        q = query.strip().lower()
+        for rid, row_w in self._row_widgets:
+            name = (row_w.property("room_name") or "").lower()
+            row_w.setVisible(not q or q in name)
+
+    def _on_join(self, room_id: str, locked: bool):
+        password = ""
+        if locked:
+            from PyQt6.QtWidgets import QInputDialog
+            pw, ok = QInputDialog.getText(
+                self, "密码保护", "请输入房间密码：",
+                QLineEdit.EchoMode.Password
+            )
+            if not ok:
+                return
+            password = pw
+        self.join_requested.emit(room_id, password)
+        self.accept()
 
 
 # ── Full chat panel ───────────────────────────────────────────────────────────
@@ -758,8 +1070,21 @@ class ChatPanel(QWidget):
         self._emoji_panel.emoji_selected.connect(self._composer.insert_emoji)
         self._emoji_panel.emoji_selected.connect(lambda _: self._emoji_panel.hide())
 
+        # Middle row: messages + collapsible info panel
+        middle = QWidget()
+        middle.setObjectName("ChatMiddle")
+        middle_lay = QHBoxLayout(middle)
+        middle_lay.setContentsMargins(0, 0, 0, 0)
+        middle_lay.setSpacing(0)
+        middle_lay.addWidget(self._msgs_stack, 1)
+        self._info_panel = RoomInfoPanel(theme)
+        self._info_panel.hide()
+        middle_lay.addWidget(self._info_panel)
+
+        self._header.info_toggled.connect(self._toggle_info_panel)
+
         chat_lay.addWidget(self._header)
-        chat_lay.addWidget(self._msgs_stack, 1)
+        chat_lay.addWidget(middle, 1)
         chat_lay.addWidget(self._typing)
         chat_lay.addWidget(self._emoji_panel)
         chat_lay.addWidget(self._composer)
@@ -786,10 +1111,16 @@ class ChatPanel(QWidget):
     def _toggle_emoji(self):
         self._emoji_panel.setVisible(not self._emoji_panel.isVisible())
 
-    def open_room(self, room_id: str, name: str,
-                  members: list[str], locked: bool, conn_state: str = "ok"):
+    def _toggle_info_panel(self):
+        self._info_panel.setVisible(not self._info_panel.isVisible())
+
+    def open_room(self, room_id: str, name: str, members: list[str], locked: bool,
+                  conn_state: str = "ok", creator: str = "",
+                  created_at: float = 0.0, icon: str = "",
+                  is_creator: bool = False):
         self._room_id = room_id
-        self._header.update_room(name, members, locked, conn_state)
+        self._header.update_room(name, members, locked, conn_state, icon)
+        self._info_panel.update_room(room_id, name, creator, created_at, icon, is_creator)
 
         if room_id not in self._msgs_by_room:
             msgs = MessagesArea(theme=self._theme)
@@ -819,6 +1150,18 @@ class ChatPanel(QWidget):
         self._typing.hide_typing()
         self._emoji_panel.hide()
         self._stack.setCurrentWidget(self._empty)
+
+    def update_member_count(self, count: int):
+        self._header.update_member_count(count)
+
+    def update_room_name(self, room_id: str, name: str, locked: bool = False):
+        if self._room_id == room_id:
+            self._header.update_room_name(name, locked)
+            self._info_panel.update_name(name)
+
+    def update_room_icon(self, room_id: str, icon: str):
+        if self._room_id == room_id:
+            self._info_panel.update_icon(icon)
 
     def _active_msgs(self) -> MessagesArea | None:
         w = self._msgs_stack.currentWidget()
@@ -992,6 +1335,7 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
         self.setMinimumSize(800, 560)
         self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().hide()
 
         QTimer.singleShot(100, self._connect)
 
@@ -1020,7 +1364,7 @@ class MainWindow(QMainWindow):
         self._conv.room_selected.connect(self._on_room_selected)
         self._conv.room_right_clicked.connect(self._on_room_right_clicked)
         self._conv.create_room.connect(self._on_create_room)
-        self._conv.join_room.connect(self._on_join_room)
+        self._conv.search_rooms.connect(self._on_search_rooms)
         self._side_stack.addWidget(self._conv)           # index 0: chats
 
         self._files_panel = FilesPanel(self._theme)
@@ -1033,6 +1377,8 @@ class MainWindow(QMainWindow):
         self._chat.reply_requested.connect(self._on_reply_requested)
         self._chat.set_typing_callbacks(self._on_typing_start, self._on_typing_stop)
         self._chat.composer.file_selected.connect(self._start_file_send)
+        self._chat._info_panel.rename_requested.connect(self._on_room_rename)
+        self._chat._info_panel.icon_change_requested.connect(self._on_room_icon_change)
         root.addWidget(self._chat)
 
     def _apply_theme(self):
@@ -1053,14 +1399,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_connected(self):
-        self.statusBar().showMessage(f"Connected  ·  {self._server_url}", 4000)
+        self.setWindowTitle("Beam — P2P Chat")
         self._bridge.send_frame(T.SET_NAME, name=self._username)
         self._bridge.send_frame(T.LIST_ROOMS)
 
     @pyqtSlot(str)
     def _on_disconnected(self, reason: str):
         _log.error("bridge disconnected: %s", reason)
-        self.statusBar().showMessage(f"Disconnected: {reason}")
+        self.setWindowTitle("Beam — P2P Chat  [disconnected]")
         self._chat.close_room()
         # Mark all conv rows offline
         for rid in self._rooms:
@@ -1084,7 +1430,6 @@ class MainWindow(QMainWindow):
             import traceback
             _log.error("frame dispatch error (type=%s): %s\n%s",
                        mtype, exc, traceback.format_exc())
-            self.statusBar().showMessage(f"Frame error ({mtype}): {exc}", 6000)
             traceback.print_exc()
 
     def _dispatch_frame(self, mtype: str, payload: dict, ts: float):
@@ -1093,7 +1438,7 @@ class MainWindow(QMainWindow):
             pass
 
         elif mtype == T.SYSTEM:
-            self.statusBar().showMessage(payload.get("message", ""), 3000)
+            pass  # system welcome messages are informational only
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
@@ -1107,33 +1452,42 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "错误", msg)
 
         elif mtype == T.ROOM_CREATED:
-            rid    = payload["room_id"]
-            name   = payload["name"]
-            locked = payload.get("locked", False)
-            pending = self._rooms.pop("__pending__", {})
+            rid        = payload["room_id"]
+            name       = payload["name"]
+            locked     = payload.get("locked", False)
+            created_at = payload.get("created_at", time.time())
+            pending    = self._rooms.pop("__pending__", {})
             pw  = pending.get("_pending_pw", "")
             key = derive_key(rid, pw) if pw else None
             self._rooms[rid] = {"name": name, "members": [self._username],
                                 "locked": locked, "key": key,
-                                "creator": self._username}
+                                "creator": self._username,
+                                "created_at": created_at, "icon": ""}
             self._conv.upsert_room(rid, name, self._username, 1, locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
-            self._chat.open_room(rid, name, [self._username], locked)
+            self._chat.open_room(rid, name, [self._username], locked,
+                                 creator=self._username, created_at=created_at,
+                                 icon="", is_creator=True)
 
         elif mtype == T.ROOM_JOINED:
-            rid     = payload["room_id"]
-            name    = payload["name"]
-            members = payload.get("members", [])
-            locked  = payload.get("locked", False)
-            creator = payload.get("creator", "")
-            key     = self._rooms.get(rid, {}).get("_pending_key")
+            rid        = payload["room_id"]
+            name       = payload["name"]
+            members    = payload.get("members", [])
+            locked     = payload.get("locked", False)
+            creator    = payload.get("creator", "")
+            created_at = payload.get("created_at", 0.0)
+            icon       = payload.get("icon", "")
+            key        = self._rooms.get(rid, {}).get("_pending_key")
             self._rooms[rid] = {"name": name, "members": members,
-                                "locked": locked, "key": key, "creator": creator}
-            self._conv.upsert_room(rid, name, self._username, len(members), locked)
+                                "locked": locked, "key": key, "creator": creator,
+                                "created_at": created_at, "icon": icon}
+            self._conv.upsert_room(rid, name, creator, len(members), locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
-            self._chat.open_room(rid, name, members, locked)
+            self._chat.open_room(rid, name, members, locked,
+                                 creator=creator, created_at=created_at, icon=icon,
+                                 is_creator=(creator == self._username))
             # Track first non-self member as file transfer peer
             others = [m for m in members if m != self._username]
             self._current_peer = others[0] if others else ""
@@ -1158,6 +1512,10 @@ class MainWindow(QMainWindow):
                 members = self._rooms[rid].get("members", [])
                 if uname not in members:
                     members.append(uname)
+                count = len(self._rooms[rid]["members"])
+                self._conv.update_members(rid, count)
+                if rid == self._chat.current_room_id:
+                    self._chat.update_member_count(count)
             if rid == self._chat.current_room_id:
                 self._chat.add_sys(f"{uname} joined")
 
@@ -1168,6 +1526,10 @@ class MainWindow(QMainWindow):
                 self._rooms[rid]["members"] = [
                     m for m in self._rooms[rid].get("members", []) if m != uname
                 ]
+                count = len(self._rooms[rid]["members"])
+                self._conv.update_members(rid, count)
+                if rid == self._chat.current_room_id:
+                    self._chat.update_member_count(count)
             if rid == self._chat.current_room_id:
                 self._chat.add_sys(f"{uname} left")
 
@@ -1207,8 +1569,10 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ROOM_LIST:
             for r in payload.get("rooms", []):
-                rid     = r["id"]
-                creator = r.get("creator", "")
+                rid        = r["id"]
+                creator    = r.get("creator", "")
+                created_at = r.get("created_at", 0.0)
+                icon       = r.get("icon", "")
                 self._conv.upsert_room(
                     rid, r["name"], creator,
                     r.get("members", 0), r.get("locked", False)
@@ -1216,7 +1580,12 @@ class MainWindow(QMainWindow):
                 if rid not in self._rooms:
                     self._rooms[rid] = {"name": r["name"], "members": [],
                                         "locked": r.get("locked", False),
-                                        "key": None, "creator": creator}
+                                        "key": None, "creator": creator,
+                                        "created_at": created_at, "icon": icon}
+                else:
+                    # Update fields that can change
+                    self._rooms[rid]["created_at"] = created_at
+                    self._rooms[rid]["icon"] = icon
 
         elif mtype == T.ROOM_DELETED:
             rid = payload.get("room_id", "")
@@ -1224,7 +1593,23 @@ class MainWindow(QMainWindow):
             self._conv.remove_room(rid)
             if self._chat.current_room_id == rid:
                 self._chat.close_room(remove_history=True)
-                self.statusBar().showMessage("该聊天室已被创建者删除", 5000)
+                QMessageBox.information(self, "聊天室已删除", "该聊天室已被创建者删除。")
+
+        elif mtype == T.ROOM_NAME_UPDATED:
+            rid  = payload.get("room_id", "")
+            name = payload.get("name", "")
+            if rid in self._rooms:
+                locked = self._rooms[rid].get("locked", False)
+                self._rooms[rid]["name"] = name
+                self._conv.update_room_name(rid, name)
+                self._chat.update_room_name(rid, name, locked)
+
+        elif mtype == T.ROOM_ICON_UPDATED:
+            rid  = payload.get("room_id", "")
+            icon = payload.get("icon", "")
+            if rid in self._rooms:
+                self._rooms[rid]["icon"] = icon
+                self._chat.update_room_icon(rid, icon)
 
         # ── New protocol messages ─────────────────────────────────────────────
 
@@ -1677,22 +2062,36 @@ class MainWindow(QMainWindow):
         self._bridge.send_frame(T.CREATE_ROOM, name=v["name"], password=v["password"])
 
     @pyqtSlot()
-    def _on_join_room(self):
+    def _on_search_rooms(self):
         if not self._bridge or not self._bridge._queue:
-            _log.error("JOIN_ROOM aborted: not connected to server")
-            QMessageBox.critical(self, "未连接", "尚未连接到服务器，无法加入房间。\n请检查服务器地址后重试。")
+            QMessageBox.critical(self, "未连接", "尚未连接到服务器。\n请检查服务器地址后重试。")
             return
-        dlg = RoomDialog("join", self)
+        # Refresh room list before opening dialog
+        self._bridge.send_frame(T.LIST_ROOMS)
+        dlg = RoomSearchDialog(self._rooms, self._username, self)
         self._style_dialog(dlg)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        dlg.join_requested.connect(self._on_join_from_search)
+        dlg.exec()
+
+    @pyqtSlot(str, str)
+    def _on_join_from_search(self, room_id: str, password: str):
+        if not self._bridge or not self._bridge._queue:
             return
-        v   = dlg.values()
-        rid = v["room_id"]
-        key = derive_key(rid, v["password"]) if v["password"] else None
-        self._rooms.setdefault(rid, {})["_pending_key"] = key
+        key = derive_key(room_id, password) if password else None
+        self._rooms.setdefault(room_id, {})["_pending_key"] = key
         if self._chat.current_room_id:
             self._implicit_leave = True
-        self._bridge.send_frame(T.JOIN_ROOM, room_id=rid, password=v["password"])
+        self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, password=password)
+
+    @pyqtSlot(str, str)
+    def _on_room_rename(self, room_id: str, new_name: str):
+        if self._bridge:
+            self._bridge.send_frame(T.SET_ROOM_NAME, room_id=room_id, name=new_name)
+
+    @pyqtSlot(str, str)
+    def _on_room_icon_change(self, room_id: str, icon: str):
+        if self._bridge:
+            self._bridge.send_frame(T.SET_ROOM_ICON, room_id=room_id, icon=icon)
 
     @pyqtSlot(str)
     def _on_send_message(self, text: str):
