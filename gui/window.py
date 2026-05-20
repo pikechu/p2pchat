@@ -30,7 +30,7 @@ from PyQt6.QtGui import (
     QAction,
 )
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
     QPushButton, QScrollArea, QLineEdit, QTextEdit,
     QDialog, QDialogButtonBox, QFormLayout, QSizePolicy,
     QFrame, QMessageBox, QMenu, QToolButton, QApplication,
