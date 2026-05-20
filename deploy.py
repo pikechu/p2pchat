@@ -106,9 +106,9 @@ def _step_upload(target: str, port_args: list[str], remote_dir: str) -> None:
 def _step_install(target: str, port_args: list[str], remote_dir: str) -> None:
     console.print("\n[bold cyan]2/5  安装 Python 依赖[/bold cyan]")
 
-    # 确保 python3 + python3-venv 都已安装
+    # 确保 ensurepip 可用（python3-venv 包提供）
     venv_check = _ssh(target, port_args,
-                      "python3 -m venv --help", "检测 venv", check=False)
+                      "python3 -c 'import ensurepip'", "检测 ensurepip", check=False)
     if venv_check.returncode != 0:
         console.print("  [yellow]python3-venv 未找到，尝试 apt 安装...[/yellow]")
         _ssh(target, port_args,
