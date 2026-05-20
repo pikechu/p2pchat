@@ -5,7 +5,7 @@ from datetime import datetime
 from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QPainter, QPainterPath, QLinearGradient, QColor,
-    QBrush, QPen, QFont, QAction,
+    QBrush, QPen, QFont, QAction, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QSizePolicy,
@@ -18,38 +18,61 @@ from .theme import TOKENS, avatar_stops
 # ── Avatar ────────────────────────────────────────────────────────────────────
 
 class Avatar(QWidget):
-    """Circular avatar: gradient background + initials (IBM Plex Mono)."""
+    """Circular avatar: gradient background + initials, or custom image."""
+
+    clicked = pyqtSignal()
 
     def __init__(self, name: str = "", size: int = 36, parent=None):
         super().__init__(parent)
-        self._name = name
-        self._sz   = size
+        self._name   = name
+        self._sz     = size
+        self._pixmap: QPixmap | None = None
         self.setFixedSize(size, size)
 
     def set_name(self, name: str):
         self._name = name
         self.update()
 
+    def set_pixmap(self, pixmap: QPixmap | None):
+        self._pixmap = pixmap
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        stops = avatar_stops(self._name or "?")
-        grad  = QLinearGradient(0, 0, self._sz, self._sz)
-        grad.setColorAt(0, QColor(stops[0]))
-        grad.setColorAt(1, QColor(stops[1]))
-
         path = QPainterPath()
         path.addEllipse(QRectF(0, 0, self._sz, self._sz))
-        p.fillPath(path, QBrush(grad))
+        p.setClipPath(path)
 
-        initials = (self._name or "?")[:2].upper()
-        font = QFont("IBM Plex Mono", max(7, self._sz // 3))
-        font.setWeight(QFont.Weight.DemiBold)
-        p.setFont(font)
-        p.setPen(QColor("white"))
-        p.drawText(QRectF(0, 0, self._sz, self._sz),
-                   Qt.AlignmentFlag.AlignCenter, initials)
+        if self._pixmap and not self._pixmap.isNull():
+            scaled = self._pixmap.scaled(
+                self._sz, self._sz,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self._sz - scaled.width()) // 2
+            y = (self._sz - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            stops = avatar_stops(self._name or "?")
+            grad  = QLinearGradient(0, 0, self._sz, self._sz)
+            grad.setColorAt(0, QColor(stops[0]))
+            grad.setColorAt(1, QColor(stops[1]))
+            p.fillPath(path, QBrush(grad))
+
+            initials = (self._name or "?")[:2].upper()
+            font = QFont("IBM Plex Mono", max(7, self._sz // 3))
+            font.setWeight(QFont.Weight.DemiBold)
+            p.setFont(font)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(0, 0, self._sz, self._sz),
+                       Qt.AlignmentFlag.AlignCenter, initials)
 
 
 # ── Status dot ────────────────────────────────────────────────────────────────

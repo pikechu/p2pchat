@@ -41,8 +41,7 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Beam")
-    app.setApplicationDisplayName("Beam — P2P Chat")
+    app.setApplicationName("Beam — P2P Chat")
 
     icon_path = _resource(os.path.join("assets", "icon.png"))
     if os.path.exists(icon_path):

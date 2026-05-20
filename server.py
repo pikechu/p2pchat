@@ -168,7 +168,8 @@ class ChatServer:
             room.members.pop(username, None)
             # Rooms persist even when empty — never auto-delete
             if room.members:
-                await self._broadcast(room, T.USER_LEFT, username=username)
+                await self._broadcast(room, T.USER_LEFT, username=username,
+                                      room_id=room_id)
             else:
                 log.info("room %s is now empty (persisted)", room_id)
         # Clean up any in-progress transfers started by this user
@@ -271,7 +272,8 @@ class ChatServer:
                                      icon=room.icon,
                                      members=list(room.members))
                     await self._broadcast(room, T.USER_JOINED,
-                                          exclude=username, username=username)
+                                          exclude=username, username=username,
+                                          room_id=rid)
                     log.info("%s joined room %s", username, rid)
 
                 # ── LEAVE_ROOM ───────────────────────────────────────────────

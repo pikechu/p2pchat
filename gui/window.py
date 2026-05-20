@@ -5,6 +5,7 @@ import logging
 import logging.handlers
 import os
 import pathlib
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -182,6 +183,8 @@ class SettingsDialog(QDialog):
 # ── Rail (left icon bar) ──────────────────────────────────────────────────────
 
 class Rail(QWidget):
+    avatar_change = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Rail")
@@ -191,19 +194,6 @@ class Rail(QWidget):
         lay.setContentsMargins(8, 12, 8, 12)
         lay.setSpacing(4)
         lay.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        mark = QLabel("B")
-        mark.setObjectName("RailBtn")
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mark.setFixedSize(40, 40)
-        mark.setStyleSheet(
-            "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
-            " stop:0 #0088cc, stop:1 #5fc4ee);"
-            "color:white; font-size:16px; font-weight:700;"
-            "border-radius:8px;"
-        )
-        lay.addWidget(mark, alignment=Qt.AlignmentFlag.AlignHCenter)
-        lay.addSpacing(8)
 
         self._btns: dict[str, QPushButton] = {}
         icons = [("💬", "chats"), ("👥", "peers"), ("📁", "files")]
@@ -224,6 +214,9 @@ class Rail(QWidget):
         lay.addWidget(self._settings_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         self._avatar = Avatar("?", 36)
+        self._avatar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._avatar.setToolTip("更换头像")
+        self._avatar.clicked.connect(self.avatar_change)
         lay.addWidget(self._avatar, alignment=Qt.AlignmentFlag.AlignHCenter)
 
     def set_active(self, key: str):
@@ -234,6 +227,9 @@ class Rail(QWidget):
 
     def set_username(self, name: str):
         self._avatar.set_name(name)
+
+    def set_avatar_pixmap(self, pixmap):
+        self._avatar.set_pixmap(pixmap)
 
 
 # ── Conversation list panel ───────────────────────────────────────────────────
@@ -1316,8 +1312,12 @@ class MainWindow(QMainWindow):
         # DM state: "@peer" → peer username
         self._dms: dict[str, str] = {}
 
-        # File transfer state
-        downloads = pathlib.Path.home() / "Downloads" / "P2PChat"
+        # File transfer state — save next to exe when frozen, else project root
+        if getattr(sys, 'frozen', False):
+            _dl_base = pathlib.Path(sys.executable).parent
+        else:
+            _dl_base = pathlib.Path(__file__).parent.parent
+        downloads = _dl_base / "downloads"
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
         self._ft_cards: dict[str, "FileCard"] = {}
         self._current_peer: str = ""
@@ -1336,6 +1336,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 560)
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().hide()
+        self._load_avatar()
 
         QTimer.singleShot(100, self._connect)
 
@@ -1355,6 +1356,7 @@ class MainWindow(QMainWindow):
         self._rail._btns["chats"].clicked.connect(self._on_rail_chats)
         self._rail._btns["peers"].clicked.connect(self._on_rail_peers)
         self._rail._btns["files"].clicked.connect(self._on_rail_files)
+        self._rail.avatar_change.connect(self._on_change_avatar)
         self._rail.set_active("chats")
         root.addWidget(self._rail)
 
@@ -1412,6 +1414,10 @@ class MainWindow(QMainWindow):
         for rid in self._rooms:
             self._conv.set_conn_state(rid, "offline")
             self._chat.set_conn_state("offline")
+        # Cancel all in-progress file transfers
+        for _tid, _card in list(self._ft_cards.items()):
+            _card.set_error("连接断开")
+        self._ft_cards.clear()
 
     # ── Incoming frame dispatcher ─────────────────────────────────────────────
 
@@ -1828,6 +1834,10 @@ class MainWindow(QMainWindow):
                                 filename=filename, size=len(data), mime=mime)
 
         def _send_chunk(i: int):
+            if not self._bridge or not self._bridge.isRunning():
+                if c := self._ft_cards.pop(tid, None):
+                    c.set_error("传输中断")
+                return
             if i >= total:
                 self._bridge.send_frame(T.FILE_ROOM_DONE,
                                         transfer_id=tid, sha256=sha)
@@ -2147,6 +2157,35 @@ class MainWindow(QMainWindow):
         if self._is_typing:
             self._is_typing = False
             self._typing_timer.stop()
+
+    _AVATAR_PATH = pathlib.Path.home() / ".p2pchat_avatar.png"
+
+    def _load_avatar(self):
+        if self._AVATAR_PATH.exists():
+            from PyQt6.QtGui import QPixmap as _QPixmap
+            px = _QPixmap(str(self._AVATAR_PATH))
+            if not px.isNull():
+                self._rail.set_avatar_pixmap(px)
+
+    @pyqtSlot()
+    def _on_change_avatar(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择头像图片", "",
+            "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+        if not path:
+            return
+        from PyQt6.QtGui import QPixmap as _QPixmap
+        px = _QPixmap(path)
+        if px.isNull():
+            return
+        # Save as square PNG at 128×128
+        scaled = px.scaled(128, 128,
+                           Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                           Qt.TransformationMode.SmoothTransformation)
+        scaled.save(str(self._AVATAR_PATH), "PNG")
+        self._rail.set_avatar_pixmap(scaled)
 
     @pyqtSlot()
     def _open_settings(self):
