@@ -3,5 +3,18 @@
     "allow": [
       "PowerShell(Get-ChildItem *)"
     ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo {\"systemMessage\": \"Workflow reminder: (1) run python -m pytest tests/ -q to verify, (2) git add relevant files + commit + push to GitHub before ending the session.\"}",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   }
 }
