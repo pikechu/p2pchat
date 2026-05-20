@@ -1,9 +1,21 @@
 """Main application window — Beam P2P Chat desktop client."""
 
 import json
+import logging
+import logging.handlers
 import pathlib
 import time
 from datetime import datetime
+
+_log = logging.getLogger("gui")
+if not _log.handlers:
+    _fh = logging.handlers.RotatingFileHandler(
+        "gui_client.log", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+    )
+    _fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
+                                       datefmt="%Y-%m-%d %H:%M:%S"))
+    _log.addHandler(_fh)
+    _log.setLevel(logging.DEBUG)
 
 from file_transfer import FileTransferManager, file_sha256
 
@@ -860,6 +872,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_disconnected(self, reason: str):
+        _log.error("bridge disconnected: %s", reason)
         self.statusBar().showMessage(f"Disconnected: {reason}")
         self._chat.close_room()
         # Mark all conv rows offline
@@ -882,6 +895,8 @@ class MainWindow(QMainWindow):
             self._dispatch_frame(mtype, payload, ts)
         except Exception as exc:
             import traceback
+            _log.error("frame dispatch error (type=%s): %s\n%s",
+                       mtype, exc, traceback.format_exc())
             self.statusBar().showMessage(f"Frame error ({mtype}): {exc}", 6000)
             traceback.print_exc()
 
@@ -894,7 +909,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(payload.get("message", ""), 3000)
 
         elif mtype == T.ERROR:
-            self.statusBar().showMessage("⚠  " + payload.get("message", ""), 5000)
+            msg = payload.get("message", "")
+            pending_room = "__pending__" in self._rooms
+            if pending_room:
+                _log.error("CREATE_ROOM error: %s", msg)
+            else:
+                _log.warning("server error: %s", msg)
+            self.statusBar().showMessage("⚠  " + msg, 5000)
 
         elif mtype == T.ROOM_CREATED:
             rid    = payload["room_id"]
@@ -1271,6 +1292,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_create_room(self):
         if not self._bridge or not self._bridge._queue:
+            _log.error("CREATE_ROOM aborted: not connected to server")
             self.statusBar().showMessage("⚠  Not connected to server", 4000)
             return
         dlg = RoomDialog("create", self)
@@ -1282,6 +1304,7 @@ class MainWindow(QMainWindow):
         self._rooms.setdefault("__pending__", {})["_pending_key"] = key
         if v["password"]:
             self._rooms["__pending__"]["_pending_pw"] = v["password"]
+        _log.info("CREATE_ROOM request: name=%r locked=%s", v["name"], bool(v["password"]))
         self._bridge.send_frame(T.CREATE_ROOM, name=v["name"], password=v["password"])
 
     @pyqtSlot()

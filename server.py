@@ -31,6 +31,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("server")
 
+# Persist logs to a rotating file (10 MB × 3 backups)
+from logging.handlers import RotatingFileHandler as _RFH
+_fh = _RFH("server.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
+                                   datefmt="%Y-%m-%d %H:%M:%S"))
+log.addHandler(_fh)
+
 # Characters used for room IDs — omits 0/O and 1/I/L to reduce confusion
 _ID_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _ID_LEN = 6
@@ -161,6 +168,7 @@ class ChatServer:
                 # ── CREATE_ROOM ──────────────────────────────────────────────
                 elif mtype == T.CREATE_ROOM:
                     if not username:
+                        log.warning("CREATE_ROOM rejected: SET_NAME not done (peer %s)", ws.remote_address)
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
                     room_name = str(payload.get("name", f"{username}'s room"))[:64]
