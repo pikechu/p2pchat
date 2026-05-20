@@ -11,8 +11,10 @@ from datetime import datetime
 
 _log = logging.getLogger("gui")
 if not _log.handlers:
+    _log_dir = pathlib.Path.home() / ".beamchat"
+    _log_dir.mkdir(parents=True, exist_ok=True)
     _fh = logging.handlers.RotatingFileHandler(
-        "gui_client.log", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+        _log_dir / "gui_client.log", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
     )
     _fh.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
                                        datefmt="%Y-%m-%d %H:%M:%S"))
