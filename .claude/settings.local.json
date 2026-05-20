@@ -45,7 +45,14 @@
       "Bash(python -m pytest tests/ -q)",
       "Bash(ls \"C:\\\\Users\\\\paprika\\\\.claude\\\\projects\\\\\" 2>/dev/null | head -20)",
       "Read(//c/Users/paprika/.claude/projects\" 2>/dev/**)",
-      "Read(//c/Users/paprika/.claude/projects/**)"
+      "Read(//c/Users/paprika/.claude/projects/**)",
+      "Bash(python -m py_compile deploy.py)",
+      "Bash(python deploy.py --help)",
+      "Bash(python -m py_compile publish.py)",
+      "Bash(python publish.py --help)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(git push *)"
     ]
   }
 }
