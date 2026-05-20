@@ -161,8 +161,9 @@ WantedBy=multi-user.target
 def _step_firewall(target: str, port_args: list[str], port: int) -> None:
     console.print(f"\n[bold cyan]4/5  开放端口 {port}/tcp[/bold cyan]")
 
+    # Always allow SSH (22) first so we don't lock ourselves out
     r = _ssh(target, port_args,
-             f"sudo ufw allow {port}/tcp && sudo ufw --force enable",
+             f"sudo ufw allow 22/tcp && sudo ufw allow {port}/tcp && sudo ufw --force enable",
              "UFW 开放端口", check=False)
     if r.returncode == 0:
         console.print(f"[green]  ✓ UFW 已放行 {port}/tcp[/green]")
