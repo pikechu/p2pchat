@@ -3,8 +3,10 @@
 import json
 import logging
 import logging.handlers
+import os
 import pathlib
 import time
+import uuid
 from datetime import datetime
 
 _log = logging.getLogger("gui")
@@ -17,7 +19,8 @@ if not _log.handlers:
     _log.addHandler(_fh)
     _log.setLevel(logging.DEBUG)
 
-from file_transfer import FileTransferManager, file_sha256
+from file_transfer import (FileTransferManager, file_sha256,
+                           split_file, reassemble_chunks, guess_mime)
 
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
@@ -29,7 +32,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QLineEdit, QTextEdit,
     QDialog, QDialogButtonBox, QFormLayout, QSizePolicy,
     QFrame, QMessageBox, QMenu, QToolButton, QApplication,
-    QCheckBox, QComboBox, QStackedWidget, QListWidget,
+    QCheckBox, QComboBox, QStackedWidget, QListWidget, QListWidgetItem,
 )
 
 from protocol import T, unpack
@@ -773,6 +776,93 @@ class ChatPanel(QWidget):
         return self._composer
 
 
+# ── Files panel ───────────────────────────────────────────────────────────────
+
+class _FileRow(QWidget):
+    def __init__(self, filename: str, from_user: str, room_name: str,
+                 size: int, save_path: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ConvRow")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(10)
+
+        icon = QLabel("📄")
+        icon.setFixedWidth(26)
+        lay.addWidget(icon)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        name_w = QLabel(filename)
+        name_w.setObjectName("ConvRowName")
+        name_w.setMaximumWidth(155)
+        from_w = QLabel(f"{from_user}  ·  {room_name}")
+        from_w.setObjectName("ConvRowPreview")
+        if size < 1024:
+            sz = f"{size} B"
+        elif size < 1024 * 1024:
+            sz = f"{size / 1024:.0f} KB"
+        else:
+            sz = f"{size / 1024 / 1024:.1f} MB"
+        size_w = QLabel(sz)
+        size_w.setObjectName("ConvRowTime")
+        info.addWidget(name_w)
+        info.addWidget(from_w)
+        info.addWidget(size_w)
+        lay.addLayout(info, 1)
+
+        if os.path.exists(save_path):
+            btn = QPushButton("打开")
+            btn.setObjectName("BtnGhost")
+            btn.setFixedHeight(26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda: os.startfile(save_path))
+            lay.addWidget(btn)
+
+
+class FilesPanel(QWidget):
+    def __init__(self, theme: str = "light", parent=None):
+        super().__init__(parent)
+        self.setObjectName("ConvPanel")
+        self.setFixedWidth(300)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        hdr = QWidget()
+        hdr.setObjectName("ConvHeader")
+        hlay = QHBoxLayout(hdr)
+        hlay.setContentsMargins(16, 14, 16, 10)
+        hlay.addWidget(_lbl("Files", "ConvTitle"))
+        hlay.addStretch()
+        lay.addWidget(hdr)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("ConvScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self._inner = QWidget()
+        self._inner.setObjectName("ConvList")
+        self._inner_lay = QVBoxLayout(self._inner)
+        self._inner_lay.setContentsMargins(0, 0, 0, 0)
+        self._inner_lay.setSpacing(0)
+        self._empty_lbl = _lbl("暂无共享文件", "EmptyDesc")
+        self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_lbl.setContentsMargins(20, 40, 20, 40)
+        self._inner_lay.addWidget(self._empty_lbl)
+        self._inner_lay.addStretch()
+
+        scroll.setWidget(self._inner)
+        lay.addWidget(scroll, 1)
+
+    def add_file(self, filename: str, from_user: str, room_name: str,
+                 size: int, save_path: str):
+        self._empty_lbl.hide()
+        row = _FileRow(filename, from_user, room_name, size, save_path)
+        self._inner_lay.insertWidget(1, row)   # newest at top, after hidden empty
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -832,14 +922,21 @@ class MainWindow(QMainWindow):
         self._rail._settings_btn.clicked.connect(self._open_settings)
         self._rail._btns["chats"].clicked.connect(self._on_rail_chats)
         self._rail._btns["peers"].clicked.connect(self._on_rail_peers)
+        self._rail._btns["files"].clicked.connect(self._on_rail_files)
         self._rail.set_active("chats")
         root.addWidget(self._rail)
 
+        self._side_stack = QStackedWidget()
         self._conv = ConvPanel(self._theme)
         self._conv.room_selected.connect(self._on_room_selected)
         self._conv.create_room.connect(self._on_create_room)
         self._conv.join_room.connect(self._on_join_room)
-        root.addWidget(self._conv)
+        self._side_stack.addWidget(self._conv)           # index 0: chats
+
+        self._files_panel = FilesPanel(self._theme)
+        self._side_stack.addWidget(self._files_panel)    # index 1: files
+
+        root.addWidget(self._side_stack)
 
         self._chat = ChatPanel(self._theme)
         self._chat.send_message.connect(self._on_send_message)
@@ -1080,6 +1177,10 @@ class MainWindow(QMainWindow):
             self._on_file_done(payload)
         elif mtype == T.FILE_ERROR:
             self._on_file_error(payload)
+        elif mtype == T.FILE_ROOM_AVAILABLE:
+            self._on_file_room_available(payload)
+        elif mtype == T.FILE_ROOM_ERROR:
+            self._on_file_room_error(payload)
 
     # ── Typing ────────────────────────────────────────────────────────────────
 
@@ -1101,6 +1202,11 @@ class MainWindow(QMainWindow):
 
     def _on_rail_chats(self):
         self._rail.set_active("chats")
+        self._side_stack.setCurrentIndex(0)
+
+    def _on_rail_files(self):
+        self._rail.set_active("files")
+        self._side_stack.setCurrentIndex(1)
 
     def _on_rail_peers(self):
         self._rail.set_active("peers")
@@ -1135,13 +1241,21 @@ class MainWindow(QMainWindow):
         lay.addWidget(_lbl("Online Users", "DialogTitle"))
 
         if not users:
-            lay.addWidget(_lbl("No other users online right now.", "EmptyDesc"))
+            lay.addWidget(_lbl("No users online right now.", "EmptyDesc"))
         else:
             list_w = QListWidget()
-            list_w.addItems(users)
-            list_w.itemDoubleClicked.connect(
-                lambda item: (self._start_dm(item.text()), dlg.accept())
-            )
+            for u in users:
+                item = QListWidgetItem(f"{u}（我）" if u == self._username else u)
+                item.setData(Qt.ItemDataRole.UserRole, u)
+                list_w.addItem(item)
+
+            def _on_double_click(item):
+                uid = item.data(Qt.ItemDataRole.UserRole)
+                if uid != self._username:
+                    self._start_dm(uid)
+                    dlg.accept()
+
+            list_w.itemDoubleClicked.connect(_on_double_click)
             lay.addWidget(list_w)
 
             hint = _lbl("Double-click to open a direct message", "FormLabel")
@@ -1158,27 +1272,49 @@ class MainWindow(QMainWindow):
     # ── File transfer ─────────────────────────────────────────────────────────
 
     def _start_file_send(self, path: str):
-        if not self._current_peer:
-            self.statusBar().showMessage("No peer to send file to", 3000)
+        from protocol import pack as _pack
+        rid = self._chat.current_room_id
+        if not rid or rid.startswith("@"):
+            QMessageBox.warning(self, "发送失败", "请先加入一个聊天室再发送文件。")
             return
+        if not self._bridge or not self._bridge._queue:
+            QMessageBox.critical(self, "未连接", "尚未连接到服务器。")
+            return
+
         data = pathlib.Path(path).read_bytes()
+        if len(data) > 10 * 1024 * 1024:
+            QMessageBox.warning(self, "文件过大", "文件大小不能超过 10 MB。")
+            return
+
         filename = pathlib.Path(path).name
-        tid = self._ft_manager.register_outgoing(self._current_peer, filename, data)
-        info = self._ft_manager.outgoing[tid]
+        tid    = uuid.uuid4().hex[:12]
+        sha    = file_sha256(data)
+        chunks = split_file(data)
+        total  = len(chunks)
 
         card = FileCard(tid, filename, len(data), outgoing=True, theme=self._theme)
         card.cancel_requested.connect(self._cancel_transfer)
         self._ft_cards[tid] = card
         self._chat.add_file_card(card)
 
-        self._bridge.send_frame(
-            T.FILE_OFFER,
-            to=self._current_peer,
-            transfer_id=tid,
-            filename=filename,
-            size=len(data),
-            mime=info["mime"],
-        )
+        self._bridge.send_frame(T.FILE_ROOM_SHARE,
+                                room_id=rid, transfer_id=tid,
+                                filename=filename, size=len(data),
+                                mime=guess_mime(filename))
+
+        def _send_chunk(i: int):
+            if i >= total:
+                self._bridge.send_frame(T.FILE_ROOM_DONE,
+                                        transfer_id=tid, sha256=sha)
+                return
+            self._bridge.send_raw_frame(_pack(T.FILE_ROOM_CHUNK,
+                                              transfer_id=tid, index=i,
+                                              total=total, data=chunks[i]))
+            if c := self._ft_cards.get(tid):
+                c.set_progress(int((i + 1) / total * 100))
+            QTimer.singleShot(0, lambda: _send_chunk(i + 1))
+
+        _send_chunk(0)
 
     def _on_file_offer(self, p: dict):
         tid, from_user = p["transfer_id"], p["from"]
@@ -1267,6 +1403,54 @@ class MainWindow(QMainWindow):
                                         reason="Cancelled by receiver")
         self._ft_manager.cancel(tid)
         self._ft_cards.pop(tid, None)
+
+    def _on_file_room_available(self, p: dict):
+        tid       = p["transfer_id"]
+        filename  = p["filename"]
+        size      = p["size"]
+        from_user = p.get("from_user", "?")
+        room_id   = p.get("room_id", "")
+        sha       = p["sha256"]
+        chunks    = p.get("chunks", [])
+
+        data = reassemble_chunks([c for c in chunks if c is not None])
+        if file_sha256(data) != sha:
+            _log.error("FILE_ROOM_AVAILABLE checksum mismatch tid=%s", tid)
+            if card := self._ft_cards.pop(tid, None):
+                card.set_error("校验失败")
+            return
+
+        # Save to downloads dir (sender gets a local copy too)
+        save_path = self._ft_manager._dir / filename
+        stem, suffix = save_path.stem, save_path.suffix
+        counter = 1
+        while save_path.exists():
+            save_path = self._ft_manager._dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+        save_path.write_bytes(data)
+
+        # Update sender's upload card or create receiver's card in chat
+        if card := self._ft_cards.pop(tid, None):
+            card.set_done(save_path=str(save_path))
+        elif room_id == self._chat.current_room_id:
+            new_card = FileCard(tid, filename, size, outgoing=False,
+                                theme=self._theme)
+            new_card.set_done(save_path=str(save_path))
+            self._chat.add_file_card(new_card)
+
+        # Add to files panel
+        room_name = self._rooms.get(room_id, {}).get("name", room_id)
+        self._files_panel.add_file(filename, from_user, room_name,
+                                   size, str(save_path))
+
+    def _on_file_room_error(self, p: dict):
+        tid = p["transfer_id"]
+        msg = p.get("message", "上传失败")
+        _log.error("FILE_ROOM_ERROR tid=%s: %s", tid, msg)
+        if card := self._ft_cards.pop(tid, None):
+            card.set_error(msg)
+        else:
+            QMessageBox.warning(self, "文件上传失败", msg)
 
     # ── Reply ─────────────────────────────────────────────────────────────────
 

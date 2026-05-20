@@ -35,6 +35,14 @@ class T(str, Enum):
     FILE_DONE   = "FILE_DONE"    # {to, transfer_id, sha256}
     FILE_ERROR  = "FILE_ERROR"   # {to, transfer_id, message}
 
+    # room-based file sharing (client→server, broadcast to all room members)
+    FILE_ROOM_SHARE     = "FILE_ROOM_SHARE"      # {room_id, transfer_id, filename, size, mime}
+    FILE_ROOM_CHUNK     = "FILE_ROOM_CHUNK"      # {transfer_id, index, total, data (base64)}
+    FILE_ROOM_DONE      = "FILE_ROOM_DONE"       # {transfer_id, sha256}
+    # server → all room members
+    FILE_ROOM_AVAILABLE = "FILE_ROOM_AVAILABLE"  # {transfer_id, filename, size, mime, from_user, room_id, sha256, chunks}
+    FILE_ROOM_ERROR     = "FILE_ROOM_ERROR"      # {transfer_id, message}
+
     # server → client
     WELCOME      = "WELCOME"
     SYSTEM       = "SYSTEM"

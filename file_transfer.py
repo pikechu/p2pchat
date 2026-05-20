@@ -42,7 +42,7 @@ class FileTransferManager:
             "filename": filename,
             "data":     data,
             "chunks":   split_file(data),
-            "mime":     _guess_mime(filename),
+            "mime":     guess_mime(filename),
             "size":     len(data),
         }
         return tid
@@ -91,7 +91,7 @@ class FileTransferManager:
         self.incoming.pop(transfer_id, None)
 
 
-def _guess_mime(filename: str) -> str:
+def guess_mime(filename: str) -> str:
     ext = pathlib.Path(filename).suffix.lower()
     return {
         ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",

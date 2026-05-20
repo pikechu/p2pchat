@@ -71,6 +71,9 @@ class Room:
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
+MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB per room-shared file
+
+
 class ChatServer:
     def __init__(self):
         self._rooms: Dict[str, Room] = {}
@@ -82,6 +85,8 @@ class ChatServer:
         self._user_room: Dict[str, str] = {}
         # room_id → {seq: sender_username}  — for ack routing
         self._seq_to_sender: Dict[str, Dict[int, str]] = {}
+        # transfer_id → pending room-upload state
+        self._pending_uploads: Dict[str, dict] = {}
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -304,9 +309,76 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message=f"User '{to_user}' disconnected")
 
+                # ── FILE_ROOM_* (room-broadcast file sharing) ────────────
+                elif mtype == T.FILE_ROOM_SHARE:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    rid = self._user_room.get(username, "")
+                    if not rid:
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="Not in a room")
+                        continue
+                    size = int(payload.get("size", 0))
+                    if size > MAX_FILE_BYTES:
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message=f"文件过大（最大 {MAX_FILE_BYTES//1024//1024} MB）")
+                        continue
+                    tid = str(payload.get("transfer_id", ""))
+                    self._pending_uploads[tid] = {
+                        "room_id":   rid,
+                        "from_user": username,
+                        "filename":  str(payload.get("filename", "file")),
+                        "size":      size,
+                        "mime":      str(payload.get("mime", "")),
+                        "chunks":    [],
+                    }
+
+                elif mtype == T.FILE_ROOM_CHUNK:
+                    tid   = str(payload.get("transfer_id", ""))
+                    entry = self._pending_uploads.get(tid)
+                    if entry is None:
+                        continue
+                    idx   = int(payload.get("index", 0))
+                    total = int(payload.get("total", 1))
+                    # Grow list to fit
+                    while len(entry["chunks"]) < total:
+                        entry["chunks"].append(None)
+                    entry["chunks"][idx] = payload.get("data", "")
+
+                elif mtype == T.FILE_ROOM_DONE:
+                    tid   = str(payload.get("transfer_id", ""))
+                    entry = self._pending_uploads.pop(tid, None)
+                    if entry is None:
+                        continue
+                    room = self._rooms.get(entry["room_id"])
+                    if not room:
+                        continue
+                    sha = str(payload.get("sha256", ""))
+                    log.info("file '%s' (%d B) shared by %s in room %s",
+                             entry["filename"], entry["size"],
+                             entry["from_user"], entry["room_id"])
+                    for m_ws in list(room.members.values()):
+                        try:
+                            await m_ws.send(pack(
+                                T.FILE_ROOM_AVAILABLE,
+                                transfer_id=tid,
+                                filename=entry["filename"],
+                                size=entry["size"],
+                                mime=entry["mime"],
+                                from_user=entry["from_user"],
+                                room_id=entry["room_id"],
+                                sha256=sha,
+                                chunks=entry["chunks"],
+                            ))
+                        except websockets.exceptions.ConnectionClosed:
+                            pass
+
                 # ── LIST_USERS ──────────────────────────────────────────────
                 elif mtype == T.LIST_USERS:
-                    users = sorted(u for u in self._name_to_ws if u != username)
+                    users = sorted(self._name_to_ws.keys())   # includes self
                     await self._send(ws, T.USER_LIST, users=users)
 
                 # ── SEND_DM (user-to-user direct message) ───────────────────
