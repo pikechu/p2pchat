@@ -1371,8 +1371,8 @@ class MainWindow(QMainWindow):
             return
 
         data = pathlib.Path(path).read_bytes()
-        if len(data) > 10 * 1024 * 1024:
-            QMessageBox.warning(self, "文件过大", "文件大小不能超过 10 MB。")
+        if len(data) > 500 * 1024 * 1024:
+            QMessageBox.warning(self, "文件过大", "文件大小不能超过 500 MB。")
             return
 
         filename = pathlib.Path(path).name

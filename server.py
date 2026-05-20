@@ -71,7 +71,7 @@ class Room:
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
-MAX_FILE_BYTES = 10 * 1024 * 1024   # 10 MB per room-shared file
+MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB per room-shared file
 
 
 class ChatServer:
