@@ -52,7 +52,7 @@ def _run(cmd: list[str]) -> tuple[int, str]:
 
 
 def _ssh(target: str, port_args: list[str], cmd: str) -> tuple[int, str]:
-    full = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+    full = ["ssh", "-o", "ConnectTimeout=10",
             *port_args, target, cmd]
     r = subprocess.run(full, capture_output=True, text=True, encoding='utf-8', errors='replace')
     out = (r.stdout + r.stderr).strip()
