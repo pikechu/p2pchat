@@ -814,7 +814,6 @@ class _FileRow(QWidget):
         if os.path.exists(save_path):
             btn = QPushButton("打开")
             btn.setObjectName("BtnGhost")
-            btn.setFixedHeight(26)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda: os.startfile(save_path))
             lay.addWidget(btn)
@@ -927,6 +926,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._rail)
 
         self._side_stack = QStackedWidget()
+        self._side_stack.setFixedWidth(300)
         self._conv = ConvPanel(self._theme)
         self._conv.room_selected.connect(self._on_room_selected)
         self._conv.create_room.connect(self._on_create_room)
