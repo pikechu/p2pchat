@@ -1300,6 +1300,8 @@ class MainWindow(QMainWindow):
 
         # Room state: room_id → {name, members, locked, key}
         self._rooms: dict[str, dict] = {}
+        # Server-tracked room (may differ from displayed room when viewing a DM)
+        self._server_room_id: str = ""
         # True when we're leaving a room to join/create another (don't remove sidebar entry)
         self._implicit_leave: bool = False
 
@@ -1472,6 +1474,7 @@ class MainWindow(QMainWindow):
             self._conv.upsert_room(rid, name, self._username, 1, locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
+            self._server_room_id = rid
             self._chat.open_room(rid, name, [self._username], locked,
                                  creator=self._username, created_at=created_at,
                                  icon="", is_creator=True)
@@ -1497,19 +1500,23 @@ class MainWindow(QMainWindow):
             # Track first non-self member as file transfer peer
             others = [m for m in members if m != self._username]
             self._current_peer = others[0] if others else ""
+            self._server_room_id = rid
 
         elif mtype == T.ROOM_LEFT:
-            rid = self._chat.current_room_id
+            rid = self._server_room_id
+            self._server_room_id = ""
             if rid:
                 if self._implicit_leave:
                     # Switching to another room — preserve sidebar entry and history
                     self._implicit_leave = False
-                    self._chat.close_room(remove_history=False)
+                    if self._chat.current_room_id == rid:
+                        self._chat.close_room(remove_history=False)
                 else:
                     # Explicit leave or room dissolved — discard
                     self._rooms.pop(rid, None)
                     self._conv.remove_room(rid)
-                    self._chat.close_room(remove_history=True)
+                    if self._chat.current_room_id == rid:
+                        self._chat.close_room(remove_history=True)
 
         elif mtype == T.USER_JOINED:
             uname = payload.get("username", "")
@@ -1666,7 +1673,7 @@ class MainWindow(QMainWindow):
             client_mid = payload.get("client_mid", -1)
             if client_mid in self._pending_bubbles:
                 bubble = self._pending_bubbles.pop(client_mid)
-                bubble.set_status("sent")
+                bubble.set_status("delivered")
 
         elif mtype == T.FILE_OFFER:
             self._on_file_offer(payload)
@@ -1854,6 +1861,12 @@ class MainWindow(QMainWindow):
                 room_name = self._rooms.get(rid, {}).get("name", rid)
                 self._files_panel.add_file(filename, self._username,
                                            room_name, len(data), str(save_path))
+                return
+            # Throttle: limit queue depth to avoid flooding the asyncio send
+            # queue and starving ping/pong handling on slow connections.
+            q = self._bridge._queue
+            if q is not None and q.qsize() >= 16:
+                QTimer.singleShot(50, lambda: _send_chunk(i))
                 return
             self._bridge.send_raw_frame(_pack(T.FILE_ROOM_CHUNK,
                                               transfer_id=tid, index=i,
@@ -2045,7 +2058,7 @@ class MainWindow(QMainWindow):
             self._current_peer = peer
             self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
             return
-        if self._chat.current_room_id and not self._chat.current_room_id.startswith("@"):
+        if self._server_room_id:
             self._on_typing_stop()
             self._implicit_leave = True
             self._bridge.send_frame(T.LEAVE_ROOM)
@@ -2067,7 +2080,7 @@ class MainWindow(QMainWindow):
         if v["password"]:
             self._rooms["__pending__"]["_pending_pw"] = v["password"]
         _log.info("CREATE_ROOM request: name=%r locked=%s", v["name"], bool(v["password"]))
-        if self._chat.current_room_id:
+        if self._server_room_id:
             self._implicit_leave = True
         self._bridge.send_frame(T.CREATE_ROOM, name=v["name"], password=v["password"])
 
@@ -2089,7 +2102,7 @@ class MainWindow(QMainWindow):
             return
         key = derive_key(room_id, password) if password else None
         self._rooms.setdefault(room_id, {})["_pending_key"] = key
-        if self._chat.current_room_id:
+        if self._server_room_id:
             self._implicit_leave = True
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, password=password)
 

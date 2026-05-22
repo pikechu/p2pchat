@@ -103,3 +103,6 @@ class WSBridge(QThread):
                 await ws.send(data)
             except Exception as exc:
                 self.send_error.emit(str(exc))
+            # Yield to event loop between every send so ping/pong tasks
+            # can run even when many chunks are queued back-to-back.
+            await asyncio.sleep(0)

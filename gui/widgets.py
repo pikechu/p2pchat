@@ -175,7 +175,13 @@ class BubbleWidget(QFrame):
         msg_lbl.setObjectName("BubbleText")
         msg_lbl.setWordWrap(True)
         msg_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        msg_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        msg_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         vlay.addWidget(msg_lbl)
+        self._msg_lbl = msg_lbl
 
         # Time + delivery tick row
         bottom = QHBoxLayout()
@@ -222,11 +228,21 @@ class BubbleWidget(QFrame):
         self._tick.style().unpolish(self._tick)
         self._tick.style().polish(self._tick)
 
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self.layout().heightForWidth(width)
+
     def _show_context_menu(self, pos):
         menu = QMenu(self)
-        act = menu.addAction("↩  Reply")
+        copy_act  = menu.addAction("⎘  Copy")
+        reply_act = menu.addAction("↩  Reply")
         chosen = menu.exec(self.mapToGlobal(pos))
-        if chosen == act:
+        if chosen == copy_act:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.clipboard().setText(self._text)
+        elif chosen == reply_act:
             self.reply_requested.emit(self._sender, self._text, self._seq)
 
 
