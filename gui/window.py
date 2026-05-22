@@ -504,11 +504,19 @@ class MessagesArea(QScrollArea):
         row = QWidget()
         row_lay = QHBoxLayout(row)
         row_lay.setContentsMargins(0, 0, 0, 0)
-        row_lay.setSpacing(0)
+        row_lay.setSpacing(6)
         if outgoing:
             row_lay.addStretch()
-        row_lay.addWidget(bubble)
-        if not outgoing:
+            row_lay.addWidget(bubble)
+        else:
+            if show_sender:
+                av = Avatar(sender, 32)
+                row_lay.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
+            else:
+                placeholder = QWidget()
+                placeholder.setFixedWidth(32)
+                row_lay.addWidget(placeholder)
+            row_lay.addWidget(bubble)
             row_lay.addStretch()
         self._lay.insertWidget(self._lay.count() - 1, row)
         self._last_sender = sender
@@ -1499,7 +1507,7 @@ class MainWindow(QMainWindow):
             created_at = payload.get("created_at", time.time())
             pending    = self._rooms.pop("__pending__", {})
             pw  = pending.get("_pending_pw", "")
-            key = derive_key(rid, pw) if pw else None
+            key = derive_key(rid, pw)
             self._rooms[rid] = {"name": name, "members": [self._username],
                                 "locked": locked, "key": key, "_password": pw,
                                 "creator": self._username,
@@ -2118,7 +2126,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         v   = dlg.values()
-        key = derive_key("__pending__", v["password"]) if v["password"] else None
+        key = derive_key("__pending__", v["password"])
         self._rooms.setdefault("__pending__", {})["_pending_key"] = key
         if v["password"]:
             self._rooms["__pending__"]["_pending_pw"] = v["password"]
@@ -2143,7 +2151,7 @@ class MainWindow(QMainWindow):
     def _on_join_from_search(self, room_id: str, password: str):
         if not self._bridge or not self._bridge._queue:
             return
-        key = derive_key(room_id, password) if password else None
+        key = derive_key(room_id, password)
         self._rooms.setdefault(room_id, {})["_pending_key"] = key
         self._rooms[room_id]["_password"] = password
         if self._server_room_id:
