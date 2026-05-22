@@ -155,7 +155,7 @@ class BubbleWidget(QFrame):
         sp = QSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
-        self.setMaximumWidth(540)
+        self.setMaximumWidth(720)
 
         vlay = QVBoxLayout(self)
         vlay.setContentsMargins(0, 0, 0, 0)
@@ -233,10 +233,19 @@ class BubbleWidget(QFrame):
     def hasHeightForWidth(self) -> bool:
         return True
 
+    def sizeHint(self) -> QSize:
+        # Always prefer maximumWidth so bubbles use the full available width
+        # (WeChat-style), letting short text produce a 1-line tall bubble rather
+        # than an artificially narrow one.  Maximum policy still lets the layout
+        # shrink us on small screens.
+        w = self.maximumWidth()
+        h = self.heightForWidth(w)
+        return QSize(w, max(h, super().sizeHint().height()))
+
     def heightForWidth(self, width: int) -> int:
         m = self.contentsMargins()
         # Clamp to our max width: the parent layout may pass the full container
-        # width, but we render at most 540 px, so compute lines at that width.
+        # width, but we render at most 720 px, so compute lines at that width.
         inner_w = min(width, self.maximumWidth()) - m.left() - m.right()
         h = self.layout().heightForWidth(max(0, inner_w))
         return (h + m.top() + m.bottom()) if h >= 0 else -1

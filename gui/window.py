@@ -28,7 +28,7 @@ from file_transfer import (FileTransferManager, file_sha256,
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QLinearGradient, QBrush,
-    QAction,
+    QAction, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
@@ -462,9 +462,11 @@ class ChatHeader(QWidget):
 class MessagesArea(QScrollArea):
     reply_requested = pyqtSignal(str, str, int)   # sender, text, seq
 
-    def __init__(self, theme: str = "light", parent=None):
+    def __init__(self, theme: str = "light", own_name: str = "", parent=None):
         super().__init__(parent)
         self._theme = theme
+        self._own_name   = own_name
+        self._own_pixmap: QPixmap | None = None
         self.setObjectName("MsgsScroll")
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -480,6 +482,9 @@ class MessagesArea(QScrollArea):
         self._last_sender: str | None = None
         self._last_day:    str | None = None
 
+    def set_own_avatar(self, pixmap: QPixmap | None):
+        self._own_pixmap = pixmap
+
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool = False,
                     seq: int = 0,
@@ -494,7 +499,8 @@ class MessagesArea(QScrollArea):
             self._last_day = day
             self._last_sender = None
 
-        show_sender = sender != self._last_sender and not outgoing
+        show_av     = sender != self._last_sender
+        show_sender = show_av and not outgoing
         bubble = BubbleWidget(sender, text, ts, outgoing, show_sender,
                               self._theme, seq=seq, quote=quote)
         bubble.reply_requested.connect(self.reply_requested)
@@ -508,6 +514,15 @@ class MessagesArea(QScrollArea):
         if outgoing:
             row_lay.addStretch()
             row_lay.addWidget(bubble)
+            if show_av:
+                own_av = Avatar(self._own_name or sender, 32)
+                if self._own_pixmap:
+                    own_av.set_pixmap(self._own_pixmap)
+                row_lay.addWidget(own_av, 0, Qt.AlignmentFlag.AlignTop)
+            else:
+                ph = QWidget()
+                ph.setFixedWidth(32)
+                row_lay.addWidget(ph)
         else:
             if show_sender:
                 av = Avatar(sender, 32)
@@ -1041,8 +1056,10 @@ class ChatPanel(QWidget):
 
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
-        self._theme   = theme
-        self._room_id: str | None = None
+        self._theme      = theme
+        self._room_id:   str | None = None
+        self._own_name:  str = ""
+        self._own_pixmap: QPixmap | None = None
         self.setObjectName("ChatPanel")
 
         self._stack = QStackedWidget(self)
@@ -1115,6 +1132,13 @@ class ChatPanel(QWidget):
         self._typing_started_cb = start_cb
         self._typing_stopped_cb = stop_cb
 
+    def set_own_avatar(self, name: str, pixmap: QPixmap | None):
+        self._own_name   = name
+        self._own_pixmap = pixmap
+        for msgs in self._msgs_by_room.values():
+            msgs._own_name = name
+            msgs.set_own_avatar(pixmap)
+
     def _on_typing_start(self):
         if self._typing_started_cb:
             self._typing_started_cb()
@@ -1138,7 +1162,8 @@ class ChatPanel(QWidget):
         self._info_panel.update_room(room_id, name, creator, created_at, icon, is_creator)
 
         if room_id not in self._msgs_by_room:
-            msgs = MessagesArea(theme=self._theme)
+            msgs = MessagesArea(theme=self._theme, own_name=self._own_name)
+            msgs.set_own_avatar(self._own_pixmap)
             msgs.reply_requested.connect(self.reply_requested)
             self._msgs_by_room[room_id] = msgs
             self._msgs_stack.addWidget(msgs)
@@ -2227,10 +2252,10 @@ class MainWindow(QMainWindow):
 
     def _load_avatar(self):
         if self._AVATAR_PATH.exists():
-            from PyQt6.QtGui import QPixmap as _QPixmap
-            px = _QPixmap(str(self._AVATAR_PATH))
+            px = QPixmap(str(self._AVATAR_PATH))
             if not px.isNull():
                 self._rail.set_avatar_pixmap(px)
+                self._chat.set_own_avatar(self._username, px)
 
     @pyqtSlot()
     def _on_change_avatar(self):
@@ -2241,8 +2266,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        from PyQt6.QtGui import QPixmap as _QPixmap
-        px = _QPixmap(path)
+        px = QPixmap(path)
         if px.isNull():
             return
         # Save as square PNG at 128×128
@@ -2251,6 +2275,7 @@ class MainWindow(QMainWindow):
                            Qt.TransformationMode.SmoothTransformation)
         scaled.save(str(self._AVATAR_PATH), "PNG")
         self._rail.set_avatar_pixmap(scaled)
+        self._chat.set_own_avatar(self._username, scaled)
 
     @pyqtSlot()
     def _open_settings(self):
