@@ -1302,6 +1302,8 @@ class MainWindow(QMainWindow):
         self._rooms: dict[str, dict] = {}
         # Server-tracked room (may differ from displayed room when viewing a DM)
         self._server_room_id: str = ""
+        # Room to re-join after auto-reconnect
+        self._reconnect_room_id: str = ""
         # True when we're leaving a room to join/create another (don't remove sidebar entry)
         self._implicit_leave: bool = False
 
@@ -1399,6 +1401,7 @@ class MainWindow(QMainWindow):
         self._bridge.received.connect(self._on_frame)
         self._bridge.connected.connect(self._on_connected)
         self._bridge.disconnected.connect(self._on_disconnected)
+        self._bridge.reconnecting.connect(self._on_reconnecting)
         self._bridge.start()
 
     @pyqtSlot()
@@ -1406,16 +1409,35 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Beam — P2P Chat")
         self._bridge.send_frame(T.SET_NAME, name=self._username)
         self._bridge.send_frame(T.LIST_ROOMS)
+        # Mark all known rooms online
+        for rid in self._rooms:
+            self._conv.set_conn_state(rid, "ok")
+        self._chat.set_conn_state("ok")
+        # Re-join the room we were in before disconnect (if any)
+        rejoin = self._reconnect_room_id
+        self._reconnect_room_id = ""
+        if rejoin and rejoin in self._rooms:
+            pw = self._rooms[rejoin].get("_password", "")
+            _log.info("Reconnect: re-joining room %s", rejoin)
+            self._bridge.send_frame(T.JOIN_ROOM, room_id=rejoin, password=pw)
+
+    @pyqtSlot(int)
+    def _on_reconnecting(self, attempt: int):
+        self.setWindowTitle(f"Beam — P2P Chat  [重连中... #{attempt}]")
 
     @pyqtSlot(str)
     def _on_disconnected(self, reason: str):
         _log.error("bridge disconnected: %s", reason)
-        self.setWindowTitle("Beam — P2P Chat  [disconnected]")
+        self.setWindowTitle("Beam — P2P Chat  [断线]")
+        # Save room for auto-reconnect before clearing server state
+        self._reconnect_room_id = self._server_room_id
+        self._server_room_id = ""
+        self._implicit_leave = False
         self._chat.close_room()
         # Mark all conv rows offline
         for rid in self._rooms:
             self._conv.set_conn_state(rid, "offline")
-            self._chat.set_conn_state("offline")
+        self._chat.set_conn_state("offline")
         # Cancel all in-progress file transfers
         for _tid, _card in list(self._ft_cards.items()):
             _card.set_error("连接断开")
@@ -1468,7 +1490,7 @@ class MainWindow(QMainWindow):
             pw  = pending.get("_pending_pw", "")
             key = derive_key(rid, pw) if pw else None
             self._rooms[rid] = {"name": name, "members": [self._username],
-                                "locked": locked, "key": key,
+                                "locked": locked, "key": key, "_password": pw,
                                 "creator": self._username,
                                 "created_at": created_at, "icon": ""}
             self._conv.upsert_room(rid, name, self._username, 1, locked)
@@ -1488,8 +1510,10 @@ class MainWindow(QMainWindow):
             created_at = payload.get("created_at", 0.0)
             icon       = payload.get("icon", "")
             key        = self._rooms.get(rid, {}).get("_pending_key")
+            pw         = self._rooms.get(rid, {}).get("_password", "")
             self._rooms[rid] = {"name": name, "members": members,
-                                "locked": locked, "key": key, "creator": creator,
+                                "locked": locked, "key": key, "_password": pw,
+                                "creator": creator,
                                 "created_at": created_at, "icon": icon}
             self._conv.upsert_room(rid, name, creator, len(members), locked)
             self._conv.set_active(rid)
@@ -1604,6 +1628,8 @@ class MainWindow(QMainWindow):
             rid = payload.get("room_id", "")
             self._rooms.pop(rid, None)
             self._conv.remove_room(rid)
+            if rid == self._server_room_id:
+                self._server_room_id = ""
             if self._chat.current_room_id == rid:
                 self._chat.close_room(remove_history=True)
                 QMessageBox.information(self, "聊天室已删除", "该聊天室已被创建者删除。")
@@ -1836,16 +1862,19 @@ class MainWindow(QMainWindow):
         self._ft_cards[tid] = card
         self._chat.add_file_card(card)
 
+        _log.info("File send start: %r  size=%d  chunks=%d", filename, len(data), total)
         self._bridge.send_frame(T.FILE_ROOM_SHARE,
                                 room_id=rid, transfer_id=tid,
                                 filename=filename, size=len(data), mime=mime)
 
         def _send_chunk(i: int):
             if not self._bridge or not self._bridge.isRunning():
+                _log.error("File send aborted at chunk %d/%d: bridge gone", i, total)
                 if c := self._ft_cards.pop(tid, None):
                     c.set_error("传输中断")
                 return
             if i >= total:
+                _log.info("File send complete: %r  (%d chunks sent)", filename, total)
                 self._bridge.send_frame(T.FILE_ROOM_DONE,
                                         transfer_id=tid, sha256=sha)
                 # Sender: save locally and mark done immediately
@@ -1866,8 +1895,11 @@ class MainWindow(QMainWindow):
             # queue and starving ping/pong handling on slow connections.
             q = self._bridge._queue
             if q is not None and q.qsize() >= 16:
+                _log.debug("File send throttle: chunk %d/%d  queue=%d", i, total, q.qsize())
                 QTimer.singleShot(50, lambda: _send_chunk(i))
                 return
+            if i % max(1, total // 10) == 0:
+                _log.info("File send progress: %d/%d (%.0f%%)", i, total, i / total * 100)
             self._bridge.send_raw_frame(_pack(T.FILE_ROOM_CHUNK,
                                               transfer_id=tid, index=i,
                                               total=total, data=chunks[i]))
@@ -2102,6 +2134,7 @@ class MainWindow(QMainWindow):
             return
         key = derive_key(room_id, password) if password else None
         self._rooms.setdefault(room_id, {})["_pending_key"] = key
+        self._rooms[room_id]["_password"] = password
         if self._server_room_id:
             self._implicit_leave = True
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, password=password)

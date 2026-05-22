@@ -152,7 +152,9 @@ class BubbleWidget(QFrame):
         self._theme    = theme
         self._seq      = seq
         self.setObjectName("BubbleOut" if outgoing else "BubbleIn")
-        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        sp = QSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
         self.setMaximumWidth(540)
 
         vlay = QVBoxLayout(self)
@@ -232,7 +234,12 @@ class BubbleWidget(QFrame):
         return True
 
     def heightForWidth(self, width: int) -> int:
-        return self.layout().heightForWidth(width)
+        m = self.contentsMargins()
+        # Clamp to our max width: the parent layout may pass the full container
+        # width, but we render at most 540 px, so compute lines at that width.
+        inner_w = min(width, self.maximumWidth()) - m.left() - m.right()
+        h = self.layout().heightForWidth(max(0, inner_w))
+        return (h + m.top() + m.bottom()) if h >= 0 else -1
 
     def _show_context_menu(self, pos):
         menu = QMenu(self)
