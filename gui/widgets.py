@@ -233,15 +233,6 @@ class BubbleWidget(QFrame):
     def hasHeightForWidth(self) -> bool:
         return True
 
-    def sizeHint(self) -> QSize:
-        # Always prefer maximumWidth so bubbles use the full available width
-        # (WeChat-style), letting short text produce a 1-line tall bubble rather
-        # than an artificially narrow one.  Maximum policy still lets the layout
-        # shrink us on small screens.
-        w = self.maximumWidth()
-        h = self.heightForWidth(w)
-        return QSize(w, max(h, super().sizeHint().height()))
-
     def heightForWidth(self, width: int) -> int:
         m = self.contentsMargins()
         # Clamp to our max width: the parent layout may pass the full container
