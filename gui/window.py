@@ -498,8 +498,19 @@ class MessagesArea(QScrollArea):
         bubble = BubbleWidget(sender, text, ts, outgoing, show_sender,
                               self._theme, seq=seq, quote=quote)
         bubble.reply_requested.connect(self.reply_requested)
-        align = Qt.AlignmentFlag.AlignRight if outgoing else Qt.AlignmentFlag.AlignLeft
-        self._lay.insertWidget(self._lay.count() - 1, bubble, alignment=align)
+        # Wrap in a row widget so heightForWidth() propagates through the layout.
+        # Passing alignment= directly to insertWidget() wraps the bubble in a
+        # fixed-size container using sizeHint() height, which truncates wrapped text.
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(0)
+        if outgoing:
+            row_lay.addStretch()
+        row_lay.addWidget(bubble)
+        if not outgoing:
+            row_lay.addStretch()
+        self._lay.insertWidget(self._lay.count() - 1, row)
         self._last_sender = sender
         QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
             self.verticalScrollBar().maximum()))
