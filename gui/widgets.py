@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal, QTimer, QEvent
 from PyQt6.QtGui import (
     QPainter, QPainterPath, QLinearGradient, QColor,
     QBrush, QPen, QFont, QAction, QPixmap,
@@ -152,10 +152,10 @@ class BubbleWidget(QFrame):
         self._theme    = theme
         self._seq      = seq
         self.setObjectName("BubbleOut" if outgoing else "BubbleIn")
-        sp = QSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sp.setHeightForWidth(True)
         self.setSizePolicy(sp)
-        self.setMaximumWidth(720)
+        self.setMaximumWidth(720)  # tightened to natural width by _update_max_width()
 
         vlay = QVBoxLayout(self)
         vlay.setContentsMargins(0, 0, 0, 0)
@@ -215,6 +215,25 @@ class BubbleWidget(QFrame):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
+        self._update_max_width()
+
+    def _update_max_width(self):
+        fm = self._msg_lbl.fontMetrics()
+        lines = self._text.split('\n') if self._text else ['']
+        text_w = max((fm.horizontalAdvance(line) for line in lines), default=0)
+        # For incoming messages, also account for sender name width
+        if not self._outgoing and self._sender:
+            text_w = max(text_w, fm.horizontalAdvance(self._sender))
+        # 24px horizontal padding from QSS: padding: 8px 12px → 12+12=24px
+        natural_w = max(text_w + 24, 60)  # 60px min keeps the time+tick row visible
+        self.setMaximumWidth(min(natural_w, 720))
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.FontChange and hasattr(self, '_msg_lbl'):
+            self._update_max_width()
+            self.updateGeometry()
+
     def set_status(self, status: str):
         """Update delivery tick. status: 'sent' | 'delivered' | 'read'."""
         if not hasattr(self, '_tick'):
@@ -232,6 +251,15 @@ class BubbleWidget(QFrame):
 
     def hasHeightForWidth(self) -> bool:
         return True
+
+    def sizeHint(self) -> QSize:
+        # Use maximumWidth (= natural text width capped at 720) as the preferred
+        # width.  QLabel.sizeHint() caches the last layout width and will return
+        # 720 after the bubble was first rendered wide; bypassing it here gives
+        # correct QQ-style narrow bubbles for short text.
+        w = self.maximumWidth()
+        h = self.heightForWidth(w)
+        return QSize(w, h if h >= 0 else super().sizeHint().height())
 
     def heightForWidth(self, width: int) -> int:
         m = self.contentsMargins()
