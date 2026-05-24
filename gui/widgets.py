@@ -230,7 +230,14 @@ class BubbleWidget(QFrame):
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
-        if event.type() == QEvent.Type.FontChange and hasattr(self, '_msg_lbl'):
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange) \
+                and hasattr(self, '_msg_lbl'):
+            self._update_max_width()
+            self.updateGeometry()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if hasattr(self, '_msg_lbl'):
             self._update_max_width()
             self.updateGeometry()
 

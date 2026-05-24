@@ -90,6 +90,8 @@ class ChatServer:
         self._user_room: Dict[str, str] = {}
         # room_id → {seq: sender_username}  — for ack routing
         self._seq_to_sender: Dict[str, Dict[int, str]] = {}
+        # username → base64-encoded PNG avatar (set via SET_AVATAR)
+        self._user_avatar: Dict[str, str] = {}
         # transfer_id → {room_id, from_user, filename, size, mime}
         # Chunks are NOT stored — relayed immediately to avoid memory blowup
         self._load_rooms()
@@ -274,6 +276,18 @@ class ChatServer:
                     await self._broadcast(room, T.USER_JOINED,
                                           exclude=username, username=username,
                                           room_id=rid)
+                    # Send the joiner's avatar to existing members, and existing
+                    # members' avatars to the joiner.
+                    if username in self._user_avatar:
+                        await self._broadcast(room, T.USER_AVATAR,
+                                              exclude=username,
+                                              name=username,
+                                              data=self._user_avatar[username])
+                    for member, member_ws in room.members.items():
+                        if member != username and member in self._user_avatar:
+                            await self._send(ws, T.USER_AVATAR,
+                                             name=member,
+                                             data=self._user_avatar[member])
                     log.info("%s joined room %s", username, rid)
 
                 # ── LEAVE_ROOM ───────────────────────────────────────────────
@@ -482,6 +496,21 @@ class ChatServer:
                         for r in self._rooms.values()
                     ]
                     await self._send(ws, T.ROOM_LIST, rooms=rooms)
+
+                # ── SET_AVATAR ───────────────────────────────────────────────
+                elif mtype == T.SET_AVATAR:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    data = str(payload.get("data", ""))
+                    if data:
+                        self._user_avatar[username] = data
+                        # Broadcast to everyone in the user's current room
+                        rid = self._user_room.get(username)
+                        if rid and rid in self._rooms:
+                            await self._broadcast(self._rooms[rid], T.USER_AVATAR,
+                                                  exclude=username,
+                                                  name=username, data=data)
 
                 # ── DELETE_ROOM ──────────────────────────────────────────────
                 elif mtype == T.DELETE_ROOM:

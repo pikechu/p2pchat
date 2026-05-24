@@ -481,9 +481,13 @@ class MessagesArea(QScrollArea):
         self.setWidget(self._container)
         self._last_sender: str | None = None
         self._last_day:    str | None = None
+        self._peer_pixmaps: dict[str, QPixmap] = {}
 
     def set_own_avatar(self, pixmap: QPixmap | None):
         self._own_pixmap = pixmap
+
+    def set_peer_avatar(self, name: str, pixmap: QPixmap) -> None:
+        self._peer_pixmaps[name] = pixmap
 
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool = False,
@@ -526,6 +530,8 @@ class MessagesArea(QScrollArea):
         else:
             if show_sender:
                 av = Avatar(sender, 32)
+                if sender in self._peer_pixmaps:
+                    av.set_pixmap(self._peer_pixmaps[sender])
                 row_lay.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
             else:
                 placeholder = QWidget()
@@ -1060,6 +1066,7 @@ class ChatPanel(QWidget):
         self._room_id:   str | None = None
         self._own_name:  str = ""
         self._own_pixmap: QPixmap | None = None
+        self._peer_pixmaps: dict[str, QPixmap] = {}
         self.setObjectName("ChatPanel")
 
         self._stack = QStackedWidget(self)
@@ -1139,6 +1146,11 @@ class ChatPanel(QWidget):
             msgs._own_name = name
             msgs.set_own_avatar(pixmap)
 
+    def set_peer_avatar(self, name: str, pixmap: QPixmap) -> None:
+        self._peer_pixmaps[name] = pixmap
+        for msgs in self._msgs_by_room.values():
+            msgs.set_peer_avatar(name, pixmap)
+
     def _on_typing_start(self):
         if self._typing_started_cb:
             self._typing_started_cb()
@@ -1164,6 +1176,8 @@ class ChatPanel(QWidget):
         if room_id not in self._msgs_by_room:
             msgs = MessagesArea(theme=self._theme, own_name=self._own_name)
             msgs.set_own_avatar(self._own_pixmap)
+            for peer, px in self._peer_pixmaps.items():
+                msgs.set_peer_avatar(peer, px)
             msgs.reply_requested.connect(self.reply_requested)
             self._msgs_by_room[room_id] = msgs
             self._msgs_stack.addWidget(msgs)
@@ -1452,6 +1466,7 @@ class MainWindow(QMainWindow):
     def _on_connected(self):
         self.setWindowTitle("Beam — P2P Chat")
         self._bridge.send_frame(T.SET_NAME, name=self._username)
+        self._send_avatar()
         self._bridge.send_frame(T.LIST_ROOMS)
         # Mark all known rooms online
         for rid in self._rooms:
@@ -1765,6 +1780,23 @@ class MainWindow(QMainWindow):
             self._on_file_room_done(payload)
         elif mtype == T.FILE_ROOM_ERROR:
             self._on_file_room_error(payload)
+        elif mtype == T.USER_AVATAR:
+            self._on_user_avatar(payload)
+
+    def _on_user_avatar(self, payload: dict):
+        import base64
+        name = payload.get("name", "")
+        data = payload.get("data", "")
+        if not name or not data:
+            return
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            return
+        px = QPixmap()
+        if not px.loadFromData(raw):
+            return
+        self._chat.set_peer_avatar(name, px)
 
     # ── Room management ───────────────────────────────────────────────────────
 
@@ -2257,6 +2289,14 @@ class MainWindow(QMainWindow):
                 self._rail.set_avatar_pixmap(px)
                 self._chat.set_own_avatar(self._username, px)
 
+    def _send_avatar(self):
+        """Encode the saved avatar as base64 and send SET_AVATAR to the server."""
+        if not self._AVATAR_PATH.exists() or not self._bridge:
+            return
+        import base64
+        data = base64.b64encode(self._AVATAR_PATH.read_bytes()).decode()
+        self._bridge.send_frame(T.SET_AVATAR, data=data)
+
     @pyqtSlot()
     def _on_change_avatar(self):
         from PyQt6.QtWidgets import QFileDialog
@@ -2276,6 +2316,7 @@ class MainWindow(QMainWindow):
         scaled.save(str(self._AVATAR_PATH), "PNG")
         self._rail.set_avatar_pixmap(scaled)
         self._chat.set_own_avatar(self._username, scaled)
+        self._send_avatar()
 
     @pyqtSlot()
     def _open_settings(self):

@@ -29,6 +29,7 @@ class T(str, Enum):
     DELETE_ROOM    = "DELETE_ROOM"    # {room_id} — creator only
     SET_ROOM_NAME  = "SET_ROOM_NAME"  # {room_id, name} — creator only
     SET_ROOM_ICON  = "SET_ROOM_ICON"  # {room_id, icon} — creator only
+    SET_AVATAR     = "SET_AVATAR"     # {data: base64 PNG} — client → server
 
     # file transfer (client→server, routed user-to-user)
     FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
@@ -66,6 +67,7 @@ class T(str, Enum):
     ROOM_DELETED      = "ROOM_DELETED"      # {room_id} — broadcast when creator deletes room
     ROOM_NAME_UPDATED = "ROOM_NAME_UPDATED" # {room_id, name} — broadcast on rename
     ROOM_ICON_UPDATED = "ROOM_ICON_UPDATED" # {room_id, icon} — broadcast on icon change
+    USER_AVATAR    = "USER_AVATAR"    # {name, data: base64 PNG} — server → client
 
 
 def pack(msg_type: T, **payload) -> str:
