@@ -1531,6 +1531,10 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
+            # Silently swallow avatar errors — old servers don't know SET_AVATAR
+            if "SET_AVATAR" in msg or "USER_AVATAR" in msg:
+                _log.warning("server avatar error (suppressed): %s", msg)
+                return
             pending_room = "__pending__" in self._rooms
             if pending_room:
                 _log.error("CREATE_ROOM error: %s", msg)
