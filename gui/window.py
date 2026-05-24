@@ -1466,7 +1466,6 @@ class MainWindow(QMainWindow):
     def _on_connected(self):
         self.setWindowTitle("Beam — P2P Chat")
         self._bridge.send_frame(T.SET_NAME, name=self._username)
-        self._send_avatar()
         self._bridge.send_frame(T.LIST_ROOMS)
         # Mark all known rooms online
         for rid in self._rooms:
@@ -1527,7 +1526,8 @@ class MainWindow(QMainWindow):
             pass
 
         elif mtype == T.SYSTEM:
-            pass  # system welcome messages are informational only
+            if payload.get("message", "").startswith("Name set to"):
+                self._send_avatar()
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
@@ -2290,12 +2290,14 @@ class MainWindow(QMainWindow):
                 self._chat.set_own_avatar(self._username, px)
 
     def _send_avatar(self):
-        """Encode the saved avatar as base64 and send SET_AVATAR to the server."""
         if not self._AVATAR_PATH.exists() or not self._bridge:
             return
-        import base64
-        data = base64.b64encode(self._AVATAR_PATH.read_bytes()).decode()
-        self._bridge.send_frame(T.SET_AVATAR, data=data)
+        try:
+            import base64
+            data = base64.b64encode(self._AVATAR_PATH.read_bytes()).decode()
+            self._bridge.send_frame(T.SET_AVATAR, data=data)
+        except Exception as exc:
+            _log.warning("_send_avatar failed: %s", exc)
 
     @pyqtSlot()
     def _on_change_avatar(self):
