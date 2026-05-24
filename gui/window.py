@@ -482,12 +482,15 @@ class MessagesArea(QScrollArea):
         self._last_sender: str | None = None
         self._last_day:    str | None = None
         self._peer_pixmaps: dict[str, QPixmap] = {}
+        self._peer_avatar_widgets: dict[str, list] = {}   # sender → [Avatar, ...]
 
     def set_own_avatar(self, pixmap: QPixmap | None):
         self._own_pixmap = pixmap
 
     def set_peer_avatar(self, name: str, pixmap: QPixmap) -> None:
         self._peer_pixmaps[name] = pixmap
+        for av in self._peer_avatar_widgets.get(name, []):
+            av.set_pixmap(pixmap)
 
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool = False,
@@ -532,6 +535,7 @@ class MessagesArea(QScrollArea):
                 av = Avatar(sender, 32)
                 if sender in self._peer_pixmaps:
                     av.set_pixmap(self._peer_pixmaps[sender])
+                self._peer_avatar_widgets.setdefault(sender, []).append(av)
                 row_lay.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
             else:
                 placeholder = QWidget()
@@ -1531,8 +1535,8 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
-            # Silently swallow avatar errors — old servers don't know SET_AVATAR
-            if "SET_AVATAR" in msg or "USER_AVATAR" in msg:
+            # Silently swallow avatar errors — old servers don't know SET_AVATAR/USER_AVATAR
+            if "AVATAR" in msg.upper():
                 _log.warning("server avatar error (suppressed): %s", msg)
                 return
             pending_room = "__pending__" in self._rooms
