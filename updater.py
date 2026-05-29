@@ -37,6 +37,10 @@ def is_newer(remote: str, local: str = __version__) -> bool:
 
 # ── GitHub release check ──────────────────────────────────────────────────────
 
+import time as _time
+_cache: tuple | None = None          # (result_tuple, timestamp)
+_CACHE_TTL = 600                     # 10 minutes
+
 def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]:
     """
     Return (version, download_url, error_msg).
@@ -44,6 +48,12 @@ def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]
     - error_msg is set when the check itself failed (network / rate-limit).
     - Both None means "already latest".
     """
+    global _cache
+    if _cache is not None:
+        result, ts = _cache
+        if _time.time() - ts < _CACHE_TTL:
+            return result
+
     try:
         req = urllib.request.Request(
             GITHUB_API,
@@ -59,11 +69,15 @@ def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]
             return None, None, f"GitHub: {msg}"
         tag = data.get("tag_name", "")
         if not is_newer(tag):
-            return None, None, None          # genuinely up to date
+            result = (None, None, None)       # genuinely up to date
+            _cache = (result, _time.time())
+            return result
         for asset in data.get("assets", []):
             if asset.get("name", "").lower() == ASSET_NAME.lower():
-                return tag.lstrip("v"), asset["browser_download_url"], None
-        # Tag is newer but Actions hasn't uploaded the EXE yet
+                result = (tag.lstrip("v"), asset["browser_download_url"], None)
+                _cache = (result, _time.time())
+                return result
+        # Tag is newer but Actions hasn't uploaded the EXE yet — don't cache
         return None, None, f"v{tag.lstrip('v')} 正在构建中，请稍后重试"
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
