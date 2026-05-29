@@ -1676,6 +1676,9 @@ class MainWindow(QMainWindow):
                 # Delivered but not yet read
                 if seq and self._bridge:
                     self._bridge.send_frame(T.MSG_ACK, seq=seq, status="delivered")
+            # Flash taskbar button when the app window is not in focus
+            if not self.isActiveWindow():
+                QApplication.alert(self, 0)
 
         elif mtype == T.ROOM_LIST:
             for r in payload.get("rooms", []):
@@ -1767,6 +1770,8 @@ class MainWindow(QMainWindow):
                 self._chat.add_message(peer, text, ts, outgoing=False)
             else:
                 self._conv.set_preview(dm_id, f"{peer}: {text}", ts)
+            if not self.isActiveWindow():
+                QApplication.alert(self, 0)
 
         elif mtype == T.DM_ACK:
             client_mid = payload.get("client_mid", -1)
