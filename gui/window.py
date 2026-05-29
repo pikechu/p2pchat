@@ -2610,23 +2610,30 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         pref = self._close_pref
         if pref is None:
-            # Ask user what to do
             dlg = QDialog(self)
-            dlg.setWindowTitle("关闭")
+            dlg.setObjectName("Dialog")
             dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
             dlg.setModal(True)
+            dlg.setMinimumWidth(300)
             self._style_dialog(dlg)
             lay = QVBoxLayout(dlg)
             lay.setContentsMargins(24, 20, 24, 20)
-            lay.setSpacing(12)
+            lay.setSpacing(14)
+
             lay.addWidget(_lbl("关闭 Beam", "DialogTitle"))
             lay.addWidget(_lbl("请选择关闭方式：", "FormLabel"))
-            remember = QCheckBox("记住我的选择")
+
             tray_btn = _btn("最小化到托盘", "BtnPrimary")
-            quit_btn = _btn("退出程序",    "BtnGhost")
+            tray_btn.setMinimumWidth(160)
+            quit_btn = _btn("退出程序", "BtnGhost")
+            quit_btn.setMinimumWidth(160)
             lay.addWidget(tray_btn)
             lay.addWidget(quit_btn)
+
+            remember = QCheckBox("记住我的选择")
+            remember.setObjectName("CloseRemember")
             lay.addWidget(remember)
+
             chosen = {"v": None}
             def _tray():
                 chosen["v"] = "tray"
@@ -2637,7 +2644,7 @@ class MainWindow(QMainWindow):
             tray_btn.clicked.connect(_tray)
             quit_btn.clicked.connect(_quit)
             dlg.exec()
-            if chosen["v"] is None:   # dialog closed without choosing
+            if chosen["v"] is None:
                 event.ignore()
                 return
             if remember.isChecked():

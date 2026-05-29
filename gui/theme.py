@@ -263,11 +263,42 @@ def make_qss(theme: str = "light") -> str:
     }}
     #DialogTitle {{ font-size: 15px; font-weight: 600; color: {t['fg']}; }}
     #FormLabel {{ font-size: 12px; font-weight: 500; color: {t['fg3']}; }}
+    #CloseRemember {{ font-size: 12px; color: {t['fg3']}; }}
+    #CloseRemember::indicator {{
+        width: 14px; height: 14px;
+        border: 1px solid {t['line']}; border-radius: 3px;
+        background: {t['bg_input']};
+    }}
+    #CloseRemember::indicator:checked {{
+        background: {t['accent']}; border-color: {t['accent']};
+        image: none;
+    }}
     #FormInput {{
         background: {t['bg_input']}; border: 1px solid {t['line']};
         border-radius: 6px; padding: 8px 10px; font-size: 13.5px; color: {t['fg']};
     }}
     #FormInput:focus {{ border-color: {t['accent']}; }}
+    QComboBox#FormInput::drop-down {{ border: none; width: 24px; }}
+    QComboBox#FormInput::down-arrow {{
+        image: none; width: 0; height: 0;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 6px solid {t['fg3']};
+    }}
+    QComboBox#FormInput QAbstractItemView {{
+        background: {t['bg_input']};
+        border: 1px solid {t['line']};
+        border-radius: 6px;
+        outline: none;
+        selection-background-color: {t['bg_hover']};
+        selection-color: {t['fg']};
+        color: {t['fg']};
+        padding: 2px;
+    }}
+    QComboBox#FormInput QAbstractItemView::item {{
+        padding: 6px 10px;
+        border-radius: 4px;
+    }}
     #BtnPrimary {{
         background: {t['accent']}; color: white;
         border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 500;
