@@ -162,10 +162,19 @@ class SettingsDialog(QDialog):
         lay.addLayout(form)
 
         from version import __version__
+        ver_row = QHBoxLayout()
         ver_lbl = QLabel(f"版本  v{__version__}")
         ver_lbl.setObjectName("SettingsVersion")
-        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(ver_lbl)
+        ver_row.addWidget(ver_lbl)
+        ver_row.addStretch()
+        self._check_btn = _btn("检查更新", "BtnGhost")
+        self._check_btn.setFixedHeight(28)
+        self._check_btn.clicked.connect(self._on_check_update)
+        self._check_status = QLabel("")
+        self._check_status.setObjectName("SettingsVersion")
+        ver_row.addWidget(self._check_status)
+        ver_row.addWidget(self._check_btn)
+        lay.addLayout(ver_row)
 
         btns = QHBoxLayout()
         btns.setSpacing(8)
@@ -177,6 +186,37 @@ class SettingsDialog(QDialog):
         btns.addStretch()
         btns.addWidget(ok)
         lay.addLayout(btns)
+
+    def _on_check_update(self):
+        self._check_btn.setEnabled(False)
+        self._check_status.setText("检查中…")
+        import threading
+        def _worker():
+            try:
+                from updater import check_update
+                ver, url = check_update(timeout=8)
+            except Exception:
+                ver, url = None, None
+            # marshal back to GUI thread via a single-shot timer
+            self._check_result = (ver, url)
+            QTimer.singleShot(0, self._on_check_done)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_check_done(self):
+        self._check_btn.setEnabled(True)
+        ver, url = getattr(self, "_check_result", (None, None))
+        if ver:
+            self._check_status.setText(f"新版本 v{ver} !")
+            self._check_status.setStyleSheet("color: #22c55e; font-weight: 600;")
+            # surface the update bar on the main window
+            parent = self.parent()
+            if parent and hasattr(parent, "_show_update_bar"):
+                parent._update_available_ver = ver
+                parent._update_available_url = url
+                parent._show_update_bar(ver)
+        else:
+            self._check_status.setText("已是最新")
+            self._check_status.setStyleSheet("")
 
     def values(self) -> dict:
         return {
