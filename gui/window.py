@@ -2190,12 +2190,14 @@ class MainWindow(QMainWindow):
         # Locked room with no stored password — ask the user
         if room.get("locked") and not pw:
             from PyQt6.QtWidgets import QInputDialog
-            pw, ok = QInputDialog.getText(
-                self, "加入房间", "请输入房间密码：",
-                QLineEdit.EchoMode.Password,
-            )
-            if not ok:
+            dlg = QInputDialog(self)
+            dlg.setWindowTitle("加入房间")
+            dlg.setLabelText("请输入房间密码：")
+            dlg.setTextEchoMode(QLineEdit.EchoMode.Password)
+            self._style_dialog(dlg)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
+            pw = dlg.textValue()
         if self._server_room_id:
             self._on_typing_stop()
             self._implicit_leave = True
