@@ -2623,7 +2623,14 @@ class MainWindow(QMainWindow):
             lay.setContentsMargins(24, 20, 24, 20)
             lay.setSpacing(14)
 
-            lay.addWidget(_lbl("关闭 Beam", "DialogTitle"))
+            title_row = QHBoxLayout()
+            title_row.addWidget(_lbl("关闭 Beam", "DialogTitle"))
+            title_row.addStretch()
+            x_btn = _btn("✕", "DialogCloseBtn")
+            x_btn.setFixedSize(28, 28)
+            x_btn.clicked.connect(dlg.reject)
+            title_row.addWidget(x_btn)
+            lay.addLayout(title_row)
             lay.addWidget(_lbl("请选择关闭方式：", "FormLabel"))
 
             tray_btn = _btn("最小化到托盘", "BtnPrimary")
