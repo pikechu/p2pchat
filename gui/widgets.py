@@ -506,11 +506,12 @@ class FileCard(QFrame):
                  outgoing: bool = False, thumbnail_data: bytes | None = None,
                  theme: str = "light", parent=None):
         super().__init__(parent)
-        self._tid      = transfer_id
-        self._filename = filename
-        self._size     = size
-        self._outgoing = outgoing
-        self._theme    = theme
+        self._tid       = transfer_id
+        self._filename  = filename
+        self._size      = size
+        self._outgoing  = outgoing
+        self._theme     = theme
+        self._save_path: str | None = None
         self.setObjectName("FileCard")
         self.setFixedWidth(280)
 
@@ -578,12 +579,21 @@ class FileCard(QFrame):
         )
 
     def set_done(self, save_path: str | None = None):
+        self._save_path = save_path
         self._progress.setValue(100)
         self._cancel_btn.hide()
         if save_path:
-            self._status_lbl.setText(f"Saved → {_os.path.basename(save_path)}")
+            self._status_lbl.setText(f"已保存 → 点击打开")
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self._status_lbl.setText("Sent ✓")
+
+    def mousePressEvent(self, event):
+        if self._save_path and _os.path.exists(self._save_path):
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
+        super().mousePressEvent(event)
 
     def set_error(self, message: str):
         self._progress.hide()
