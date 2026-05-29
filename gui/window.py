@@ -1480,6 +1480,7 @@ class MainWindow(QMainWindow):
         self._reconnect_room_id = ""
         if rejoin and rejoin in self._rooms:
             pw = self._rooms[rejoin].get("_password", "")
+            self._rooms[rejoin]["_pending_key"] = derive_key(rejoin, pw)
             _log.info("Reconnect: re-joining room %s", rejoin)
             self._bridge.send_frame(T.JOIN_ROOM, room_id=rejoin, password=pw)
 
@@ -1576,8 +1577,10 @@ class MainWindow(QMainWindow):
             creator    = payload.get("creator", "")
             created_at = payload.get("created_at", 0.0)
             icon       = payload.get("icon", "")
-            key        = self._rooms.get(rid, {}).get("_pending_key")
             pw         = self._rooms.get(rid, {}).get("_password", "")
+            # _pending_key is set by _on_join_from_search / _on_room_selected.
+            # Fall back to deriving from stored password so the key is never wiped.
+            key        = self._rooms.get(rid, {}).get("_pending_key") or derive_key(rid, pw)
             self._rooms[rid] = {"name": name, "members": members,
                                 "locked": locked, "key": key, "_password": pw,
                                 "creator": creator,
@@ -1652,7 +1655,10 @@ class MainWindow(QMainWindow):
                 if key:
                     plain = decrypt(key, text)
                     text  = plain if plain else "[decryption failed]"
-                    # Also decrypt reply_to.text if it was encrypted
+                    if reply_to and reply_to.get("text"):
+                        dec = decrypt(key, reply_to["text"])
+                        if dec:
+                            reply_to = dict(reply_to, text=dec)
                 else:
                     text = "[encrypted — join with room password]"
 
@@ -2174,11 +2180,25 @@ class MainWindow(QMainWindow):
             self._current_peer = peer
             self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
             return
+        room = self._rooms.get(room_id, {})
+        pw = room.get("_password", "")
+        # Locked room with no stored password — ask the user
+        if room.get("locked") and not pw:
+            from PyQt6.QtWidgets import QInputDialog
+            pw, ok = QInputDialog.getText(
+                self, "加入房间", "请输入房间密码：",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return
         if self._server_room_id:
             self._on_typing_stop()
             self._implicit_leave = True
             self._bridge.send_frame(T.LEAVE_ROOM)
-        self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id)
+        # Pre-compute key so ROOM_JOINED handler doesn't wipe it
+        self._rooms.setdefault(room_id, {})["_pending_key"] = derive_key(room_id, pw)
+        self._rooms[room_id]["_password"] = pw
+        self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, password=pw)
 
     @pyqtSlot()
     def _on_create_room(self):

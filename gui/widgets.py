@@ -127,10 +127,11 @@ class QuoteBar(QFrame):
         name_lbl.setObjectName("QuoteSender")
         lay.addWidget(name_lbl)
 
-        preview = text[:80] + ("…" if len(text) > 80 else "")
+        preview = text[:200] + ("…" if len(text) > 200 else "")
         text_lbl = QLabel(preview)
         text_lbl.setObjectName("QuoteText")
-        text_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        text_lbl.setWordWrap(True)
+        text_lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         lay.addWidget(text_lbl)
 
 
