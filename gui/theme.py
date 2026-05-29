@@ -329,6 +329,10 @@ def make_qss(theme: str = "light") -> str:
 
     /* ── Settings ───────────────────────────────────────── */
     #SettingsPanel {{ background: {t['bg_chat']}; }}
+    #SettingsVersion {{
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 11px; color: {t['fg4']};
+    }}
     #SettingsGroup {{
         background: {t['bg_sidebar']}; border: 1px solid {t['line']};
         border-radius: 8px; padding: 4px 0;

@@ -161,6 +161,12 @@ class SettingsDialog(QDialog):
 
         lay.addLayout(form)
 
+        from version import __version__
+        ver_lbl = QLabel(f"版本  v{__version__}")
+        ver_lbl.setObjectName("SettingsVersion")
+        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(ver_lbl)
+
         btns = QHBoxLayout()
         btns.setSpacing(8)
         cancel = _btn("Cancel", "BtnGhost")
