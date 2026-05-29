@@ -410,4 +410,14 @@ def make_qss(theme: str = "light") -> str:
         font-size: 12px; font-weight: 500;
     }}
     #PrimaryBtn:hover {{ background: {t['accent']}; opacity: 0.9; }}
+
+    /* ── Update banner ──────────────────────────────────────── */
+    #UpdateBar   {{ background: {t['accent']}; }}
+    #UpdateBarLabel {{ color: white; font-size: 12px; }}
+    #UpdateBarBtn {{
+        background: white; color: {t['accent']};
+        border: none; border-radius: 4px;
+        font-size: 12px; font-weight: 600; padding: 2px 10px;
+    }}
+    #UpdateBarBtn:hover {{ background: #f0f0f0; }}
     """

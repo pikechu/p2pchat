@@ -1405,6 +1405,9 @@ class MainWindow(QMainWindow):
         self._load_avatar()
 
         QTimer.singleShot(100, self._connect)
+        # Check for updates in background — only when running as frozen EXE
+        if getattr(sys, "frozen", False):
+            QTimer.singleShot(3000, self._check_update_bg)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -1426,8 +1429,30 @@ class MainWindow(QMainWindow):
         self._rail.set_active("chats")
         root.addWidget(self._rail)
 
+        # Side panel: update banner + stacked pages
+        side_col = QWidget()
+        side_col.setFixedWidth(300)
+        side_col_lay = QVBoxLayout(side_col)
+        side_col_lay.setContentsMargins(0, 0, 0, 0)
+        side_col_lay.setSpacing(0)
+
+        # Update banner (hidden until a new version is found)
+        self._update_bar = QWidget()
+        self._update_bar.setObjectName("UpdateBar")
+        self._update_bar.setFixedHeight(36)
+        self._update_bar.hide()
+        ub_lay = QHBoxLayout(self._update_bar)
+        ub_lay.setContentsMargins(10, 0, 6, 0)
+        self._update_lbl = QLabel()
+        self._update_lbl.setObjectName("UpdateBarLabel")
+        ub_lay.addWidget(self._update_lbl, 1)
+        ub_btn = _btn("立即更新", "UpdateBarBtn")
+        ub_btn.setFixedHeight(24)
+        ub_btn.clicked.connect(self._on_do_update)
+        ub_lay.addWidget(ub_btn)
+        side_col_lay.addWidget(self._update_bar)
+
         self._side_stack = QStackedWidget()
-        self._side_stack.setFixedWidth(300)
         self._conv = ConvPanel(self._theme)
         self._conv.room_selected.connect(self._on_room_selected)
         self._conv.room_right_clicked.connect(self._on_room_right_clicked)
@@ -1438,7 +1463,8 @@ class MainWindow(QMainWindow):
         self._files_panel = FilesPanel(self._theme)
         self._side_stack.addWidget(self._files_panel)    # index 1: files
 
-        root.addWidget(self._side_stack)
+        side_col_lay.addWidget(self._side_stack)
+        root.addWidget(side_col)
 
         self._chat = ChatPanel(self._theme)
         self._chat.send_message.connect(self._on_send_message)
@@ -2378,6 +2404,67 @@ class MainWindow(QMainWindow):
             self._connect()
         else:
             self._bridge.send_frame(T.SET_NAME, name=self._username)
+
+    # ── Auto-update ───────────────────────────────────────────────────────────
+
+    def _check_update_bg(self):
+        import threading
+        def _worker():
+            try:
+                from updater import check_update
+                ver, url = check_update()
+                if ver and url:
+                    self._update_available_ver = ver
+                    self._update_available_url = url
+                    # Marshal back to GUI thread
+                    QTimer.singleShot(0, lambda: self._show_update_bar(ver))
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_update_bar(self, ver: str):
+        from version import __version__
+        self._update_lbl.setText(f"新版本 v{ver} 可用 (当前 v{__version__})")
+        self._update_bar.show()
+
+    @pyqtSlot()
+    def _on_do_update(self):
+        url = getattr(self, "_update_available_url", None)
+        if not url:
+            return
+        from updater import UpdateDownloader, apply_update
+        dlg = QDialog(self)
+        dlg.setWindowTitle("正在下载更新…")
+        dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        dlg.setFixedWidth(340)
+        self._style_dialog(dlg)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel(f"下载 BeamChat v{self._update_available_ver}…"))
+        from PyQt6.QtWidgets import QProgressBar
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(True)
+        lay.addWidget(bar)
+        status = QLabel("准备中…")
+        status.setObjectName("FileCardStatus")
+        lay.addWidget(status)
+
+        dl = UpdateDownloader(url, self)
+        dl.progress.connect(bar.setValue)
+        dl.progress.connect(lambda p: status.setText(f"{p}%"))
+        def _on_done(tmp_path: str):
+            dlg.close()
+            apply_update(tmp_path)
+            QApplication.quit()
+        def _on_fail(msg: str):
+            status.setText(f"下载失败: {msg}")
+        dl.finished.connect(_on_done)
+        dl.failed.connect(_on_fail)
+        dl.start()
+        dlg.exec()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
