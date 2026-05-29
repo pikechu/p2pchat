@@ -191,30 +191,29 @@ class SettingsDialog(QDialog):
     def _on_check_update(self):
         self._check_btn.setEnabled(False)
         self._check_status.setText("检查中…")
+        self._check_status.setStyleSheet("")
         import threading
         def _worker():
-            try:
-                from updater import check_update
-                ver, url = check_update(timeout=8)
-            except Exception:
-                ver, url = None, None
-            # marshal back to GUI thread via a single-shot timer
-            self._check_result = (ver, url)
+            from updater import check_update
+            result = check_update(timeout=8)
+            self._check_result = result
             QTimer.singleShot(0, self._on_check_done)
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_check_done(self):
         self._check_btn.setEnabled(True)
-        ver, url = getattr(self, "_check_result", (None, None))
+        ver, url, err = getattr(self, "_check_result", (None, None, None))
         if ver:
             self._check_status.setText(f"新版本 v{ver} !")
             self._check_status.setStyleSheet("color: #22c55e; font-weight: 600;")
-            # surface the update bar on the main window
             parent = self.parent()
             if parent and hasattr(parent, "_show_update_bar"):
                 parent._update_available_ver = ver
                 parent._update_available_url = url
                 parent._show_update_bar(ver)
+        elif err:
+            self._check_status.setText(err)
+            self._check_status.setStyleSheet("color: #f59e0b;")
         else:
             self._check_status.setText("已是最新")
             self._check_status.setStyleSheet("")
@@ -2549,7 +2548,7 @@ class MainWindow(QMainWindow):
         def _worker():
             try:
                 from updater import check_update
-                ver, url = check_update()
+                ver, url, _ = check_update()
                 if ver and url:
                     self._update_available_ver = ver
                     self._update_available_url = url

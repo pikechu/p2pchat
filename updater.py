@@ -36,10 +36,12 @@ def is_newer(remote: str, local: str = __version__) -> bool:
 
 # ── GitHub release check ──────────────────────────────────────────────────────
 
-def check_update(timeout: int = 10) -> tuple[str | None, str | None]:
+def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]:
     """
-    Return (version_string, download_url) if a newer release exists,
-    otherwise (None, None).
+    Return (version, download_url, error_msg).
+    - version is set only when a newer release with the EXE asset exists.
+    - error_msg is set when the check itself failed (network / rate-limit).
+    - Both None means "already latest".
     """
     try:
         req = urllib.request.Request(
@@ -48,15 +50,19 @@ def check_update(timeout: int = 10) -> tuple[str | None, str | None]:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
+        # GitHub returns {"message": "..."} when rate-limited or errored
+        if "message" in data and "tag_name" not in data:
+            return None, None, f"GitHub: {data['message']}"
         tag = data.get("tag_name", "")
         if not is_newer(tag):
-            return None, None
+            return None, None, None          # genuinely up to date
         for asset in data.get("assets", []):
             if asset.get("name", "").lower() == ASSET_NAME.lower():
-                return tag.lstrip("v"), asset["browser_download_url"]
-    except Exception:
-        pass
-    return None, None
+                return tag.lstrip("v"), asset["browser_download_url"], None
+        # Tag is newer but Actions hasn't uploaded the EXE yet
+        return None, None, f"v{tag.lstrip('v')} 正在构建中，请稍后重试"
+    except Exception as exc:
+        return None, None, str(exc)
 
 
 # ── Download thread ───────────────────────────────────────────────────────────
