@@ -1986,10 +1986,10 @@ class MainWindow(QMainWindow):
                 self._files_panel.add_file(filename, self._username,
                                            room_name, len(data), str(save_path))
                 return
-            # Throttle: limit queue depth to avoid flooding the asyncio send
-            # queue and starving ping/pong handling on slow connections.
+            # Throttle: back off when queue is deep to let the asyncio send
+            # loop drain and keep ping/pong alive on slow connections.
             q = self._bridge._queue
-            if q is not None and q.qsize() >= 16:
+            if q is not None and q.qsize() >= 4:
                 _log.debug("File send throttle: chunk %d/%d  queue=%d", i, total, q.qsize())
                 QTimer.singleShot(50, lambda: _send_chunk(i))
                 return
@@ -2000,7 +2000,7 @@ class MainWindow(QMainWindow):
                                               total=total, data=chunks[i]))
             if c := self._ft_cards.get(tid):
                 c.set_progress(int((i + 1) / total * 100))
-            QTimer.singleShot(0, lambda: _send_chunk(i + 1))
+            QTimer.singleShot(5, lambda: _send_chunk(i + 1))
 
         _send_chunk(0)
 
@@ -2039,13 +2039,17 @@ class MainWindow(QMainWindow):
                     card.set_done()
                 self._ft_manager.outgoing.pop(tid, None)
                 return
+            q = self._bridge._queue
+            if q is not None and q.qsize() >= 4:
+                QTimer.singleShot(50, lambda: send_chunk(i))
+                return
             raw = _pack(T.FILE_CHUNK,
                         to=info["to"], transfer_id=tid,
                         index=i, total=total, data=chunks[i])
             self._bridge.send_raw_frame(raw)
             if card := self._ft_cards.get(tid):
                 card.set_progress(int((i + 1) / total * 100))
-            QTimer.singleShot(0, lambda: send_chunk(i + 1))
+            QTimer.singleShot(5, lambda: send_chunk(i + 1))
 
         send_chunk(0)
 

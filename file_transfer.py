@@ -6,7 +6,7 @@ import pathlib
 import uuid
 from typing import Dict, List, Optional
 
-CHUNK_SIZE = 65536   # 64 KB
+CHUNK_SIZE = 32768   # 32 KB — halved to reduce frame size and ease ping/pong timing
 
 
 def split_file(data: bytes) -> List[str]:
