@@ -168,7 +168,7 @@ class SettingsDialog(QDialog):
         ver_row.addWidget(ver_lbl)
         ver_row.addStretch()
         self._check_btn = _btn("检查更新", "BtnGhost")
-        self._check_btn.setFixedHeight(28)
+        self._check_btn.setFixedSize(80, 28)
         self._check_btn.clicked.connect(self._on_check_update)
         self._check_status = QLabel("")
         self._check_status.setObjectName("SettingsVersion")
@@ -1441,6 +1441,11 @@ class MainWindow(QMainWindow):
         self._typing_timer.setInterval(3000)
         self._typing_timer.timeout.connect(self._on_typing_stop)
 
+        # Tray / close preference: None=ask, "tray"=minimize, "quit"=quit
+        self._close_pref: str | None = self._load_close_pref()
+        # Pending tray notifications: list of (source, text) for tooltip
+        self._tray_msgs: list[tuple[str, str]] = []
+
         self._build_ui()
         self._apply_theme()
         self.setWindowTitle("Beam — P2P Chat")
@@ -1449,6 +1454,7 @@ class MainWindow(QMainWindow):
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().hide()
         self._load_avatar()
+        self._setup_tray()
 
         QTimer.singleShot(100, self._connect)
         # Check for updates in background — only when running as frozen EXE
@@ -1748,9 +1754,12 @@ class MainWindow(QMainWindow):
                 # Delivered but not yet read
                 if seq and self._bridge:
                     self._bridge.send_frame(T.MSG_ACK, seq=seq, status="delivered")
-            # Flash taskbar button when the app window is not in focus
+            # Flash taskbar / tray when window is not in focus
             if not self.isActiveWindow():
                 QApplication.alert(self, 0)
+                if not self.isVisible():
+                    room_name = self._rooms.get(rid, {}).get("name", rid)
+                    self._notify_tray(f"{room_name}", f"{sender}: {text}")
 
         elif mtype == T.ROOM_LIST:
             for r in payload.get("rooms", []):
@@ -1844,6 +1853,8 @@ class MainWindow(QMainWindow):
                 self._conv.set_preview(dm_id, f"{peer}: {text}", ts)
             if not self.isActiveWindow():
                 QApplication.alert(self, 0)
+                if not self.isVisible():
+                    self._notify_tray(f"@ {peer}", text)
 
         elif mtype == T.DM_ACK:
             client_mid = payload.get("client_mid", -1)
@@ -2451,6 +2462,85 @@ class MainWindow(QMainWindow):
         else:
             self._bridge.send_frame(T.SET_NAME, name=self._username)
 
+    # ── System tray ───────────────────────────────────────────────────────────
+
+    _PREF_FILE = pathlib.Path.home() / ".beamchat" / "close_pref.txt"
+
+    def _load_close_pref(self) -> str | None:
+        try:
+            v = self._PREF_FILE.read_text().strip()
+            return v if v in ("tray", "quit") else None
+        except Exception:
+            return None
+
+    def _save_close_pref(self, pref: str):
+        self._close_pref = pref
+        try:
+            self._PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._PREF_FILE.write_text(pref)
+        except Exception:
+            pass
+
+    def _setup_tray(self):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        from PyQt6.QtGui import QIcon
+        icon_path = pathlib.Path(__file__).parent.parent / "assets" / "icon.png"
+        if not icon_path.exists() and getattr(sys, "frozen", False):
+            icon_path = pathlib.Path(sys._MEIPASS) / "assets" / "icon.png"
+        icon = QIcon(str(icon_path)) if icon_path.exists() else self.windowIcon()
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Beam — P2P Chat")
+        menu = QMenu()
+        show_act = menu.addAction("显示窗口")
+        show_act.triggered.connect(self._tray_show)
+        menu.addSeparator()
+        quit_act = menu.addAction("退出")
+        quit_act.triggered.connect(self._tray_quit)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+        # Timer for flashing tray icon when there are unread messages
+        self._tray_flash_timer = QTimer(self)
+        self._tray_flash_timer.setInterval(600)
+        self._tray_flash_timer.timeout.connect(self._tray_flash_tick)
+        self._tray_icon_visible = True
+        self._tray_icon_obj = icon
+
+    def _tray_show(self):
+        self._tray_flash_timer.stop()
+        self._tray.setIcon(self._tray_icon_obj)
+        self._tray_msgs.clear()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_quit(self):
+        self._tray_flash_timer.stop()
+        self._tray.hide()
+        self._do_quit()
+
+    def _on_tray_activated(self, reason):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._tray_show()
+
+    def _tray_flash_tick(self):
+        from PyQt6.QtGui import QIcon
+        if self._tray_icon_visible:
+            self._tray.setIcon(QIcon())   # blank frame
+        else:
+            self._tray.setIcon(self._tray_icon_obj)
+        self._tray_icon_visible = not self._tray_icon_visible
+
+    def _notify_tray(self, source: str, text: str):
+        """Called on new message while window is hidden or unfocused."""
+        self._tray_msgs.append((source, text))
+        # Build tooltip showing last 5 unread
+        lines = [f"{s}: {t[:30]}" for s, t in self._tray_msgs[-5:]]
+        self._tray.setToolTip("Beam — 新消息\n" + "\n".join(lines))
+        if not self._tray_flash_timer.isActive():
+            self._tray_flash_timer.start()
+
     # ── Auto-update ───────────────────────────────────────────────────────────
 
     def _check_update_bg(self):
@@ -2518,8 +2608,56 @@ class MainWindow(QMainWindow):
         dlg.setStyleSheet(self.styleSheet())
 
     def closeEvent(self, event):
+        pref = self._close_pref
+        if pref is None:
+            # Ask user what to do
+            dlg = QDialog(self)
+            dlg.setWindowTitle("关闭")
+            dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+            dlg.setModal(True)
+            self._style_dialog(dlg)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(24, 20, 24, 20)
+            lay.setSpacing(12)
+            lay.addWidget(_lbl("关闭 Beam", "DialogTitle"))
+            lay.addWidget(_lbl("请选择关闭方式：", "FormLabel"))
+            remember = QCheckBox("记住我的选择")
+            tray_btn = _btn("最小化到托盘", "BtnPrimary")
+            quit_btn = _btn("退出程序",    "BtnGhost")
+            lay.addWidget(tray_btn)
+            lay.addWidget(quit_btn)
+            lay.addWidget(remember)
+            chosen = {"v": None}
+            def _tray():
+                chosen["v"] = "tray"
+                dlg.accept()
+            def _quit():
+                chosen["v"] = "quit"
+                dlg.accept()
+            tray_btn.clicked.connect(_tray)
+            quit_btn.clicked.connect(_quit)
+            dlg.exec()
+            if chosen["v"] is None:   # dialog closed without choosing
+                event.ignore()
+                return
+            if remember.isChecked():
+                self._save_close_pref(chosen["v"])
+            pref = chosen["v"]
+
+        if pref == "tray":
+            event.ignore()
+            self.hide()
+        else:
+            self._on_typing_stop()
+            if self._bridge:
+                self._bridge.close()
+                self._bridge.wait(1500)
+            self._tray.hide()
+            event.accept()
+
+    def _do_quit(self):
         self._on_typing_stop()
         if self._bridge:
             self._bridge.close()
             self._bridge.wait(1500)
-        event.accept()
+        QApplication.quit()
