@@ -149,6 +149,7 @@ class BubbleWidget(QFrame):
         super().__init__(parent)
         self._sender   = sender
         self._text     = text
+        self._quote    = quote
         self._outgoing = outgoing
         self._theme    = theme
         self._seq      = seq
@@ -225,8 +226,19 @@ class BubbleWidget(QFrame):
         # For incoming messages, also account for sender name width
         if not self._outgoing and self._sender:
             text_w = max(text_w, fm.horizontalAdvance(self._sender))
-        # 24px horizontal padding from QSS: padding: 8px 12px → 12+12=24px
-        natural_w = max(text_w + 24, 60)  # 60px min keeps the time+tick row visible
+        # Quote bar: needs its own space. QuoteBar has 8+8px internal margins
+        # plus a 3px left border, so add 19px on top of the bubble's 24px padding.
+        if self._quote:
+            q_sender = self._quote.get("sender", "") or ""
+            q_text   = (self._quote.get("text",   "") or "")[:200]
+            q_line   = q_text.split('\n')[0] if q_text else ""
+            q_w = max(
+                fm.horizontalAdvance(q_sender) if q_sender else 0,
+                fm.horizontalAdvance(q_line)   if q_line   else 0,
+            )
+            text_w = max(text_w, q_w + 19)
+        # 24px bubble padding (QSS padding: 8px 12px) + 10px rendering safety margin
+        natural_w = max(text_w + 34, 60)
         self.setMaximumWidth(min(natural_w, 720))
 
     def changeEvent(self, event: QEvent) -> None:
