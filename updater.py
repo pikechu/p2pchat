@@ -10,6 +10,7 @@ Flow:
 import json
 import pathlib
 import subprocess
+import urllib.error
 import sys
 import urllib.request
 
@@ -52,7 +53,10 @@ def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]
             data = json.loads(resp.read())
         # GitHub returns {"message": "..."} when rate-limited or errored
         if "message" in data and "tag_name" not in data:
-            return None, None, f"GitHub: {data['message']}"
+            msg: str = data["message"]
+            if "rate limit" in msg.lower():
+                return None, None, "GitHub 访问次数超限，请稍后再试（每小时60次）"
+            return None, None, f"GitHub: {msg}"
         tag = data.get("tag_name", "")
         if not is_newer(tag):
             return None, None, None          # genuinely up to date
@@ -61,6 +65,12 @@ def check_update(timeout: int = 10) -> tuple[str | None, str | None, str | None]
                 return tag.lstrip("v"), asset["browser_download_url"], None
         # Tag is newer but Actions hasn't uploaded the EXE yet
         return None, None, f"v{tag.lstrip('v')} 正在构建中，请稍后重试"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            return None, None, "GitHub 访问次数超限，请稍后再试（每小时60次）"
+        return None, None, f"网络错误 {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, None, f"网络连接失败: {exc.reason}"
     except Exception as exc:
         return None, None, str(exc)
 
