@@ -2571,6 +2571,7 @@ class MainWindow(QMainWindow):
             return
         from updater import UpdateDownloader, apply_update
         dlg = QDialog(self)
+        dlg.setObjectName("Dialog")
         dlg.setWindowTitle("正在下载更新…")
         dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
         dlg.setFixedWidth(340)
@@ -2581,9 +2582,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(QLabel(f"下载 BeamChat v{self._update_available_ver}…"))
         from PyQt6.QtWidgets import QProgressBar
         bar = QProgressBar()
+        bar.setObjectName("UpdateProgress")
         bar.setRange(0, 100)
         bar.setValue(0)
-        bar.setTextVisible(True)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(6)
         lay.addWidget(bar)
         status = QLabel("准备中…")
         status.setObjectName("FileCardStatus")

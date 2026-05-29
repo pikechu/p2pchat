@@ -405,6 +405,12 @@ def make_qss(theme: str = "light") -> str:
     QProgressBar#FileCardProgress::chunk {{
         background: {t['accent']}; border-radius: 2px;
     }}
+    QProgressBar#UpdateProgress {{
+        background: {t['line']}; border-radius: 3px; border: none;
+    }}
+    QProgressBar#UpdateProgress::chunk {{
+        background: {t['accent']}; border-radius: 3px;
+    }}
 
     /* ── Room info panel ──────────────────────────────────── */
     #RoomInfoPanel {{
