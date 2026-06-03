@@ -127,7 +127,8 @@ class RoomDialog(QDialog):
 # ── Settings dialog ───────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
-    def __init__(self, server_url: str, username: str, theme: str, parent=None):
+    def __init__(self, server_url: str, username: str, theme: str,
+                 download_dir: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("Dialog")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
@@ -160,6 +161,22 @@ class SettingsDialog(QDialog):
         form.addRow(_lbl("Theme", "FormLabel"), self._theme)
 
         lay.addLayout(form)
+
+        # Download directory row
+        dl_row = QHBoxLayout()
+        dl_row.setSpacing(6)
+        dl_row.addWidget(_lbl("下载路径", "FormLabel"))
+        self._dl_lbl = QLabel(download_dir or "—")
+        self._dl_lbl.setObjectName("SettingsVersion")
+        self._dl_lbl.setWordWrap(False)
+        self._dl_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        dl_row.addWidget(self._dl_lbl, 1)
+        dl_change = _btn("更改", "BtnGhost")
+        dl_change.setFixedHeight(28)
+        dl_change.setMinimumWidth(52)
+        dl_change.clicked.connect(self._on_change_dl)
+        dl_row.addWidget(dl_change)
+        lay.addLayout(dl_row)
 
         from version import __version__
         ver_row = QHBoxLayout()
@@ -218,11 +235,20 @@ class SettingsDialog(QDialog):
             self._check_status.setText("已是最新")
             self._check_status.setStyleSheet("")
 
+    def _on_change_dl(self):
+        from PyQt6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(
+            self, "选择下载目录", self._dl_lbl.text()
+        )
+        if path:
+            self._dl_lbl.setText(path)
+
     def values(self) -> dict:
         return {
-            "server_url": self._url.text().strip(),
-            "username":   self._user.text().strip(),
-            "theme":      self._theme.currentText(),
+            "server_url":   self._url.text().strip(),
+            "username":     self._user.text().strip(),
+            "theme":        self._theme.currentText(),
+            "download_dir": self._dl_lbl.text(),
         }
 
 
@@ -1424,12 +1450,8 @@ class MainWindow(QMainWindow):
         # DM state: "@peer" → peer username
         self._dms: dict[str, str] = {}
 
-        # File transfer state — save next to exe when frozen, else project root
-        if getattr(sys, 'frozen', False):
-            _dl_base = pathlib.Path(sys.executable).parent
-        else:
-            _dl_base = pathlib.Path(__file__).parent.parent
-        downloads = _dl_base / "downloads"
+        # File transfer state — configurable download directory
+        downloads = self._load_download_dir()
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
         self._ft_cards: dict[str, "FileCard"] = {}
         self._current_peer: str = ""
@@ -1455,6 +1477,17 @@ class MainWindow(QMainWindow):
         self.statusBar().hide()
         self._load_avatar()
         self._setup_tray()
+
+        # Clean up any leftover update temp files from a previous update attempt
+        if getattr(sys, "frozen", False):
+            _exe = pathlib.Path(sys.executable)
+            for _tmp in (_exe.with_name("_BeamChat_update.exe"),
+                         _exe.with_name("_update.bat")):
+                try:
+                    if _tmp.exists():
+                        _tmp.unlink()
+                except Exception:
+                    pass
 
         QTimer.singleShot(100, self._connect)
         # Check for updates in background — only when running as frozen EXE
@@ -2444,7 +2477,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _open_settings(self):
-        dlg = SettingsDialog(self._server_url, self._username, self._theme, self)
+        dlg = SettingsDialog(self._server_url, self._username, self._theme,
+                             str(self._ft_manager._dir), self)
         self._style_dialog(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2453,6 +2487,12 @@ class MainWindow(QMainWindow):
         self._server_url = v["server_url"]
         self._username   = v["username"] or self._username
         self._theme      = v["theme"]
+
+        new_dl = pathlib.Path(v["download_dir"]) if v.get("download_dir") else None
+        if new_dl and new_dl != self._ft_manager._dir:
+            new_dl.mkdir(parents=True, exist_ok=True)
+            self._ft_manager._dir = new_dl
+            self._save_download_dir(new_dl)
 
         self._rail.set_username(self._username)
         self._apply_theme()
@@ -2464,7 +2504,25 @@ class MainWindow(QMainWindow):
 
     # ── System tray ───────────────────────────────────────────────────────────
 
-    _PREF_FILE = pathlib.Path.home() / ".beamchat" / "close_pref.txt"
+    _PREF_FILE   = pathlib.Path.home() / ".beamchat" / "close_pref.txt"
+    _DL_DIR_FILE = pathlib.Path.home() / ".beamchat" / "download_dir.txt"
+    _DEFAULT_DL  = pathlib.Path.home() / "AppData" / "Local" / "BeamChat" / "downloads"
+
+    def _load_download_dir(self) -> pathlib.Path:
+        try:
+            p = pathlib.Path(self._DL_DIR_FILE.read_text().strip())
+            if p.is_absolute():
+                return p
+        except Exception:
+            pass
+        return self._DEFAULT_DL
+
+    def _save_download_dir(self, path: pathlib.Path):
+        try:
+            self._DL_DIR_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._DL_DIR_FILE.write_text(str(path))
+        except Exception:
+            pass
 
     def _load_close_pref(self) -> str | None:
         try:
