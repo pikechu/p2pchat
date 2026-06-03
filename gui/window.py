@@ -2649,19 +2649,26 @@ class MainWindow(QMainWindow):
         status.setObjectName("FileCardStatus")
         lay.addWidget(status)
 
+        result = {"path": None}
+
         dl = UpdateDownloader(url, self)
         dl.progress.connect(bar.setValue)
         dl.progress.connect(lambda p: status.setText(f"{p}%"))
         def _on_done(tmp_path: str):
-            dlg.close()
-            apply_update(tmp_path)
-            QApplication.quit()
+            result["path"] = tmp_path
+            dlg.accept()          # exit sub-event-loop only; quit happens below
         def _on_fail(msg: str):
             status.setText(f"下载失败: {msg}")
         dl.finished.connect(_on_done)
         dl.failed.connect(_on_fail)
         dl.start()
-        dlg.exec()
+        dlg.exec()                # blocks here until _on_done / user closes
+
+        # Now we're back in the main event loop — safe to quit
+        if result["path"]:
+            apply_update(result["path"])
+            self._close_pref = "quit"   # skip the "minimize/quit?" dialog
+            self._do_quit()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
