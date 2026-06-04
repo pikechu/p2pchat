@@ -41,6 +41,7 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")   # ensures QSS fully applies on all platforms incl. Windows
     app.setApplicationName("Beam — P2P Chat")
 
     icon_path = _resource(os.path.join("assets", "icon.png"))

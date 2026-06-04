@@ -461,4 +461,27 @@ def make_qss(theme: str = "light") -> str:
         font-size: 12px; font-weight: 600; padding: 2px 10px;
     }}
     #UpdateBarBtn:hover {{ background: #f0f0f0; }}
+
+    /* ── Context menu (right-click on bubbles) ────────────────── */
+    QMenu {{
+        background: {t['bg_sidebar']};
+        color: {t['fg']};
+        border: 1px solid {t['line_strong']};
+        border-radius: 8px;
+        padding: 4px;
+    }}
+    QMenu::item {{
+        padding: 6px 20px;
+        border-radius: 6px;
+        font-size: 13px;
+    }}
+    QMenu::item:selected {{
+        background: {t['bg_active']};
+        color: {t['fg']};
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background: {t['line']};
+        margin: 4px 8px;
+    }}
     """
