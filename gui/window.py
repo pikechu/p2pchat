@@ -130,7 +130,7 @@ class RoomDialog(QDialog):
 
 class SettingsDialog(QDialog):
     def __init__(self, server_url: str, username: str, theme: str,
-                 download_dir: str = "", parent=None):
+                 download_dir: str = "", close_pref: str | None = None, parent=None):
         super().__init__(parent)
         self.setObjectName("Dialog")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
@@ -161,6 +161,13 @@ class SettingsDialog(QDialog):
         self._theme.addItems(["light", "dark"])
         self._theme.setCurrentText(theme)
         form.addRow(_lbl("Theme", "FormLabel"), self._theme)
+
+        self._close_combo = QComboBox()
+        self._close_combo.setObjectName("FormInput")
+        self._close_combo.addItems(["每次询问", "最小化到托盘", "退出程序"])
+        _close_map = {None: "每次询问", "tray": "最小化到托盘", "quit": "退出程序"}
+        self._close_combo.setCurrentText(_close_map.get(close_pref, "每次询问"))
+        form.addRow(_lbl("X 关闭按钮", "FormLabel"), self._close_combo)
 
         lay.addLayout(form)
 
@@ -246,11 +253,13 @@ class SettingsDialog(QDialog):
             self._dl_lbl.setText(path)
 
     def values(self) -> dict:
+        _pref_map = {"每次询问": None, "最小化到托盘": "tray", "退出程序": "quit"}
         return {
             "server_url":   self._url.text().strip(),
             "username":     self._user.text().strip(),
             "theme":        self._theme.currentText(),
             "download_dir": self._dl_lbl.text(),
+            "close_pref":   _pref_map.get(self._close_combo.currentText()),
         }
 
 
@@ -2618,7 +2627,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _open_settings(self):
         dlg = SettingsDialog(self._server_url, self._username, self._theme,
-                             str(self._ft_manager._dir), self)
+                             str(self._ft_manager._dir), self._close_pref, self)
         self._style_dialog(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2633,6 +2642,10 @@ class MainWindow(QMainWindow):
             new_dl.mkdir(parents=True, exist_ok=True)
             self._ft_manager._dir = new_dl
             self._save_download_dir(new_dl)
+
+        new_pref = v.get("close_pref")   # None | "tray" | "quit"
+        if new_pref != self._close_pref:
+            self._save_close_pref(new_pref)
 
         self._rail.set_username(self._username)
         self._apply_theme()
@@ -2671,11 +2684,11 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _save_close_pref(self, pref: str):
+    def _save_close_pref(self, pref: str | None):
         self._close_pref = pref
         try:
             self._PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
-            self._PREF_FILE.write_text(pref)
+            self._PREF_FILE.write_text(pref or "")
         except Exception:
             pass
 

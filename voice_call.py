@@ -73,6 +73,7 @@ class VoiceCall(QObject):
         self._in_stream:  Optional[sd.InputStream]  = None
         self._out_stream: Optional[sd.OutputStream] = None
         self._jitter: collections.deque = collections.deque(maxlen=JITTER_FRAMES * 2)
+        self._rx_rms: float = 0.0   # smoothed RMS of received audio (for echo gate)
 
         self._stop_event = threading.Event()
 
@@ -233,8 +234,14 @@ class VoiceCall(QObject):
     # ── Audio ──────────────────────────────────────────────────────────────────
 
     def _start_audio(self) -> None:
+        # Echo gate threshold: RMS ~-34dB — suppress mic when remote is audible
+        _ECHO_GATE = 0.02
+
         def _capture(indata, frames, time_info, status):
             if self._muted or self._state != CallState.CONNECTED:
+                return
+            # Gate: don't transmit while receiving remote audio (prevents echo)
+            if self._rx_rms > _ECHO_GATE:
                 return
             pcm = (indata[:, 0] * 32768).astype(np.int16)
             if self._mode == _Mode.DIRECT and self._peer_addr and self._udp_sock:
@@ -255,7 +262,11 @@ class VoiceCall(QObject):
                 outdata[:n, 0] = chunk[:n]
                 if n < frames:
                     outdata[n:] = 0
+                # Update received RMS for echo gate (exponential smoothing)
+                rms = float(np.sqrt(np.mean(chunk[:n] ** 2)))
+                self._rx_rms = 0.7 * self._rx_rms + 0.3 * rms
             else:
+                self._rx_rms = 0.6 * self._rx_rms   # decay when silent
                 outdata.fill(0)
 
         self._in_stream = sd.InputStream(
