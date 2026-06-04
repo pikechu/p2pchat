@@ -90,6 +90,10 @@ class VoiceCall(QObject):
     def is_muted(self) -> bool:
         return self._muted
 
+    @property
+    def room_id(self) -> str:
+        return self._room_id
+
     def start_call(self, peer: str, room_id: str = "") -> None:
         if self._state != CallState.IDLE:
             return

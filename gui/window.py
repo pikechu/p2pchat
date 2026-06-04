@@ -1615,6 +1615,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_disconnected(self, reason: str):
+        if self._voice_call and self._voice_call.state.name != "IDLE":
+            self._voice_call.hangup()
         _log.error("bridge disconnected: %s", reason)
         self.setWindowTitle("Beam — P2P Chat  [断线]")
         # Save room for auto-reconnect before clearing server state
@@ -2034,7 +2036,7 @@ class MainWindow(QMainWindow):
         """Write a system message into the room where the call was initiated."""
         room_id = ""
         if self._voice_call:
-            room_id = self._voice_call._room_id
+            room_id = self._voice_call.room_id
         if not room_id:
             room_id = self._chat.current_room_id or ""
         if not room_id:
@@ -2052,7 +2054,6 @@ class MainWindow(QMainWindow):
         if not self._voice_call:
             return
         if self._voice_call.state != CallState.IDLE:
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self, "通话中", "当前已有通话进行中。")
             return
         room_id = self._chat.current_room_id or ""
