@@ -40,6 +40,9 @@ HIDDEN_IMPORTS = [
     "websockets.legacy.server",
     "cryptography.hazmat.primitives.kdf.pbkdf2",
     "cryptography.fernet",
+    "sounddevice",
+    "numpy",
+    "_sounddevice_data",
 ]
 
 # Explicitly exclude heavy Qt sub-packages that are auto-discovered
@@ -72,7 +75,6 @@ EXCLUDES = [
     "PyQt6.QtSql",
     "tkinter",
     "matplotlib",
-    "numpy",
     "PIL",
     "scipy",
     "pandas",
