@@ -484,4 +484,45 @@ def make_qss(theme: str = "light") -> str:
         background: {t['line']};
         margin: 4px 8px;
     }}
+
+    /* ── Call widget ──────────────────────────────────────────── */
+    #CallWidget {{
+        background: {t['bg_sidebar']};
+        border: 1px solid {t['line_strong']};
+        border-radius: 12px;
+    }}
+    #CallDragBar {{
+        background: transparent;
+    }}
+    #CallPeerName {{
+        font-size: 14px; font-weight: 600; color: {t['fg']};
+    }}
+    #CallDuration {{
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 12px; color: {t['fg3']};
+    }}
+    #CallModeBadge {{
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 11px; border-radius: 8px; padding: 2px 8px;
+    }}
+    #CallModeDirect {{ background: #dcfce7; color: {t['ok']}; }}
+    #CallModeRelay  {{ background: #fef3c7; color: {t['warn']}; }}
+    #CallHangupBtn {{
+        background: {t['error']}; color: white;
+        border: none; border-radius: 20px;
+        font-size: 18px; min-width: 40px; min-height: 40px;
+    }}
+    #CallHangupBtn:hover {{ background: #b91c1c; }}
+    #CallMuteBtn {{
+        background: {t['bg_hover']}; color: {t['fg2']};
+        border: 1px solid {t['line']}; border-radius: 20px;
+        font-size: 16px; min-width: 40px; min-height: 40px;
+    }}
+    #CallMuteBtn:hover {{ background: {t['bg_active']}; }}
+    #CallMutedBtn {{
+        background: {t['warn']}; color: white;
+        border: none; border-radius: 20px;
+        font-size: 16px; min-width: 40px; min-height: 40px;
+    }}
+    #CallMutedBtn:hover {{ background: #b45309; }}
     """
