@@ -31,6 +31,14 @@ class T(str, Enum):
     SET_ROOM_ICON  = "SET_ROOM_ICON"  # {room_id, icon} — creator only
     SET_AVATAR     = "SET_AVATAR"     # {data: base64 PNG} — client → server
 
+    # voice call (client↔server, user-to-user relay like FILE_*)
+    CALL_OFFER   = "CALL_OFFER"   # {to, room_id?}
+    CALL_ANSWER  = "CALL_ANSWER"  # {to}
+    CALL_REJECT  = "CALL_REJECT"  # {to, reason?}
+    CALL_HANGUP  = "CALL_HANGUP"  # {to}
+    CALL_ICE     = "CALL_ICE"     # {to, candidate: {ip, port}}
+    VOICE_CHUNK  = "VOICE_CHUNK"  # {to, data: base64 PCM int16}
+
     # file transfer (client→server, routed user-to-user)
     FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
     FILE_ACCEPT = "FILE_ACCEPT"  # {to, transfer_id}

@@ -356,7 +356,9 @@ class ChatServer:
 
                 # ── FILE_* (user-to-user routing) ────────────────────────
                 elif mtype in (T.FILE_OFFER, T.FILE_ACCEPT, T.FILE_REJECT,
-                               T.FILE_CHUNK, T.FILE_DONE, T.FILE_ERROR):
+                               T.FILE_CHUNK, T.FILE_DONE, T.FILE_ERROR,
+                               T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT,
+                               T.CALL_HANGUP, T.CALL_ICE, T.VOICE_CHUNK):
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
