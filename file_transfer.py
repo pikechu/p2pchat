@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import math
 import pathlib
 import uuid
 from typing import Dict, List, Optional
@@ -24,6 +25,59 @@ def reassemble_chunks(chunks_b64: List[str]) -> bytes:
 
 def file_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class RoomFileSender:
+    def __init__(self, path: pathlib.Path, max_in_flight: int = 16):
+        self.path = path
+        self.max_in_flight = max_in_flight
+        self.size = path.stat().st_size
+        self.total_chunks = max(1, math.ceil(self.size / CHUNK_SIZE))
+        self._src = path.open("rb")
+        self._hasher = hashlib.sha256()
+        self._sent_chunks = 0
+        self._acked_chunks = 0
+        self._in_flight: set[int] = set()
+        self._done_reading = False
+
+    @property
+    def sent_chunks(self) -> int:
+        return self._sent_chunks
+
+    @property
+    def acked_chunks(self) -> int:
+        return self._acked_chunks
+
+    @property
+    def sha256_hex(self) -> str:
+        return self._hasher.hexdigest()
+
+    def next_payloads(self) -> List[tuple[int, int, str]]:
+        payloads = []
+        while not self._done_reading and len(self._in_flight) < self.max_in_flight:
+            chunk = self._src.read(CHUNK_SIZE)
+            if not chunk:
+                self._done_reading = True
+                self._src.close()
+                break
+            index = self._sent_chunks
+            self._hasher.update(chunk)
+            payloads.append((
+                index,
+                self.total_chunks,
+                base64.b64encode(chunk).decode("ascii"),
+            ))
+            self._sent_chunks += 1
+            self._in_flight.add(index)
+        return payloads
+
+    def acknowledge(self, index: int):
+        if index in self._in_flight:
+            self._in_flight.remove(index)
+            self._acked_chunks += 1
+
+    def ready_to_finish(self) -> bool:
+        return self._done_reading and not self._in_flight and self._sent_chunks == self.total_chunks
 
 
 class FileTransferManager:
@@ -52,29 +106,46 @@ class FileTransferManager:
         # Sanitize filename to basename only, preventing path traversal
         filename = pathlib.Path(filename).name or "file"
         total_chunks = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+        temp_path = self._dir / f".{transfer_id}.part"
         self.incoming[transfer_id] = {
             "from":     from_user,
             "filename": filename,
             "size":     size,
             "mime":     mime,
-            "received": [None] * total_chunks,
+            "total_chunks": total_chunks,
+            "received_chunks": 0,
+            "temp_path": temp_path,
+            "hasher": hashlib.sha256(),
         }
+        temp_path.unlink(missing_ok=True)
 
     def add_chunk(self, transfer_id: str, index: int, total: int, data_b64: str):
         rec = self.incoming.get(transfer_id)
         if rec is None:
             return
-        # Grow list if needed (guard against off-by-one in total)
-        while len(rec["received"]) <= index:
-            rec["received"].append(None)
-        rec["received"][index] = data_b64
+        if total != rec["total_chunks"]:
+            return
+        if index < 0 or index >= total or index != rec["received_chunks"]:
+            return
+        try:
+            chunk = base64.b64decode(data_b64)
+        except Exception:
+            return
+        with rec["temp_path"].open("ab") as out:
+            out.write(chunk)
+        rec["hasher"].update(chunk)
+        rec["received_chunks"] += 1
 
     def finish_incoming(self, transfer_id: str, sha256_hex: str) -> Optional[pathlib.Path]:
         rec = self.incoming.pop(transfer_id, None)
         if rec is None:
             return None
-        data = reassemble_chunks([c for c in rec["received"] if c is not None])
-        if file_sha256(data) != sha256_hex:
+        temp_path = rec["temp_path"]
+        if rec["received_chunks"] != rec["total_chunks"]:
+            temp_path.unlink(missing_ok=True)
+            return None
+        if rec["hasher"].hexdigest() != sha256_hex:
+            temp_path.unlink(missing_ok=True)
             return None
         out = self._dir / rec["filename"]
         # Avoid clobbering existing files
@@ -83,12 +154,22 @@ class FileTransferManager:
         while out.exists():
             out = self._dir / f"{stem}_{counter}{suffix}"
             counter += 1
-        out.write_bytes(data)
+        temp_path.replace(out)
         return out
 
     def cancel(self, transfer_id: str):
         self.outgoing.pop(transfer_id, None)
-        self.incoming.pop(transfer_id, None)
+        if rec := self.incoming.pop(transfer_id, None):
+            rec["temp_path"].unlink(missing_ok=True)
+
+    @staticmethod
+    def iter_file_chunks(path: pathlib.Path):
+        size = path.stat().st_size
+        total = max(1, math.ceil(size / CHUNK_SIZE))
+        with path.open("rb") as src:
+            for index in range(total):
+                chunk = src.read(CHUNK_SIZE)
+                yield index, total, base64.b64encode(chunk).decode("ascii")
 
 
 def guess_mime(filename: str) -> str:

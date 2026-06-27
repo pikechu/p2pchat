@@ -51,7 +51,10 @@ class T(str, Enum):
     FILE_ROOM_SHARE     = "FILE_ROOM_SHARE"      # {room_id, transfer_id, filename, size, mime}
     FILE_ROOM_CHUNK     = "FILE_ROOM_CHUNK"      # {transfer_id, index, total, data (base64)}
     FILE_ROOM_DONE      = "FILE_ROOM_DONE"       # {transfer_id, sha256}
+    FILE_ROOM_RECEIVED  = "FILE_ROOM_RECEIVED"   # {transfer_id, sha256}
     # server → all room members
+    FILE_ROOM_CHUNK_ACK = "FILE_ROOM_CHUNK_ACK"  # {transfer_id, index}
+    FILE_ROOM_DONE_ACK  = "FILE_ROOM_DONE_ACK"   # {transfer_id}
     FILE_ROOM_AVAILABLE = "FILE_ROOM_AVAILABLE"  # {transfer_id, filename, size, mime, from_user, room_id, sha256, chunks}
     FILE_ROOM_ERROR     = "FILE_ROOM_ERROR"      # {transfer_id, message}
 

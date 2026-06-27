@@ -206,3 +206,16 @@ def test_bridge_send_frame_returns_false_when_not_connected(app):
     # Don't start — _queue is None
     result = bridge.send_frame(T.SET_NAME, name="x")
     assert result is False
+
+
+def test_bridge_send_raw_frame_returns_false_when_not_connected(app):
+    bridge = WSBridge("ws://127.0.0.1:1")
+    result = bridge.send_raw_frame(pack(T.SET_NAME, name="x"))
+    assert result is False
+
+
+def test_bridge_reports_connected_state(app, server_port):
+    bridge = _make_bridge(server_port)
+    assert bridge.is_connected() is True
+    bridge.close()
+    bridge.wait(2000)

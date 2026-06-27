@@ -29,6 +29,18 @@ def test_file_error_type_exists():
     assert T.FILE_ERROR == "FILE_ERROR"
 
 
+def test_room_file_chunk_ack_type_exists():
+    assert T.FILE_ROOM_CHUNK_ACK == "FILE_ROOM_CHUNK_ACK"
+
+
+def test_room_file_done_ack_type_exists():
+    assert T.FILE_ROOM_DONE_ACK == "FILE_ROOM_DONE_ACK"
+
+
+def test_room_file_received_type_exists():
+    assert T.FILE_ROOM_RECEIVED == "FILE_ROOM_RECEIVED"
+
+
 def test_file_offer_pack_roundtrip():
     raw = pack(T.FILE_OFFER,
                to="bob", transfer_id="abc123",

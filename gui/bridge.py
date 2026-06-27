@@ -30,27 +30,39 @@ class WSBridge(QThread):
         self._stop_event: asyncio.Event | None = None
         self._ws    = None
         self._stop  = False
+        self._connected = False
 
     # ── public API (called from GUI thread) ───────────────────────────────────
 
     def send_frame(self, msg_type: T, **payload) -> bool:
         """Enqueue a frame to be sent. Returns False when not connected."""
-        if self._loop and self._queue:
+        if self.is_connected():
             asyncio.run_coroutine_threadsafe(
                 self._queue.put(pack(msg_type, **payload)), self._loop
             )
             return True
         return False
 
-    def send_raw_frame(self, raw_json: str):
+    def send_raw_frame(self, raw_json: str) -> bool:
         """Enqueue an already-serialised JSON frame (large file chunks)."""
-        if self._loop and self._queue:
+        if self.is_connected():
             asyncio.run_coroutine_threadsafe(
                 self._queue.put(raw_json), self._loop
             )
+            return True
+        return False
+
+    def is_connected(self) -> bool:
+        return bool(
+            self._connected
+            and self._loop is not None
+            and self._queue is not None
+            and self._ws is not None
+        )
 
     def close(self):
         self._stop = True
+        self._connected = False
         # Wake up any reconnect sleep immediately
         if self._loop and self._stop_event:
             self._loop.call_soon_threadsafe(self._stop_event.set)
@@ -98,6 +110,8 @@ class WSBridge(QThread):
             attempt += 1
 
         self._queue = None
+        self._ws = None
+        self._connected = False
         self._stop_event = None
 
     async def _connect(self):
@@ -108,6 +122,7 @@ class WSBridge(QThread):
             ) as ws:
                 self._ws    = ws
                 self._queue = asyncio.Queue()
+                self._connected = True
                 self.connected.emit()
                 _log.info("Connected to %s", self._url)
                 recv = asyncio.create_task(self._recv_loop(ws))
@@ -117,26 +132,33 @@ class WSBridge(QThread):
                 )
                 for t in pending:
                     t.cancel()
+                self._connected = False
                 self._queue = None
+                self._ws = None
                 for t in done:
                     if exc := t.exception():
                         raise exc
         except websockets.exceptions.ConnectionClosedOK:
+            self._connected = False
             _log.info("Connection closed normally")
             self.disconnected.emit("closed")
         except websockets.exceptions.ConnectionClosedError as exc:
+            self._connected = False
             _log.error("Connection closed: code=%s reason=%r", exc.code, exc.reason)
             self.disconnected.emit(f"connection error: {exc.reason or exc.code}")
             raise
         except TimeoutError:
+            self._connected = False
             _log.error("Connection timed out")
             self.disconnected.emit("timed out during handshake")
             raise
         except OSError as exc:
+            self._connected = False
             _log.error("OS error: %s", exc)
             self.disconnected.emit(str(exc))
             raise
         except Exception as exc:
+            self._connected = False
             _log.error("Unexpected error:\n%s", traceback.format_exc())
             self.disconnected.emit(str(exc))
             raise

@@ -8,6 +8,8 @@ import pathlib
 import sys
 import time
 import uuid
+import base64
+import hashlib
 from datetime import datetime
 
 _log = logging.getLogger("gui")
@@ -22,8 +24,7 @@ if not _log.handlers:
     _log.addHandler(_fh)
     _log.setLevel(logging.DEBUG)
 
-from file_transfer import (FileTransferManager, file_sha256,
-                           split_file, reassemble_chunks, guess_mime)
+from file_transfer import CHUNK_SIZE, FileTransferManager, RoomFileSender, guess_mime
 
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
@@ -38,7 +39,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QStackedWidget, QListWidget, QListWidgetItem,
 )
 
-from protocol import T, unpack
+from protocol import T, pack, unpack
 from crypto import derive_key, encrypt, decrypt
 from .bridge import WSBridge
 from .theme import make_qss, TOKENS
@@ -1465,6 +1466,7 @@ class MainWindow(QMainWindow):
         downloads = self._load_download_dir()
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
         self._ft_cards: dict[str, "FileCard"] = {}
+        self._room_file_senders: dict[str, RoomFileSender] = {}
         self._current_peer: str = ""
 
         # Voice call state
@@ -1640,6 +1642,7 @@ class MainWindow(QMainWindow):
         # Cancel all in-progress file transfers
         for _tid, _card in list(self._ft_cards.items()):
             _card.set_error("连接断开")
+            self._ft_manager.cancel(_tid)
         self._ft_cards.clear()
 
     # ── Incoming frame dispatcher ─────────────────────────────────────────────
@@ -1936,8 +1939,12 @@ class MainWindow(QMainWindow):
             self._on_file_room_share(payload)
         elif mtype == T.FILE_ROOM_CHUNK:
             self._on_file_room_chunk(payload)
+        elif mtype == T.FILE_ROOM_CHUNK_ACK:
+            self._on_file_room_chunk_ack(payload)
         elif mtype == T.FILE_ROOM_DONE:
             self._on_file_room_done(payload)
+        elif mtype == T.FILE_ROOM_DONE_ACK:
+            self._on_file_room_done_ack(payload)
         elif mtype == T.FILE_ROOM_ERROR:
             self._on_file_room_error(payload)
         elif mtype == T.CALL_OFFER:
@@ -2190,84 +2197,52 @@ class MainWindow(QMainWindow):
     # ── File transfer ─────────────────────────────────────────────────────────
 
     def _start_file_send(self, path: str):
-        from protocol import pack as _pack
         rid = self._chat.current_room_id
         if not rid or rid.startswith("@"):
             QMessageBox.warning(self, "发送失败", "请先加入一个聊天室再发送文件。")
             return
-        if not self._bridge or not self._bridge._queue:
+        if not self._bridge or not self._bridge.is_connected():
             QMessageBox.critical(self, "未连接", "尚未连接到服务器。")
             return
 
-        data = pathlib.Path(path).read_bytes()
-        if len(data) > 500 * 1024 * 1024:
+        source_path = pathlib.Path(path)
+        size = source_path.stat().st_size
+        if size > 500 * 1024 * 1024:
             QMessageBox.warning(self, "文件过大", "文件大小不能超过 500 MB。")
             return
 
-        filename = pathlib.Path(path).name
+        filename = source_path.name
         tid    = uuid.uuid4().hex[:12]
-        sha    = file_sha256(data)
-        chunks = split_file(data)
-        total  = len(chunks)
+        sender = RoomFileSender(source_path)
+        self._room_file_senders[tid] = {
+            "sender": sender,
+            "path": source_path,
+            "filename": filename,
+            "size": size,
+            "room_id": rid,
+            "done_sent": False,
+        }
 
         mime = guess_mime(filename)
-        if mime.startswith("image/"):
-            card = ImageCard(tid, filename, data, outgoing=True)
-        elif mime.startswith("video/"):
-            card = VideoCard(tid, filename, len(data), outgoing=True)
+        if mime.startswith("video/"):
+            card = VideoCard(tid, filename, size, outgoing=True)
         else:
-            card = FileCard(tid, filename, len(data), outgoing=True, theme=self._theme)
+            card = FileCard(tid, filename, size, outgoing=True, theme=self._theme)
         if hasattr(card, "cancel_requested"):
             card.cancel_requested.connect(self._cancel_transfer)
         self._ft_cards[tid] = card
         self._chat.add_file_card(card)
 
-        _log.info("File send start: %r  size=%d  chunks=%d", filename, len(data), total)
-        self._bridge.send_frame(T.FILE_ROOM_SHARE,
-                                room_id=rid, transfer_id=tid,
-                                filename=filename, size=len(data), mime=mime)
-
-        def _send_chunk(i: int):
-            if not self._bridge or not self._bridge.isRunning():
-                _log.error("File send aborted at chunk %d/%d: bridge gone", i, total)
-                if c := self._ft_cards.pop(tid, None):
-                    c.set_error("传输中断")
-                return
-            if i >= total:
-                _log.info("File send complete: %r  (%d chunks sent)", filename, total)
-                self._bridge.send_frame(T.FILE_ROOM_DONE,
-                                        transfer_id=tid, sha256=sha)
-                # Sender: save locally and mark done immediately
-                self._ft_cards.pop(tid, None)
-                save_path = self._ft_manager._dir / filename
-                stem, suffix = save_path.stem, save_path.suffix
-                counter = 1
-                while save_path.exists():
-                    save_path = self._ft_manager._dir / f"{stem}_{counter}{suffix}"
-                    counter += 1
-                save_path.write_bytes(data)
-                card.set_done(save_path=str(save_path))
-                room_name = self._rooms.get(rid, {}).get("name", rid)
-                self._files_panel.add_file(filename, self._username,
-                                           room_name, len(data), str(save_path))
-                return
-            # Throttle: back off when queue is deep to let the asyncio send
-            # loop drain and keep ping/pong alive on slow connections.
-            q = self._bridge._queue
-            if q is not None and q.qsize() >= 4:
-                _log.debug("File send throttle: chunk %d/%d  queue=%d", i, total, q.qsize())
-                QTimer.singleShot(50, lambda: _send_chunk(i))
-                return
-            if i % max(1, total // 10) == 0:
-                _log.info("File send progress: %d/%d (%.0f%%)", i, total, i / total * 100)
-            self._bridge.send_raw_frame(_pack(T.FILE_ROOM_CHUNK,
-                                              transfer_id=tid, index=i,
-                                              total=total, data=chunks[i]))
-            if c := self._ft_cards.get(tid):
-                c.set_progress(int((i + 1) / total * 100))
-            QTimer.singleShot(5, lambda: _send_chunk(i + 1))
-
-        _send_chunk(0)
+        total = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+        _log.info("File send start: %r  size=%d  chunks=%d", filename, size, total)
+        if not self._bridge.send_frame(T.FILE_ROOM_SHARE,
+                                       room_id=rid, transfer_id=tid,
+                                       filename=filename, size=size, mime=mime):
+            card.set_error("连接不可用")
+            self._ft_cards.pop(tid, None)
+            self._room_file_senders.pop(tid, None)
+            return
+        self._pump_room_file_sender(tid)
 
     def _on_file_offer(self, p: dict):
         tid, from_user = p["transfer_id"], p["from"]
@@ -2388,6 +2363,17 @@ class MainWindow(QMainWindow):
         if card := self._ft_cards.get(tid):
             card.set_progress(pct)
 
+    def _on_file_room_chunk_ack(self, p: dict):
+        tid = p["transfer_id"]
+        sender_info = self._room_file_senders.get(tid)
+        if sender_info is None:
+            return
+        sender = sender_info["sender"]
+        sender.acknowledge(int(p.get("index", -1)))
+        if card := self._ft_cards.get(tid):
+            card.set_progress(int(sender.acked_chunks / max(sender.total_chunks, 1) * 100))
+        self._pump_room_file_sender(tid)
+
     def _on_file_room_done(self, p: dict):
         """Server relayed FILE_ROOM_DONE — verify checksum, save, update UI."""
         tid       = p["transfer_id"]
@@ -2426,6 +2412,69 @@ class MainWindow(QMainWindow):
         room_name = self._rooms.get(room_id, {}).get("name", room_id)
         self._files_panel.add_file(filename, from_user, room_name,
                                    size, str(save_path))
+        if self._bridge and self._bridge.is_connected():
+            self._bridge.send_frame(T.FILE_ROOM_RECEIVED,
+                                    transfer_id=tid, sha256=sha)
+
+    def _on_file_room_done_ack(self, p: dict):
+        tid = p["transfer_id"]
+        sender_info = self._room_file_senders.pop(tid, None)
+        if card := self._ft_cards.pop(tid, None):
+            save_path = None
+            if sender_info is not None:
+                save_path = str(sender_info["path"])
+            card.set_done(save_path=save_path)
+            if sender_info is not None:
+                room_name = self._rooms.get(sender_info["room_id"], {}).get("name", sender_info["room_id"])
+                self._files_panel.add_file(
+                    sender_info["filename"],
+                    self._username,
+                    room_name,
+                    sender_info["size"],
+                    str(sender_info["path"]),
+                )
+
+    def _pump_room_file_sender(self, tid: str):
+        if tid not in self._ft_cards:
+            self._room_file_senders.pop(tid, None)
+            return
+        sender_info = self._room_file_senders.get(tid)
+        if sender_info is None:
+            return
+        sender = sender_info["sender"]
+        if not self._bridge or not self._bridge.is_connected():
+            if c := self._ft_cards.pop(tid, None):
+                c.set_error("传输中断")
+            self._room_file_senders.pop(tid, None)
+            return
+        q = self._bridge._queue
+        if q is not None and q.qsize() >= 4:
+            QTimer.singleShot(50, lambda: self._pump_room_file_sender(tid))
+            return
+        if sender.ready_to_finish():
+            if sender_info["done_sent"]:
+                return
+            sender_info["done_sent"] = True
+            if not self._bridge.send_frame(T.FILE_ROOM_DONE,
+                                           transfer_id=tid, sha256=sender.sha256_hex):
+                if c := self._ft_cards.pop(tid, None):
+                    c.set_error("传输中断")
+                self._room_file_senders.pop(tid, None)
+            return
+        sent_any = False
+        for index, total_chunks, payload in sender.next_payloads():
+            sent_any = True
+            if index % max(1, total_chunks // 10) == 0:
+                _log.info("File send progress: %d/%d (%.0f%%)", index, total_chunks, index / total_chunks * 100)
+            if not self._bridge.send_raw_frame(pack(T.FILE_ROOM_CHUNK,
+                                                    transfer_id=tid, index=index,
+                                                    total=total_chunks, data=payload)):
+                if c := self._ft_cards.pop(tid, None):
+                    c.set_error("传输中断")
+                self._room_file_senders.pop(tid, None)
+                return
+        if sent_any:
+            QTimer.singleShot(5, lambda: self._pump_room_file_sender(tid))
 
     def _on_file_room_error(self, p: dict):
         tid = p["transfer_id"]

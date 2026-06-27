@@ -12,6 +12,7 @@ Run:  python server.py [--host 0.0.0.0] [--port 8765]
 
 import asyncio
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -75,6 +76,7 @@ class Room:
 # ── Server ───────────────────────────────────────────────────────────────────
 
 MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB per room-shared file
+TRANSFER_TTL_SECONDS = 10 * 60
 
 _ROOMS_FILE = pathlib.Path.home() / ".p2pchat_rooms.json"
 
@@ -96,6 +98,31 @@ class ChatServer:
         # Chunks are NOT stored — relayed immediately to avoid memory blowup
         self._load_rooms()
         self._transfer_meta: Dict[str, dict] = {}
+
+    @staticmethod
+    def _safe_int(value, *, default: int | None = None) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _prune_stale_transfers(self, *, now: float | None = None,
+                               max_age: float = TRANSFER_TTL_SECONDS) -> list[str]:
+        now = time.time() if now is None else now
+        stale = [
+            tid for tid, meta in self._transfer_meta.items()
+            if now - float(meta.get("last_seen", now)) > max_age
+        ]
+        for tid in stale:
+            self._transfer_meta.pop(tid, None)
+        return stale
+
+    async def _cleanup_transfer_meta_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            stale = self._prune_stale_transfers()
+            if stale:
+                log.info("pruned %d stale transfer(s)", len(stale))
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -392,7 +419,12 @@ class ChatServer:
                                          transfer_id=payload.get("transfer_id", ""),
                                          message="Not in a room")
                         continue
-                    size = int(payload.get("size", 0))
+                    size = self._safe_int(payload.get("size", 0))
+                    if size is None or size < 0:
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="非法文件大小")
+                        continue
                     if size > MAX_FILE_BYTES:
                         await self._send(ws, T.FILE_ROOM_ERROR,
                                          transfer_id=payload.get("transfer_id", ""),
@@ -407,10 +439,15 @@ class ChatServer:
                         "filename":  fname,
                         "size":      size,
                         "mime":      mime,
+                        "pending_receivers": set(),
+                        "done_sent": False,
+                        "created_at": time.time(),
+                        "last_seen": time.time(),
                     }
                     # Announce to other room members so they can prepare a card
                     room = self._rooms.get(rid)
                     if room:
+                        self._transfer_meta[tid]["pending_receivers"] = set(room.members) - {username}
                         await self._broadcast(room, T.FILE_ROOM_SHARE,
                                               exclude=username,
                                               transfer_id=tid, filename=fname,
@@ -422,23 +459,36 @@ class ChatServer:
                     meta = self._transfer_meta.get(tid)
                     if meta is None:
                         continue
+                    if meta["from_user"] != username:
+                        continue
+                    index = self._safe_int(payload.get("index", 0))
+                    total = self._safe_int(payload.get("total", 1))
+                    if index is None or total is None or total <= 0 or index < 0 or index >= total:
+                        continue
+                    meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
                     if room:
                         # Relay chunk immediately — no storage
                         await self._broadcast(room, T.FILE_ROOM_CHUNK,
                                               exclude=username,
                                               transfer_id=tid,
-                                              index=int(payload.get("index", 0)),
-                                              total=int(payload.get("total", 1)),
+                                              index=index,
+                                              total=total,
                                               data=payload.get("data", ""))
+                        await self._send(ws, T.FILE_ROOM_CHUNK_ACK,
+                                         transfer_id=tid, index=index)
 
                 elif mtype == T.FILE_ROOM_DONE:
                     tid  = str(payload.get("transfer_id", ""))
-                    meta = self._transfer_meta.pop(tid, None)
+                    meta = self._transfer_meta.get(tid)
                     if meta is None:
                         continue
+                    if meta["from_user"] != username:
+                        continue
+                    meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
                     if room:
+                        meta["done_sent"] = True
                         log.info("file '%s' (%d B) shared by %s in room %s",
                                  meta["filename"], meta["size"],
                                  meta["from_user"], meta["room_id"])
@@ -451,6 +501,28 @@ class ChatServer:
                                               mime=meta["mime"],
                                               from_user=meta["from_user"],
                                               room_id=meta["room_id"])
+                        if not meta["pending_receivers"]:
+                            self._transfer_meta.pop(tid, None)
+                            await self._send(ws, T.FILE_ROOM_DONE_ACK,
+                                             transfer_id=tid)
+
+                elif mtype == T.FILE_ROOM_RECEIVED:
+                    tid = str(payload.get("transfer_id", ""))
+                    meta = self._transfer_meta.get(tid)
+                    if meta is None:
+                        continue
+                    if username == meta["from_user"]:
+                        continue
+                    if username not in meta["pending_receivers"]:
+                        continue
+                    meta["pending_receivers"].discard(username)
+                    meta["last_seen"] = time.time()
+                    if meta["done_sent"] and not meta["pending_receivers"]:
+                        sender_ws = self._name_to_ws.get(meta["from_user"])
+                        self._transfer_meta.pop(tid, None)
+                        if sender_ws is not None:
+                            await self._send(sender_ws, T.FILE_ROOM_DONE_ACK,
+                                             transfer_id=tid)
 
                 # ── LIST_USERS ──────────────────────────────────────────────
                 elif mtype == T.LIST_USERS:
@@ -606,9 +678,15 @@ async def _main(host: str, port: int):
     log.info("═" * 50)
     log.info("  P2P Chat Server  —  ws://%s:%d", host, port)
     log.info("═" * 50)
+    cleanup_task = asyncio.create_task(server._cleanup_transfer_meta_loop())
     async with websockets.serve(server.handle, host, port,
                                 ping_interval=20, ping_timeout=60):
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        finally:
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
 
 
 if __name__ == "__main__":
