@@ -24,7 +24,7 @@ if not _log.handlers:
     _log.addHandler(_fh)
     _log.setLevel(logging.DEBUG)
 
-from file_transfer import CHUNK_SIZE, FileTransferManager, RoomFileSender, guess_mime
+from file_transfer import CHUNK_SIZE, DirectFileSender, FileTransferManager, RoomFileSender, guess_mime
 
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
@@ -1467,7 +1467,9 @@ class MainWindow(QMainWindow):
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
         self._ft_cards: dict[str, "FileCard"] = {}
         self._room_file_senders: dict[str, RoomFileSender] = {}
+        self._direct_file_senders: dict[str, DirectFileSender] = {}
         self._current_peer: str = ""
+        self._identified = False
 
         # Voice call state
         self._voice_call: VoiceCall | None = None   # created after bridge connects
@@ -1604,21 +1606,13 @@ class MainWindow(QMainWindow):
             self._voice_call.state_changed.connect(self._on_call_state_changed)
             self._voice_call.mode_changed.connect(self._on_call_mode_changed)
             self._voice_call.duration_tick.connect(self._on_call_duration)
+        self._identified = False
         self.setWindowTitle("Beam — P2P Chat")
         self._bridge.send_frame(T.SET_NAME, name=self._username)
-        self._bridge.send_frame(T.LIST_ROOMS)
         # Mark all known rooms online
         for rid in self._rooms:
             self._conv.set_conn_state(rid, "ok")
         self._chat.set_conn_state("ok")
-        # Re-join the room we were in before disconnect (if any)
-        rejoin = self._reconnect_room_id
-        self._reconnect_room_id = ""
-        if rejoin and rejoin in self._rooms:
-            pw = self._rooms[rejoin].get("_password", "")
-            self._rooms[rejoin]["_pending_key"] = derive_key(rejoin, pw)
-            _log.info("Reconnect: re-joining room %s", rejoin)
-            self._bridge.send_frame(T.JOIN_ROOM, room_id=rejoin, password=pw)
 
     @pyqtSlot(int)
     def _on_reconnecting(self, attempt: int):
@@ -1629,6 +1623,7 @@ class MainWindow(QMainWindow):
         if self._voice_call and self._voice_call.state.name != "IDLE":
             self._voice_call.hangup()
         _log.error("bridge disconnected: %s", reason)
+        self._identified = False
         self.setWindowTitle("Beam — P2P Chat  [断线]")
         # Save room for auto-reconnect before clearing server state
         self._reconnect_room_id = self._server_room_id
@@ -1644,6 +1639,8 @@ class MainWindow(QMainWindow):
             _card.set_error("连接断开")
             self._ft_manager.cancel(_tid)
         self._ft_cards.clear()
+        self._room_file_senders.clear()
+        self._direct_file_senders.clear()
 
     # ── Incoming frame dispatcher ─────────────────────────────────────────────
 
@@ -1671,13 +1668,29 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.SYSTEM:
             if payload.get("message", "").startswith("Name set to"):
+                self._identified = True
                 self._send_avatar()
+                self._bridge.send_frame(T.LIST_ROOMS)
+                rejoin = self._reconnect_room_id
+                self._reconnect_room_id = ""
+                if rejoin and rejoin in self._rooms:
+                    pw = self._rooms[rejoin].get("_password", "")
+                    self._rooms[rejoin]["_pending_key"] = derive_key(rejoin, pw)
+                    _log.info("Reconnect: re-joining room %s", rejoin)
+                    self._bridge.send_frame(T.JOIN_ROOM, room_id=rejoin, password=pw)
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
             # Silently swallow avatar errors — old servers don't know SET_AVATAR/USER_AVATAR
             if "AVATAR" in msg.upper():
                 _log.warning("server avatar error (suppressed): %s", msg)
+                return
+            if msg == "SET_NAME first":
+                _log.warning("transient auth error during reconnect: %s", msg)
+                return
+            if "already taken" in msg and not self._identified:
+                _log.warning("name temporarily taken during reconnect: %s", msg)
+                self.setWindowTitle("Beam — P2P Chat  [等待重连身份确认]")
                 return
             pending_room = "__pending__" in self._rooms
             if pending_room:
@@ -2261,20 +2274,28 @@ class MainWindow(QMainWindow):
         self._bridge.send_frame(T.FILE_ACCEPT, to=from_user, transfer_id=tid)
 
     def _on_file_accept(self, p: dict):
-        from protocol import pack as _pack
         tid = p["transfer_id"]
         info = self._ft_manager.outgoing.get(tid)
         if not info:
             return
+        sender = info.get("sender")
+        if isinstance(sender, DirectFileSender):
+            self._direct_file_senders[tid] = sender
+            self._pump_direct_file_sender(tid)
+            return
+
+        # Backward-compatible fallback for any legacy in-memory transfers that
+        # may still exist in state from older code paths.
+        from protocol import pack as _pack
+
         chunks = info["chunks"]
         total = len(chunks)
 
         def send_chunk(i: int):
             if i >= total:
-                # All chunks sent — send FILE_DONE
                 self._bridge.send_frame(T.FILE_DONE,
                                         to=info["to"], transfer_id=tid,
-                                        sha256=file_sha256(info["data"]))
+                                        sha256=hashlib.sha256(info["data"]).hexdigest())
                 if card := self._ft_cards.get(tid):
                     card.set_done()
                 self._ft_manager.outgoing.pop(tid, None)
@@ -2298,6 +2319,7 @@ class MainWindow(QMainWindow):
         if card := self._ft_cards.pop(tid, None):
             card.set_error(p.get("reason", "Rejected"))
         self._ft_manager.cancel(tid)
+        self._direct_file_senders.pop(tid, None)
 
     def _on_file_chunk(self, p: dict):
         tid = p["transfer_id"]
@@ -2314,12 +2336,14 @@ class MainWindow(QMainWindow):
                 card.set_done(save_path=str(path))
             else:
                 card.set_error("Checksum mismatch")
+        self._direct_file_senders.pop(tid, None)
 
     def _on_file_error(self, p: dict):
         tid = p["transfer_id"]
         if card := self._ft_cards.pop(tid, None):
             card.set_error(p.get("message", "Transfer error"))
         self._ft_manager.cancel(tid)
+        self._direct_file_senders.pop(tid, None)
 
     def _cancel_transfer(self, tid: str):
         info = self._ft_manager.outgoing.get(tid)
@@ -2335,6 +2359,7 @@ class MainWindow(QMainWindow):
                                         reason="Cancelled by receiver")
         self._ft_manager.cancel(tid)
         self._ft_cards.pop(tid, None)
+        self._direct_file_senders.pop(tid, None)
 
     def _on_file_room_share(self, p: dict):
         """Server relayed a FILE_ROOM_SHARE announcement — another user is sending a file."""
@@ -2475,6 +2500,56 @@ class MainWindow(QMainWindow):
                 return
         if sent_any:
             QTimer.singleShot(5, lambda: self._pump_room_file_sender(tid))
+
+    def _pump_direct_file_sender(self, tid: str):
+        if tid not in self._ft_cards:
+            self._direct_file_senders.pop(tid, None)
+            self._ft_manager.outgoing.pop(tid, None)
+            return
+        info = self._ft_manager.outgoing.get(tid)
+        sender = self._direct_file_senders.get(tid)
+        if info is None or sender is None:
+            return
+        if not self._bridge or not self._bridge.is_connected():
+            if card := self._ft_cards.pop(tid, None):
+                card.set_error("传输中断")
+            self._direct_file_senders.pop(tid, None)
+            self._ft_manager.outgoing.pop(tid, None)
+            return
+        q = self._bridge._queue
+        if q is not None and q.qsize() >= 4:
+            QTimer.singleShot(50, lambda: self._pump_direct_file_sender(tid))
+            return
+        if sender.ready_to_finish():
+            if not self._bridge.send_frame(T.FILE_DONE,
+                                           to=info["to"], transfer_id=tid,
+                                           sha256=sender.sha256_hex):
+                if card := self._ft_cards.pop(tid, None):
+                    card.set_error("传输中断")
+                self._direct_file_senders.pop(tid, None)
+                self._ft_manager.outgoing.pop(tid, None)
+                return
+            if card := self._ft_cards.get(tid):
+                card.set_done(save_path=str(info.get("path", "")) or None)
+            self._direct_file_senders.pop(tid, None)
+            self._ft_manager.outgoing.pop(tid, None)
+            return
+        payload = sender.next_payload()
+        if payload is None:
+            QTimer.singleShot(5, lambda: self._pump_direct_file_sender(tid))
+            return
+        index, total, data = payload
+        if not self._bridge.send_raw_frame(pack(T.FILE_CHUNK,
+                                                to=info["to"], transfer_id=tid,
+                                                index=index, total=total, data=data)):
+            if card := self._ft_cards.pop(tid, None):
+                card.set_error("传输中断")
+            self._direct_file_senders.pop(tid, None)
+            self._ft_manager.outgoing.pop(tid, None)
+            return
+        if card := self._ft_cards.get(tid):
+            card.set_progress(int((index + 1) / max(total, 1) * 100))
+        QTimer.singleShot(5, lambda: self._pump_direct_file_sender(tid))
 
     def _on_file_room_error(self, p: dict):
         tid = p["transfer_id"]

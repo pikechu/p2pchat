@@ -5,7 +5,7 @@ import base64
 import pytest
 from file_transfer import (
     CHUNK_SIZE, split_file, reassemble_chunks,
-    file_sha256, FileTransferManager, RoomFileSender,
+    DirectFileSender, file_sha256, FileTransferManager, RoomFileSender,
 )
 
 
@@ -189,5 +189,39 @@ def test_room_file_sender_limits_in_flight_and_tracks_ack_progress():
     assert [index for index, _, _ in batch3] == [3]
 
     sender.acknowledge(3)
+    assert sender.ready_to_finish() is True
+    assert sender.sha256_hex == hashlib.sha256(data).hexdigest()
+
+
+def test_room_file_sender_handles_zero_byte_file():
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    path = tmpdir / "empty.bin"
+    path.write_bytes(b"")
+
+    sender = RoomFileSender(path, max_in_flight=2)
+    batch = sender.next_payloads()
+
+    assert batch == [(0, 1, "")]
+    sender.acknowledge(0)
+    assert sender.ready_to_finish() is True
+    assert sender.sha256_hex == hashlib.sha256(b"").hexdigest()
+
+
+def test_direct_file_sender_streams_incrementally():
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    path = tmpdir / "direct.bin"
+    data = bytes(range(256)) * 300
+    path.write_bytes(data)
+
+    sender = DirectFileSender(path)
+    payloads = []
+    while payload := sender.next_payload():
+        payloads.append(payload)
+
+    assert len(payloads) >= 2
+    assert payloads[0][0] == 0
+    assert payloads[-1][0] == len(payloads) - 1
+    rebuilt = b"".join(base64.b64decode(chunk) for _, _, chunk in payloads)
+    assert rebuilt == data
     assert sender.ready_to_finish() is True
     assert sender.sha256_hex == hashlib.sha256(data).hexdigest()

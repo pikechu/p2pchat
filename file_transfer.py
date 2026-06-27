@@ -39,6 +39,7 @@ class RoomFileSender:
         self._acked_chunks = 0
         self._in_flight: set[int] = set()
         self._done_reading = False
+        self._zero_chunk_pending = self.size == 0
 
     @property
     def sent_chunks(self) -> int:
@@ -55,8 +56,12 @@ class RoomFileSender:
     def next_payloads(self) -> List[tuple[int, int, str]]:
         payloads = []
         while not self._done_reading and len(self._in_flight) < self.max_in_flight:
-            chunk = self._src.read(CHUNK_SIZE)
-            if not chunk:
+            if self._zero_chunk_pending:
+                chunk = b""
+                self._zero_chunk_pending = False
+            else:
+                chunk = self._src.read(CHUNK_SIZE)
+            if not chunk and self.size > 0:
                 self._done_reading = True
                 self._src.close()
                 break
@@ -69,6 +74,9 @@ class RoomFileSender:
             ))
             self._sent_chunks += 1
             self._in_flight.add(index)
+            if self._sent_chunks >= self.total_chunks:
+                self._done_reading = True
+                self._src.close()
         return payloads
 
     def acknowledge(self, index: int):
@@ -78,6 +86,49 @@ class RoomFileSender:
 
     def ready_to_finish(self) -> bool:
         return self._done_reading and not self._in_flight and self._sent_chunks == self.total_chunks
+
+
+class DirectFileSender:
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+        self.size = path.stat().st_size
+        self.total_chunks = max(1, math.ceil(self.size / CHUNK_SIZE))
+        self._src = path.open("rb")
+        self._hasher = hashlib.sha256()
+        self._sent_chunks = 0
+        self._done_reading = False
+        self._zero_chunk_pending = self.size == 0
+
+    @property
+    def sent_chunks(self) -> int:
+        return self._sent_chunks
+
+    @property
+    def sha256_hex(self) -> str:
+        return self._hasher.hexdigest()
+
+    def next_payload(self) -> Optional[tuple[int, int, str]]:
+        if self._done_reading:
+            return None
+        if self._zero_chunk_pending:
+            chunk = b""
+            self._zero_chunk_pending = False
+        else:
+            chunk = self._src.read(CHUNK_SIZE)
+        if not chunk and self.size > 0:
+            self._done_reading = True
+            self._src.close()
+            return None
+        index = self._sent_chunks
+        self._hasher.update(chunk)
+        self._sent_chunks += 1
+        if self._sent_chunks >= self.total_chunks:
+            self._done_reading = True
+            self._src.close()
+        return index, self.total_chunks, base64.b64encode(chunk).decode("ascii")
+
+    def ready_to_finish(self) -> bool:
+        return self._done_reading and self._sent_chunks == self.total_chunks
 
 
 class FileTransferManager:
@@ -98,6 +149,18 @@ class FileTransferManager:
             "chunks":   split_file(data),
             "mime":     guess_mime(filename),
             "size":     len(data),
+        }
+        return tid
+
+    def register_outgoing_path(self, to: str, path: pathlib.Path) -> str:
+        tid = uuid.uuid4().hex[:12]
+        self.outgoing[tid] = {
+            "to":       to,
+            "filename": path.name,
+            "path":     path,
+            "sender":   DirectFileSender(path),
+            "mime":     guess_mime(path.name),
+            "size":     path.stat().st_size,
         }
         return tid
 

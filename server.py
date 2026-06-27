@@ -236,9 +236,15 @@ class ChatServer:
                         await self._send(ws, T.ERROR, message="Name is empty")
                         continue
                     if name in self._name_to_ws and self._name_to_ws[name] is not ws:
-                        await self._send(ws, T.ERROR,
-                                         message=f"'{name}' is already taken")
-                        continue
+                        old_ws = self._name_to_ws[name]
+                        log.info("user '%s' reconnect takeover: closing old websocket", name)
+                        try:
+                            await old_ws.close(code=4000, reason="replaced by new connection")
+                        except Exception:
+                            pass
+                        await self._evict(name)
+                        self._ws_to_name.pop(old_ws, None)
+                        self._name_to_ws.pop(name, None)
                     # release old name
                     if username and username in self._name_to_ws:
                         del self._name_to_ws[username]
