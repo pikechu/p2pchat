@@ -2220,8 +2220,8 @@ class MainWindow(QMainWindow):
 
         source_path = pathlib.Path(path)
         size = source_path.stat().st_size
-        if size > 500 * 1024 * 1024:
-            QMessageBox.warning(self, "文件过大", "文件大小不能超过 500 MB。")
+        if size > 50 * 1024 * 1024:
+            QMessageBox.warning(self, "文件过大", "文件大小不能超过 50 MB。")
             return
 
         filename = source_path.name
@@ -2323,7 +2323,10 @@ class MainWindow(QMainWindow):
 
     def _on_file_chunk(self, p: dict):
         tid = p["transfer_id"]
-        self._ft_manager.add_chunk(tid, p["index"], p["total"], p["data"])
+        accepted = self._ft_manager.add_chunk(tid, p["index"], p["total"], p["data"])
+        if not accepted:
+            _log.warning("ignored invalid FILE_CHUNK tid=%s index=%s", tid, p.get("index"))
+            return
         pct = int((p["index"] + 1) / max(p["total"], 1) * 100)
         if card := self._ft_cards.get(tid):
             card.set_progress(pct)
@@ -2383,7 +2386,10 @@ class MainWindow(QMainWindow):
         tid   = p["transfer_id"]
         index = int(p.get("index", 0))
         total = int(p.get("total", 1))
-        self._ft_manager.add_chunk(tid, index, total, p.get("data", ""))
+        accepted = self._ft_manager.add_chunk(tid, index, total, p.get("data", ""))
+        if not accepted:
+            _log.warning("ignored invalid FILE_ROOM_CHUNK tid=%s index=%s", tid, index)
+            return
         pct = int((index + 1) / max(total, 1) * 100)
         if card := self._ft_cards.get(tid):
             card.set_progress(pct)

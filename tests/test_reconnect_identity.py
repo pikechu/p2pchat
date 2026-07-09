@@ -1,4 +1,5 @@
 import os
+import pathlib
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -82,3 +83,20 @@ def test_transient_identity_errors_do_not_popup(app):
 
     warning.assert_not_called()
     set_title.assert_called_once()
+
+
+def test_start_file_send_rejects_files_larger_than_50mb(app, tmp_path):
+    window = _make_window_stub()
+    window._chat.current_room_id = "ROOM01"
+    window._bridge.is_connected = MagicMock(return_value=True)
+    window._room_file_senders = {}
+    window._ft_cards = {}
+    big_file = tmp_path / "big.bin"
+    big_file.touch()
+    os.truncate(big_file, 51 * 1024 * 1024)
+
+    with patch.object(QMessageBox, "warning") as warning:
+        MainWindow._start_file_send(window, str(pathlib.Path(big_file)))
+
+    warning.assert_called_once_with(window, "文件过大", "文件大小不能超过 50 MB。")
+    window._bridge.send_frame.assert_not_called()

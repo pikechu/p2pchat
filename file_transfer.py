@@ -182,22 +182,23 @@ class FileTransferManager:
         }
         temp_path.unlink(missing_ok=True)
 
-    def add_chunk(self, transfer_id: str, index: int, total: int, data_b64: str):
+    def add_chunk(self, transfer_id: str, index: int, total: int, data_b64: str) -> bool:
         rec = self.incoming.get(transfer_id)
         if rec is None:
-            return
+            return False
         if total != rec["total_chunks"]:
-            return
+            return False
         if index < 0 or index >= total or index != rec["received_chunks"]:
-            return
+            return False
         try:
             chunk = base64.b64decode(data_b64)
         except Exception:
-            return
+            return False
         with rec["temp_path"].open("ab") as out:
             out.write(chunk)
         rec["hasher"].update(chunk)
         rec["received_chunks"] += 1
+        return True
 
     def finish_incoming(self, transfer_id: str, sha256_hex: str) -> Optional[pathlib.Path]:
         rec = self.incoming.pop(transfer_id, None)

@@ -12,6 +12,7 @@ Run:  python server.py [--host 0.0.0.0] [--port 8765]
 
 import asyncio
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -26,6 +27,7 @@ import websockets
 import websockets.exceptions
 
 from protocol import T, pack, unpack
+from file_transfer import CHUNK_SIZE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +77,7 @@ class Room:
 
 # ── Server ───────────────────────────────────────────────────────────────────
 
-MAX_FILE_BYTES = 500 * 1024 * 1024   # 500 MB per room-shared file
+MAX_FILE_BYTES = 50 * 1024 * 1024   # 50 MB per room-shared file
 TRANSFER_TTL_SECONDS = 10 * 60
 
 _ROOMS_FILE = pathlib.Path.home() / ".p2pchat_rooms.json"
@@ -98,6 +100,9 @@ class ChatServer:
         # Chunks are NOT stored — relayed immediately to avoid memory blowup
         self._load_rooms()
         self._transfer_meta: Dict[str, dict] = {}
+        # transfer_id → {from_user, to_user, filename, size, mime, progress...}
+        # Direct FILE_* payloads are also streamed through without buffering.
+        self._direct_transfer_meta: Dict[str, dict] = {}
 
     @staticmethod
     def _safe_int(value, *, default: int | None = None) -> int | None:
@@ -115,7 +120,167 @@ class ChatServer:
         ]
         for tid in stale:
             self._transfer_meta.pop(tid, None)
-        return stale
+        direct_stale = [
+            tid for tid, meta in self._direct_transfer_meta.items()
+            if now - float(meta.get("last_seen", now)) > max_age
+        ]
+        for tid in direct_stale:
+            self._direct_transfer_meta.pop(tid, None)
+        return stale + direct_stale
+
+    async def _fail_room_transfer(self, ws, transfer_id: str, message: str):
+        meta = self._transfer_meta.pop(transfer_id, None)
+        await self._send(ws, T.FILE_ROOM_ERROR,
+                         transfer_id=transfer_id, message=message)
+        if meta is not None:
+            room = self._rooms.get(meta["room_id"])
+            if room is not None:
+                await self._broadcast(room, T.FILE_ROOM_ERROR,
+                                      exclude=meta["from_user"],
+                                      transfer_id=transfer_id,
+                                      message=message)
+
+    async def _fail_direct_transfer(self, ws, transfer_id: str, to_user: str, message: str):
+        meta = self._direct_transfer_meta.pop(transfer_id, None)
+        await self._send(ws, T.FILE_ERROR,
+                         to=to_user, transfer_id=transfer_id, message=message)
+        target = to_user
+        if meta is not None:
+            target = meta["to_user"] if meta["from_user"] != to_user else meta["from_user"]
+        target_ws = self._name_to_ws.get(target)
+        if target_ws is not None and target_ws is not ws:
+            await self._send(target_ws, T.FILE_ERROR,
+                             transfer_id=transfer_id, message=message)
+
+    async def _forward_to_user(self, ws, username: str, to_user: str, msg_type: T, **payload) -> bool:
+        if to_user not in self._name_to_ws:
+            await self._send(ws, T.ERROR, message=f"User '{to_user}' not connected")
+            return False
+        target_ws = self._name_to_ws[to_user]
+        fwd_payload = dict(payload)
+        fwd_payload["from"] = username
+        try:
+            await target_ws.send(pack(msg_type, **fwd_payload))
+            return True
+        except websockets.exceptions.ConnectionClosed:
+            await self._evict(to_user)
+            self._name_to_ws.pop(to_user, None)
+            await self._send(ws, T.ERROR, message=f"User '{to_user}' disconnected")
+            return False
+
+    async def _handle_direct_file(self, ws, username: str, mtype: str, payload: dict):
+        to_user = str(payload.get("to", ""))
+        tid = str(payload.get("transfer_id", ""))
+        if not to_user:
+            await self._send(ws, T.ERROR, message="Missing recipient")
+            return
+        if not tid:
+            await self._send(ws, T.ERROR, message="Missing transfer_id")
+            return
+
+        if mtype == T.FILE_OFFER:
+            size = self._safe_int(payload.get("size", 0))
+            if size is None or size < 0:
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="非法文件大小")
+                return
+            if size > MAX_FILE_BYTES:
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message=f"文件过大（最大 {MAX_FILE_BYTES//1024//1024} MB）")
+                return
+            if to_user not in self._name_to_ws:
+                await self._send(ws, T.ERROR, message=f"User '{to_user}' not connected")
+                return
+            self._direct_transfer_meta[tid] = {
+                "from_user": username,
+                "to_user": to_user,
+                "filename": str(payload.get("filename", "file")),
+                "size": size,
+                "mime": str(payload.get("mime", "")),
+                "total_chunks": max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE),
+                "next_index": 0,
+                "received_bytes": 0,
+                "hasher": hashlib.sha256(),
+                "last_seen": time.time(),
+            }
+            await self._forward_to_user(ws, username, to_user, T.FILE_OFFER, **payload)
+            return
+
+        meta = self._direct_transfer_meta.get(tid)
+
+        if mtype in (T.FILE_ACCEPT, T.FILE_REJECT):
+            if meta is not None and meta["to_user"] != username:
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="transfer recipient mismatch")
+                return
+            if mtype == T.FILE_REJECT:
+                self._direct_transfer_meta.pop(tid, None)
+            await self._forward_to_user(ws, username, to_user, T(mtype), **payload)
+            return
+
+        if mtype == T.FILE_ERROR:
+            self._direct_transfer_meta.pop(tid, None)
+            await self._forward_to_user(ws, username, to_user, T.FILE_ERROR, **payload)
+            return
+
+        if meta is None:
+            await self._forward_to_user(ws, username, to_user, T(mtype), **payload)
+            return
+        if meta["from_user"] != username or meta["to_user"] != to_user:
+            await self._fail_direct_transfer(ws, tid, to_user, "transfer sender/recipient mismatch")
+            return
+
+        if mtype == T.FILE_CHUNK:
+            index = self._safe_int(payload.get("index", 0))
+            total = self._safe_int(payload.get("total", 1))
+            if index is None or total is None or total <= 0 or index < 0 or index >= total:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid index/total")
+                return
+            if total != meta["total_chunks"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid total")
+                return
+            if index != meta["next_index"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid index order")
+                return
+            data_b64 = str(payload.get("data", ""))
+            try:
+                chunk = base64.b64decode(data_b64, validate=True)
+            except Exception:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid chunk data")
+                return
+            is_last = index == total - 1
+            if (not is_last and len(chunk) != CHUNK_SIZE) or len(chunk) > CHUNK_SIZE:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid chunk size")
+                return
+            next_size = meta["received_bytes"] + len(chunk)
+            if next_size > meta["size"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "received bytes exceed file size")
+                return
+            if is_last and next_size != meta["size"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "final chunk size mismatch")
+                return
+            meta["hasher"].update(chunk)
+            meta["received_bytes"] = next_size
+            meta["next_index"] = index + 1
+            meta["last_seen"] = time.time()
+            await self._forward_to_user(ws, username, to_user, T.FILE_CHUNK,
+                                        **{**payload, "data": data_b64})
+            return
+
+        if mtype == T.FILE_DONE:
+            if meta["next_index"] != meta["total_chunks"] or meta["received_bytes"] != meta["size"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "file is incomplete")
+                return
+            sha256_hex = str(payload.get("sha256", ""))
+            if meta["hasher"].hexdigest() != sha256_hex:
+                await self._fail_direct_transfer(ws, tid, to_user, "sha256 mismatch")
+                return
+            self._direct_transfer_meta.pop(tid, None)
+            await self._forward_to_user(ws, username, to_user, T.FILE_DONE,
+                                        **{**payload, "sha256": sha256_hex})
 
     async def _cleanup_transfer_meta_loop(self):
         while True:
@@ -203,8 +368,38 @@ class ChatServer:
                 log.info("room %s is now empty (persisted)", room_id)
         # Clean up any in-progress transfers started by this user
         stale = [t for t, m in self._transfer_meta.items() if m["from_user"] == username]
-        for t in stale:
-            self._transfer_meta.pop(t, None)
+        for tid in stale:
+            meta = self._transfer_meta.pop(tid, None)
+            if meta is None:
+                continue
+            room = self._rooms.get(meta["room_id"])
+            if room is not None:
+                await self._broadcast(room, T.FILE_ROOM_ERROR,
+                                      transfer_id=tid,
+                                      message=f"User '{username}' disconnected")
+        for tid, meta in list(self._transfer_meta.items()):
+            pending = meta.get("pending_receivers")
+            if pending and username in pending:
+                pending.discard(username)
+                meta["last_seen"] = time.time()
+                if meta.get("done_sent") and not pending:
+                    sender_ws = self._name_to_ws.get(meta["from_user"])
+                    self._transfer_meta.pop(tid, None)
+                    if sender_ws is not None:
+                        await self._send(sender_ws, T.FILE_ROOM_DONE_ACK,
+                                         transfer_id=tid)
+        direct_stale = [
+            (t, m) for t, m in self._direct_transfer_meta.items()
+            if m["from_user"] == username or m["to_user"] == username
+        ]
+        for tid, meta in direct_stale:
+            self._direct_transfer_meta.pop(tid, None)
+            other = meta["to_user"] if meta["from_user"] == username else meta["from_user"]
+            other_ws = self._name_to_ws.get(other)
+            if other_ws is not None:
+                await self._send(other_ws, T.FILE_ERROR,
+                                 transfer_id=tid,
+                                 message=f"User '{username}' disconnected")
 
     async def _leave(self, username: str, ws):
         """Graceful leave — also notifies remaining members."""
@@ -389,29 +584,19 @@ class ChatServer:
 
                 # ── FILE_* (user-to-user routing) ────────────────────────
                 elif mtype in (T.FILE_OFFER, T.FILE_ACCEPT, T.FILE_REJECT,
-                               T.FILE_CHUNK, T.FILE_DONE, T.FILE_ERROR,
-                               T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT,
+                               T.FILE_CHUNK, T.FILE_DONE, T.FILE_ERROR):
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    await self._handle_direct_file(ws, username, mtype, payload)
+
+                elif mtype in (T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT,
                                T.CALL_HANGUP, T.CALL_ICE, T.VOICE_CHUNK):
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
                     to_user = str(payload.get("to", ""))
-                    if to_user not in self._name_to_ws:
-                        await self._send(ws, T.ERROR,
-                                         message=f"User '{to_user}' not connected")
-                        continue
-                    target_ws = self._name_to_ws[to_user]
-                    fwd_payload = dict(payload)
-                    fwd_payload["from"] = username
-                    try:
-                        await target_ws.send(pack(
-                            T(mtype), **fwd_payload
-                        ))
-                    except websockets.exceptions.ConnectionClosed:
-                        await self._evict(to_user)
-                        self._name_to_ws.pop(to_user, None)
-                        await self._send(ws, T.ERROR,
-                                         message=f"User '{to_user}' disconnected")
+                    await self._forward_to_user(ws, username, to_user, T(mtype), **payload)
 
                 # ── FILE_ROOM_* (room-broadcast file sharing) ────────────
                 # Chunks are relayed immediately — never buffered server-side.
@@ -445,6 +630,10 @@ class ChatServer:
                         "filename":  fname,
                         "size":      size,
                         "mime":      mime,
+                        "total_chunks": max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE),
+                        "next_index": 0,
+                        "received_bytes": 0,
+                        "hasher": hashlib.sha256(),
                         "pending_receivers": set(),
                         "done_sent": False,
                         "created_at": time.time(),
@@ -470,7 +659,34 @@ class ChatServer:
                     index = self._safe_int(payload.get("index", 0))
                     total = self._safe_int(payload.get("total", 1))
                     if index is None or total is None or total <= 0 or index < 0 or index >= total:
+                        await self._fail_room_transfer(ws, tid, "invalid index/total")
                         continue
+                    if total != meta["total_chunks"]:
+                        await self._fail_room_transfer(ws, tid, "invalid total")
+                        continue
+                    if index != meta["next_index"]:
+                        await self._fail_room_transfer(ws, tid, "invalid index order")
+                        continue
+                    data_b64 = str(payload.get("data", ""))
+                    try:
+                        chunk = base64.b64decode(data_b64, validate=True)
+                    except Exception:
+                        await self._fail_room_transfer(ws, tid, "invalid chunk data")
+                        continue
+                    is_last = index == total - 1
+                    if (not is_last and len(chunk) != CHUNK_SIZE) or len(chunk) > CHUNK_SIZE:
+                        await self._fail_room_transfer(ws, tid, "invalid chunk size")
+                        continue
+                    next_size = meta["received_bytes"] + len(chunk)
+                    if next_size > meta["size"]:
+                        await self._fail_room_transfer(ws, tid, "received bytes exceed file size")
+                        continue
+                    if is_last and next_size != meta["size"]:
+                        await self._fail_room_transfer(ws, tid, "final chunk size mismatch")
+                        continue
+                    meta["hasher"].update(chunk)
+                    meta["received_bytes"] = next_size
+                    meta["next_index"] = index + 1
                     meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
                     if room:
@@ -480,7 +696,7 @@ class ChatServer:
                                               transfer_id=tid,
                                               index=index,
                                               total=total,
-                                              data=payload.get("data", ""))
+                                              data=data_b64)
                         await self._send(ws, T.FILE_ROOM_CHUNK_ACK,
                                          transfer_id=tid, index=index)
 
@@ -490,6 +706,13 @@ class ChatServer:
                     if meta is None:
                         continue
                     if meta["from_user"] != username:
+                        continue
+                    if meta["next_index"] != meta["total_chunks"] or meta["received_bytes"] != meta["size"]:
+                        await self._fail_room_transfer(ws, tid, "file is incomplete")
+                        continue
+                    sha256_hex = str(payload.get("sha256", ""))
+                    if meta["hasher"].hexdigest() != sha256_hex:
+                        await self._fail_room_transfer(ws, tid, "sha256 mismatch")
                         continue
                     meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
@@ -501,7 +724,7 @@ class ChatServer:
                         await self._broadcast(room, T.FILE_ROOM_DONE,
                                               exclude=username,
                                               transfer_id=tid,
-                                              sha256=str(payload.get("sha256", "")),
+                                              sha256=sha256_hex,
                                               filename=meta["filename"],
                                               size=meta["size"],
                                               mime=meta["mime"],

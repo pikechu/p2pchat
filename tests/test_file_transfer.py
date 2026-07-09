@@ -117,8 +117,9 @@ def test_add_chunk_ignores_out_of_range_index():
 
     before_chunks = mgr.incoming["t4"]["received_chunks"]
     temp_path = mgr.incoming["t4"]["temp_path"]
-    mgr.add_chunk("t4", 999, 1, "AAAA")
+    accepted = mgr.add_chunk("t4", 999, 1, "AAAA")
 
+    assert accepted is False
     assert mgr.incoming["t4"]["received_chunks"] == before_chunks
     assert temp_path.exists() is False
 
@@ -129,8 +130,9 @@ def test_add_chunk_ignores_mismatched_total():
 
     before_chunks = mgr.incoming["t5"]["received_chunks"]
     temp_path = mgr.incoming["t5"]["temp_path"]
-    mgr.add_chunk("t5", 0, 999, split_file(b"abc")[0])
+    accepted = mgr.add_chunk("t5", 0, 999, split_file(b"abc")[0])
 
+    assert accepted is False
     assert mgr.incoming["t5"]["received_chunks"] == before_chunks
     assert temp_path.exists() is False
 
@@ -141,11 +143,23 @@ def test_add_chunk_ignores_out_of_order_chunk():
     mgr = FileTransferManager(downloads_dir=pathlib.Path(tempfile.mkdtemp()))
     mgr.begin_incoming("t6", "alice", "file.bin", len(data), "application/octet-stream")
 
-    mgr.add_chunk("t6", 1, len(chunks), chunks[1])
+    accepted = mgr.add_chunk("t6", 1, len(chunks), chunks[1])
+    assert accepted is False
     assert mgr.incoming["t6"]["received_chunks"] == 0
 
-    mgr.add_chunk("t6", 0, len(chunks), chunks[0])
+    accepted = mgr.add_chunk("t6", 0, len(chunks), chunks[0])
+    assert accepted is True
     assert mgr.incoming["t6"]["received_chunks"] == 1
+
+
+def test_add_chunk_returns_true_when_chunk_is_written():
+    mgr = FileTransferManager(downloads_dir=pathlib.Path(tempfile.mkdtemp()))
+    mgr.begin_incoming("t_written", "alice", "file.bin", 3, "application/octet-stream")
+
+    accepted = mgr.add_chunk("t_written", 0, 1, split_file(b"abc")[0])
+
+    assert accepted is True
+    assert mgr.incoming["t_written"]["received_chunks"] == 1
 
 
 def test_iter_file_chunks_streams_without_loading_whole_file():

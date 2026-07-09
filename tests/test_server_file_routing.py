@@ -131,6 +131,91 @@ def test_file_chunk_routed_to_recipient(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
+def test_direct_file_chunk_with_wrong_total_is_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "direct_sender_bad_total")
+        bob = await _connect(server_port, "direct_receiver_bad_total")
+
+        await alice.send(pack(T.FILE_OFFER,
+                              to="direct_receiver_bad_total",
+                              transfer_id="direct-bad-total-1",
+                              filename="x.bin", size=4,
+                              mime="application/octet-stream"))
+        await _recv_until_type(bob, T.FILE_OFFER)
+
+        await alice.send(pack(T.FILE_CHUNK,
+                              to="direct_receiver_bad_total",
+                              transfer_id="direct-bad-total-1",
+                              index=0, total=2, data="QUJDRA=="))
+        frame = await _recv_until_type(alice, T.FILE_ERROR)
+        assert frame["payload"]["transfer_id"] == "direct-bad-total-1"
+        assert "total" in frame["payload"]["message"]
+        receiver_error = await _recv_until_type(bob, T.FILE_ERROR)
+        assert receiver_error["payload"]["transfer_id"] == "direct-bad-total-1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_direct_file_done_with_bad_sha_is_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "direct_sender_bad_sha")
+        bob = await _connect(server_port, "direct_receiver_bad_sha")
+
+        await alice.send(pack(T.FILE_OFFER,
+                              to="direct_receiver_bad_sha",
+                              transfer_id="direct-bad-sha-1",
+                              filename="x.bin", size=4,
+                              mime="application/octet-stream"))
+        await _recv_until_type(bob, T.FILE_OFFER)
+
+        await alice.send(pack(T.FILE_CHUNK,
+                              to="direct_receiver_bad_sha",
+                              transfer_id="direct-bad-sha-1",
+                              index=0, total=1, data="QUJDRA=="))
+        chunk = await _recv_until_type(bob, T.FILE_CHUNK)
+        assert chunk["payload"]["transfer_id"] == "direct-bad-sha-1"
+
+        await alice.send(pack(T.FILE_DONE,
+                              to="direct_receiver_bad_sha",
+                              transfer_id="direct-bad-sha-1",
+                              sha256="deadbeef" * 8))
+        frame = await _recv_until_type(alice, T.FILE_ERROR)
+        assert frame["payload"]["transfer_id"] == "direct-bad-sha-1"
+        assert "sha256" in frame["payload"]["message"]
+        receiver_error = await _recv_until_type(bob, T.FILE_ERROR)
+        assert receiver_error["payload"]["transfer_id"] == "direct-bad-sha-1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_direct_file_sender_disconnect_notifies_recipient(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "direct_sender_disconnect")
+        bob = await _connect(server_port, "direct_receiver_disconnect")
+
+        await alice.send(pack(T.FILE_OFFER,
+                              to="direct_receiver_disconnect",
+                              transfer_id="direct-disconnect-1",
+                              filename="x.bin", size=4,
+                              mime="application/octet-stream"))
+        await _recv_until_type(bob, T.FILE_OFFER)
+
+        await alice.close()
+        frame = await _recv_until_type(bob, T.FILE_ERROR)
+        assert frame["payload"]["transfer_id"] == "direct-disconnect-1"
+        assert "disconnected" in frame["payload"]["message"]
+
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
 def test_file_offer_to_unknown_user_returns_error(server_port, event_loop):
     async def run():
         alice = await _connect(server_port, "alice4")
@@ -146,7 +231,7 @@ def test_file_offer_to_unknown_user_returns_error(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
-def test_room_file_share_rejects_files_larger_than_500mb(server_port, event_loop):
+def test_room_file_share_rejects_files_larger_than_50mb(server_port, event_loop):
     async def run():
         alice = await _connect(server_port, "room_sender")
         await _create_room(alice, "BigFiles")
@@ -156,12 +241,12 @@ def test_room_file_share_rejects_files_larger_than_500mb(server_port, event_loop
             room_id="IGNORED",
             transfer_id="room-big-1",
             filename="huge.bin",
-            size=501 * 1024 * 1024,
+            size=51 * 1024 * 1024,
             mime="application/octet-stream",
         ))
         frame = unpack(await asyncio.wait_for(alice.recv(), timeout=3))
         assert frame["type"] == T.FILE_ROOM_ERROR
-        assert "最大 500 MB" in frame["payload"]["message"]
+        assert "最大 50 MB" in frame["payload"]["message"]
 
         await alice.close()
 
@@ -253,6 +338,193 @@ def test_room_file_done_is_acked_only_after_receiver_confirms(server_port, event
 
         await alice.close()
         await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_file_chunk_with_wrong_total_is_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "room_sender_bad_total")
+        room_id = await _create_room(alice, "BadTotalRoom")
+        bob = await _connect(server_port, "room_receiver_bad_total")
+        await _join_room(bob, room_id)
+
+        await alice.send(pack(
+            T.FILE_ROOM_SHARE,
+            room_id=room_id,
+            transfer_id="room-bad-total-1",
+            filename="safe.txt",
+            size=4,
+            mime="text/plain",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_SHARE)
+
+        await alice.send(pack(
+            T.FILE_ROOM_CHUNK,
+            transfer_id="room-bad-total-1",
+            index=0,
+            total=2,
+            data="QUJDRA==",
+        ))
+        err = await _recv_until_type(alice, T.FILE_ROOM_ERROR)
+        assert err["payload"]["transfer_id"] == "room-bad-total-1"
+        assert "total" in err["payload"]["message"]
+        receiver_error = await _recv_until_type(bob, T.FILE_ROOM_ERROR)
+        assert receiver_error["payload"]["transfer_id"] == "room-bad-total-1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_file_chunk_out_of_order_is_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "room_sender_ooo")
+        room_id = await _create_room(alice, "OutOfOrderRoom")
+        bob = await _connect(server_port, "room_receiver_ooo")
+        await _join_room(bob, room_id)
+
+        await alice.send(pack(
+            T.FILE_ROOM_SHARE,
+            room_id=room_id,
+            transfer_id="room-ooo-1",
+            filename="safe.txt",
+            size=40000,
+            mime="application/octet-stream",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_SHARE)
+
+        await alice.send(pack(
+            T.FILE_ROOM_CHUNK,
+            transfer_id="room-ooo-1",
+            index=1,
+            total=2,
+            data="QQ==",
+        ))
+        err = await _recv_until_type(alice, T.FILE_ROOM_ERROR)
+        assert err["payload"]["transfer_id"] == "room-ooo-1"
+        assert "index" in err["payload"]["message"]
+        receiver_error = await _recv_until_type(bob, T.FILE_ROOM_ERROR)
+        assert receiver_error["payload"]["transfer_id"] == "room-ooo-1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_file_done_with_bad_sha_is_rejected(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "room_sender_bad_sha")
+        room_id = await _create_room(alice, "BadShaRoom")
+        bob = await _connect(server_port, "room_receiver_bad_sha")
+        await _join_room(bob, room_id)
+
+        await alice.send(pack(
+            T.FILE_ROOM_SHARE,
+            room_id=room_id,
+            transfer_id="room-bad-sha-1",
+            filename="safe.txt",
+            size=4,
+            mime="text/plain",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_SHARE)
+
+        await alice.send(pack(
+            T.FILE_ROOM_CHUNK,
+            transfer_id="room-bad-sha-1",
+            index=0,
+            total=1,
+            data="QUJDRA==",
+        ))
+        await _recv_until_type(alice, T.FILE_ROOM_CHUNK_ACK)
+        chunk = await _recv_until_type(bob, T.FILE_ROOM_CHUNK)
+        assert chunk["payload"]["transfer_id"] == "room-bad-sha-1"
+
+        await alice.send(pack(
+            T.FILE_ROOM_DONE,
+            transfer_id="room-bad-sha-1",
+            sha256="deadbeef" * 8,
+        ))
+        err = await _recv_until_type(alice, T.FILE_ROOM_ERROR)
+        assert err["payload"]["transfer_id"] == "room-bad-sha-1"
+        assert "sha256" in err["payload"]["message"]
+        receiver_error = await _recv_until_type(bob, T.FILE_ROOM_ERROR)
+        assert receiver_error["payload"]["transfer_id"] == "room-bad-sha-1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_file_sender_disconnect_notifies_receivers(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "room_sender_disconnect")
+        room_id = await _create_room(alice, "DisconnectRoom")
+        bob = await _connect(server_port, "room_receiver_disconnect")
+        await _join_room(bob, room_id)
+
+        await alice.send(pack(
+            T.FILE_ROOM_SHARE,
+            room_id=room_id,
+            transfer_id="room-disconnect-1",
+            filename="safe.txt",
+            size=4,
+            mime="text/plain",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_SHARE)
+
+        await alice.close()
+        err = await _recv_until_type(bob, T.FILE_ROOM_ERROR)
+        assert err["payload"]["transfer_id"] == "room-disconnect-1"
+        assert "disconnected" in err["payload"]["message"]
+
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_file_receiver_disconnect_unblocks_sender_done_ack(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "room_sender_receiver_gone")
+        room_id = await _create_room(alice, "ReceiverGoneRoom")
+        bob = await _connect(server_port, "room_receiver_gone")
+        await _join_room(bob, room_id)
+
+        await alice.send(pack(
+            T.FILE_ROOM_SHARE,
+            room_id=room_id,
+            transfer_id="room-receiver-gone-1",
+            filename="safe.txt",
+            size=4,
+            mime="text/plain",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_SHARE)
+
+        await alice.send(pack(
+            T.FILE_ROOM_CHUNK,
+            transfer_id="room-receiver-gone-1",
+            index=0,
+            total=1,
+            data="QUJDRA==",
+        ))
+        await _recv_until_type(alice, T.FILE_ROOM_CHUNK_ACK)
+        await _recv_until_type(bob, T.FILE_ROOM_CHUNK)
+
+        await alice.send(pack(
+            T.FILE_ROOM_DONE,
+            transfer_id="room-receiver-gone-1",
+            sha256="e12e115acf4552b2568b55e93cbd39394c4ef81c82447fafc997882a02d23677",
+        ))
+        await _recv_until_type(bob, T.FILE_ROOM_DONE)
+        await bob.close()
+
+        done_ack = await _recv_until_type(alice, T.FILE_ROOM_DONE_ACK)
+        assert done_ack["payload"]["transfer_id"] == "room-receiver-gone-1"
+
+        await alice.close()
 
     event_loop.run_until_complete(run())
 
