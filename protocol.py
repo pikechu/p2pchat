@@ -39,6 +39,13 @@ class T(str, Enum):
     CALL_ICE     = "CALL_ICE"     # {to, candidate: {ip, port}}
     VOICE_CHUNK  = "VOICE_CHUNK"  # {to, data: base64 PCM int16}
 
+    # WebRTC signaling (client↔server, user-to-user relay only)
+    WEBRTC_OFFER = "WEBRTC_OFFER"  # {to, session_id, sdp}
+    WEBRTC_ANSWER = "WEBRTC_ANSWER"  # {to, session_id, sdp}
+    WEBRTC_ICE = "WEBRTC_ICE"  # {to, session_id, candidate}
+    WEBRTC_CLOSE = "WEBRTC_CLOSE"  # {to, session_id}
+    WEBRTC_ERROR = "WEBRTC_ERROR"  # {to, session_id, message}
+
     # file transfer (client→server, routed user-to-user)
     FILE_OFFER  = "FILE_OFFER"   # {to, transfer_id, filename, size, mime}
     FILE_ACCEPT = "FILE_ACCEPT"  # {to, transfer_id}

@@ -10,6 +10,8 @@ The server never decrypts messages; E2E encryption lives entirely on clients.
 Run:  python server.py [--host 0.0.0.0] [--port 8765]
 """
 
+from __future__ import annotations
+
 import asyncio
 import argparse
 import base64
@@ -591,7 +593,9 @@ class ChatServer:
                     await self._handle_direct_file(ws, username, mtype, payload)
 
                 elif mtype in (T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT,
-                               T.CALL_HANGUP, T.CALL_ICE, T.VOICE_CHUNK):
+                               T.CALL_HANGUP, T.CALL_ICE, T.VOICE_CHUNK,
+                               T.WEBRTC_OFFER, T.WEBRTC_ANSWER, T.WEBRTC_ICE,
+                               T.WEBRTC_CLOSE, T.WEBRTC_ERROR):
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue

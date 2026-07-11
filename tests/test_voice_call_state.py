@@ -2,8 +2,14 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import types
 import pytest
 from unittest.mock import MagicMock, patch
+
+sounddevice_stub = types.ModuleType("sounddevice")
+sounddevice_stub.InputStream = object
+sounddevice_stub.OutputStream = object
+sys.modules["sounddevice"] = sounddevice_stub
 
 
 @pytest.fixture()

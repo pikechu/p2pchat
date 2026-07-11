@@ -35,7 +35,7 @@ import io as _io
 console = Console(file=_io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace') if hasattr(sys.stdout, 'buffer') else sys.stdout)
 
 SERVICE_NAME = "p2pchat"
-SERVER_FILES = ["server.py", "protocol.py", "requirements-server.txt"]
+SERVER_FILES = ["server.py", "protocol.py", "file_transfer.py", "requirements-server.txt"]
 
 
 # ── SSH / SCP helpers ─────────────────────────────────────────────────────────

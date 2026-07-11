@@ -1,5 +1,6 @@
 """Main application window — Beam P2P Chat desktop client."""
 
+import asyncio
 import json
 import logging
 import logging.handlers
@@ -25,6 +26,8 @@ if not _log.handlers:
     _log.setLevel(logging.DEBUG)
 
 from file_transfer import CHUNK_SIZE, DirectFileSender, FileTransferManager, RoomFileSender, guess_mime
+from ice_config import load_ice_servers
+from webrtc_transfer import WebRTCTransfer
 
 from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
@@ -50,6 +53,8 @@ from .widgets import (
 )
 from voice_call import VoiceCall, CallState
 from .call_widget import CallWidget, IncomingCallDialog
+
+WEBRTC_FILE_FALLBACK_MS = 5000
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -131,7 +136,8 @@ class RoomDialog(QDialog):
 
 class SettingsDialog(QDialog):
     def __init__(self, server_url: str, username: str, theme: str,
-                 download_dir: str = "", close_pref: str | None = None, parent=None):
+                 download_dir: str = "", close_pref: str | None = None,
+                 ice_servers: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("Dialog")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
@@ -169,6 +175,15 @@ class SettingsDialog(QDialog):
         _close_map = {None: "每次询问", "tray": "最小化到托盘", "quit": "退出程序"}
         self._close_combo.setCurrentText(_close_map.get(close_pref, "每次询问"))
         form.addRow(_lbl("X 关闭按钮", "FormLabel"), self._close_combo)
+
+        self._ice_servers = QTextEdit()
+        self._ice_servers.setObjectName("FormInput")
+        self._ice_servers.setPlainText(ice_servers)
+        self._ice_servers.setPlaceholderText(
+            'stun:stun.l.google.com:19302 或 JSON 列表，例如 [{"urls":["turn:host:3478"],"username":"u","credential":"p"}]'
+        )
+        self._ice_servers.setFixedHeight(72)
+        form.addRow(_lbl("ICE servers", "FormLabel"), self._ice_servers)
 
         lay.addLayout(form)
 
@@ -261,6 +276,7 @@ class SettingsDialog(QDialog):
             "theme":        self._theme.currentText(),
             "download_dir": self._dl_lbl.text(),
             "close_pref":   _pref_map.get(self._close_combo.currentText()),
+            "ice_servers":  self._ice_servers.toPlainText().strip(),
         }
 
 
@@ -384,6 +400,7 @@ class ConvPanel(QWidget):
 
         self._rows: dict[str, ConvRowWidget] = {}
         self._active: str | None = None
+        self._unread: dict[str, int] = {}
 
     def upsert_room(self, room_id: str, name: str, creator: str,
                     members: int = 0, locked: bool = False,
@@ -417,11 +434,21 @@ class ConvPanel(QWidget):
     def set_active(self, room_id: str | None):
         for rid, row in self._rows.items():
             row.set_active(rid == room_id)
+        if room_id:
+            self._unread[room_id] = 0
+            if row := self._rows.get(room_id):
+                row.set_unread(0)
         self._active = room_id
 
     def set_preview(self, room_id: str, text: str, ts: float = 0):
         if row := self._rows.get(room_id):
             row.set_preview(text, ts)
+
+    def increment_unread(self, room_id: str, amount: int = 1):
+        count = self._unread.get(room_id, 0) + amount
+        self._unread[room_id] = count
+        if row := self._rows.get(room_id):
+            row.set_unread(count)
 
     def set_conn_state(self, room_id: str, state: str):
         if row := self._rows.get(room_id):
@@ -1261,14 +1288,7 @@ class ChatPanel(QWidget):
         self._header.update_room(name, members, locked, conn_state, icon)
         self._info_panel.update_room(room_id, name, creator, created_at, icon, is_creator)
 
-        if room_id not in self._msgs_by_room:
-            msgs = MessagesArea(theme=self._theme, own_name=self._own_name)
-            msgs.set_own_avatar(self._own_pixmap)
-            for peer, px in self._peer_pixmaps.items():
-                msgs.set_peer_avatar(peer, px)
-            msgs.reply_requested.connect(self.reply_requested)
-            self._msgs_by_room[room_id] = msgs
-            self._msgs_stack.addWidget(msgs)
+        self._ensure_messages_area(room_id)
 
         self._msgs_stack.setCurrentWidget(self._msgs_by_room[room_id])
         self._composer.set_enabled(True)
@@ -1323,6 +1343,21 @@ class ChatPanel(QWidget):
     def add_file_card(self, card):
         if msgs := self._active_msgs():
             msgs.add_file_card(card)
+
+    def add_file_card_to_room(self, room_id: str, card):
+        msgs = self._ensure_messages_area(room_id)
+        msgs.add_file_card(card)
+
+    def _ensure_messages_area(self, room_id: str) -> MessagesArea:
+        if room_id not in self._msgs_by_room:
+            msgs = MessagesArea(theme=self._theme, own_name=self._own_name)
+            msgs.set_own_avatar(self._own_pixmap)
+            for peer, px in self._peer_pixmaps.items():
+                msgs.set_peer_avatar(peer, px)
+            msgs.reply_requested.connect(self.reply_requested)
+            self._msgs_by_room[room_id] = msgs
+            self._msgs_stack.addWidget(msgs)
+        return self._msgs_by_room[room_id]
 
     def show_typing(self, username: str):
         self._typing.show_typing(username)
@@ -1464,12 +1499,17 @@ class MainWindow(QMainWindow):
 
         # File transfer state — configurable download directory
         downloads = self._load_download_dir()
+        ice_servers = self._load_ice_servers()
         self._ft_manager = FileTransferManager(downloads_dir=downloads)
         self._ft_cards: dict[str, "FileCard"] = {}
         self._room_file_senders: dict[str, RoomFileSender] = {}
         self._direct_file_senders: dict[str, DirectFileSender] = {}
         self._current_peer: str = ""
         self._identified = False
+        self._webrtc_file_pending: dict[str, dict] = {}
+        self._webrtc_supported = True
+        self._ice_servers = ice_servers
+        self._webrtc_transfer = self._new_webrtc_transfer(downloads, ice_servers)
 
         # Voice call state
         self._voice_call: VoiceCall | None = None   # created after bridge connects
@@ -1691,6 +1731,11 @@ class MainWindow(QMainWindow):
             if "already taken" in msg and not self._identified:
                 _log.warning("name temporarily taken during reconnect: %s", msg)
                 self.setWindowTitle("Beam — P2P Chat  [等待重连身份确认]")
+                return
+            if "Unknown type 'WEBRTC_" in msg:
+                _log.warning("server does not support WebRTC signaling: %s", msg)
+                self._webrtc_supported = False
+                self._fallback_all_webrtc_files("server-unsupported")
                 return
             pending_room = "__pending__" in self._rooms
             if pending_room:
@@ -1989,8 +2034,127 @@ class MainWindow(QMainWindow):
             if self._voice_call:
                 self._voice_call.on_voice_chunk(data)
 
+        elif mtype == T.WEBRTC_OFFER:
+            peer = payload.get("from", "")
+            if peer:
+                self._ensure_dm_conversation(peer)
+            self._run_webrtc_task(self._webrtc_transfer.handle_offer(payload))
+
+        elif mtype == T.WEBRTC_ANSWER:
+            self._run_webrtc_task(self._webrtc_transfer.handle_answer(payload))
+
+        elif mtype == T.WEBRTC_ICE:
+            self._run_webrtc_task(self._webrtc_transfer.handle_ice(payload))
+
+        elif mtype in (T.WEBRTC_CLOSE, T.WEBRTC_ERROR):
+            session_id = str(payload.get("session_id", ""))
+            if session_id:
+                message = "对端已关闭传输" if mtype == T.WEBRTC_CLOSE else payload.get("message", "WebRTC 传输失败")
+                self._mark_webrtc_transfer_closed(session_id, message)
+                self._run_webrtc_task(self._webrtc_transfer.close(session_id))
+
         elif mtype == T.USER_AVATAR:
             self._on_user_avatar(payload)
+
+    def _run_webrtc_task(self, coro, *, raise_errors: bool = False):
+        try:
+            asyncio.run(coro)
+        except Exception as exc:
+            _log.error("WebRTC task failed: %s", exc)
+            if raise_errors:
+                raise
+
+    def _new_webrtc_transfer(self, downloads: pathlib.Path,
+                             ice_servers: list[dict] | None = None) -> WebRTCTransfer:
+        return WebRTCTransfer(
+            lambda msg_type, **payload: self._bridge.send_frame(msg_type, **payload)
+            if self._bridge else False,
+            downloads_dir=downloads,
+            on_file_received=self._on_webrtc_file_received,
+            on_file_sent=self._on_webrtc_file_sent,
+            on_file_progress=self._on_webrtc_file_progress,
+            on_channel_open=self._on_webrtc_channel_open,
+            on_session_closed=self._on_webrtc_session_closed,
+            ice_servers=ice_servers,
+        )
+
+    def _on_webrtc_file_received(self, save_path: pathlib.Path, meta: dict):
+        filename = str(meta.get("filename", save_path.name))
+        from_user = str(meta.get("from_user", "?"))
+        size = int(meta.get("size", save_path.stat().st_size))
+        _log.info("WEBRTC file received session=%s peer=%s filename=%s size=%d path=%s",
+                  meta.get("transfer_id", ""), from_user, filename, size, save_path)
+        self._files_panel.add_file(filename, from_user, "WebRTC", size, str(save_path))
+        theme = self.__dict__.get("_theme", "light")
+        card = FileCard(str(meta.get("transfer_id", "")), filename, size,
+                        outgoing=False, theme=theme)
+        card.set_done(save_path=str(save_path))
+        self._add_dm_file_card(from_user, card)
+
+    def _on_webrtc_file_sent(self, source_path: pathlib.Path, meta: dict):
+        tid = str(meta.get("transfer_id", ""))
+        self._webrtc_file_pending.pop(tid, None)
+        filename = str(meta.get("filename", source_path.name))
+        to_user = str(meta.get("to_user", "?"))
+        size = int(meta.get("size", source_path.stat().st_size))
+        _log.info("WEBRTC file sent session=%s peer=%s filename=%s size=%d",
+                  tid, to_user, filename, size)
+        if card := self._ft_cards.pop(tid, None):
+            card.set_done()
+        self._files_panel.add_file(filename, self._username, f"@ {to_user}", size, str(source_path))
+
+    def _ensure_dm_conversation(self, peer: str) -> str:
+        dm_id = f"@{peer}"
+        dms = self.__dict__.setdefault("_dms", {})
+        if dm_id not in dms:
+            dms[dm_id] = peer
+            conv = self.__dict__.get("_conv")
+            if conv is not None:
+                conv.upsert_room(dm_id, f"@ {peer}", peer, 0, False)
+            rows = getattr(conv, "_rows", None) if conv is not None else None
+            if rows is not None and (row := rows.get(dm_id)):
+                row.set_preview("Direct Message")
+        return dm_id
+
+    def _add_dm_file_card(self, peer: str, card):
+        dm_id = self._ensure_dm_conversation(peer)
+        chat = self.__dict__.get("_chat")
+        if chat is not None:
+            chat.add_file_card_to_room(dm_id, card)
+        conv = self.__dict__.get("_conv")
+        if conv is not None:
+            filename = getattr(card, "_filename", "文件")
+            conv.set_preview(dm_id, f"{peer}: 📎 {filename}", time.time())
+            current_room = getattr(chat, "current_room_id", None) if chat is not None else None
+            if current_room != dm_id and hasattr(conv, "increment_unread"):
+                conv.increment_unread(dm_id)
+
+    def _on_webrtc_channel_open(self, meta: dict):
+        session_id = str(meta.get("session_id", ""))
+        if session_id:
+            _log.info("WEBRTC channel open session=%s peer=%s filename=%s size=%s",
+                      session_id, meta.get("peer", ""), meta.get("filename", ""),
+                      meta.get("size", ""))
+            self._webrtc_file_pending.pop(session_id, None)
+
+    def _on_webrtc_file_progress(self, meta: dict):
+        tid = str(meta.get("transfer_id", ""))
+        if not tid:
+            return
+        if card := self._ft_cards.get(tid):
+            card.set_progress(int(meta.get("progress", 0)))
+
+    def _mark_webrtc_transfer_closed(self, session_id: str, message: str):
+        self._webrtc_file_pending.pop(session_id, None)
+        _log.info("WEBRTC transfer closed session=%s message=%s", session_id, message)
+        cards = self.__dict__.get("_ft_cards", {})
+        if card := cards.pop(session_id, None):
+            card.set_error(message)
+
+    def _on_webrtc_session_closed(self, meta: dict):
+        session_id = str(meta.get("session_id", ""))
+        if session_id:
+            self._mark_webrtc_transfer_closed(session_id, str(meta.get("message", "WebRTC 传输已关闭")))
 
     def _on_user_avatar(self, payload: dict):
         import base64
@@ -2211,7 +2375,7 @@ class MainWindow(QMainWindow):
 
     def _start_file_send(self, path: str):
         rid = self._chat.current_room_id
-        if not rid or rid.startswith("@"):
+        if not rid:
             QMessageBox.warning(self, "发送失败", "请先加入一个聊天室再发送文件。")
             return
         if not self._bridge or not self._bridge.is_connected():
@@ -2222,6 +2386,10 @@ class MainWindow(QMainWindow):
         size = source_path.stat().st_size
         if size > 50 * 1024 * 1024:
             QMessageBox.warning(self, "文件过大", "文件大小不能超过 50 MB。")
+            return
+        if rid.startswith("@"):
+            peer = self._dms.get(rid, rid[1:])
+            self._start_peer_file_send(peer, source_path)
             return
 
         filename = source_path.name
@@ -2257,6 +2425,90 @@ class MainWindow(QMainWindow):
             return
         self._pump_room_file_sender(tid)
 
+    def _start_peer_file_send(self, peer: str, source_path: pathlib.Path):
+        if not self.__dict__.get("_webrtc_supported", True):
+            self._start_peer_file_relay(peer, source_path)
+            return
+
+        filename = source_path.name
+        size = source_path.stat().st_size
+        tid = uuid.uuid4().hex[:12]
+        _log.info("WEBRTC file start session=%s peer=%s filename=%s size=%d",
+                  tid, peer, filename, size)
+        card = FileCard(tid, filename, size, outgoing=True, theme=self._theme)
+        if hasattr(card, "cancel_requested"):
+            card.cancel_requested.connect(self._cancel_transfer)
+        self._ft_cards[tid] = card
+        self._chat.add_file_card(card)
+        try:
+            self._run_webrtc_task(
+                self._webrtc_transfer.start_offer(peer, source_path, session_id=tid),
+                raise_errors=True,
+            )
+            self._webrtc_file_pending[tid] = {"peer": peer, "path": source_path}
+            QTimer.singleShot(WEBRTC_FILE_FALLBACK_MS,
+                              lambda tid=tid: self._fallback_webrtc_file_if_pending(tid))
+            card.set_progress(1)
+        except Exception as exc:
+            _log.warning("WebRTC file offer failed, falling back to relay: %s", exc)
+            self._start_peer_file_relay(peer, source_path, transfer_id=tid,
+                                        existing_card=card)
+
+    def _fallback_webrtc_file_if_pending(self, tid: str):
+        pending = self._webrtc_file_pending.pop(tid, None)
+        if pending is None:
+            return
+        _log.info("WEBRTC file fallback session=%s peer=%s filename=%s reason=timeout",
+                  tid, pending.get("peer", ""), pending.get("path", pathlib.Path("")).name)
+        self._run_webrtc_task(self._webrtc_transfer.close(tid))
+        self._start_peer_file_relay(pending["peer"], pending["path"], transfer_id=tid,
+                                    existing_card=self._ft_cards.get(tid))
+
+    def _fallback_all_webrtc_files(self, reason: str):
+        pending_items = list(self._webrtc_file_pending.items())
+        self._webrtc_file_pending.clear()
+        for tid, pending in pending_items:
+            _log.info("WEBRTC file fallback session=%s peer=%s filename=%s reason=%s",
+                      tid, pending.get("peer", ""), pending.get("path", pathlib.Path("")).name,
+                      reason)
+            self._run_webrtc_task(self._webrtc_transfer.close(tid))
+            self._start_peer_file_relay(pending["peer"], pending["path"], transfer_id=tid,
+                                        existing_card=self._ft_cards.get(tid))
+
+    def _start_peer_file_relay(self, peer: str, source_path: pathlib.Path, *,
+                               transfer_id: str | None = None,
+                               existing_card=None):
+        tid = transfer_id or self._ft_manager.register_outgoing_path(peer, source_path)
+        if tid not in self._ft_manager.outgoing:
+            self._ft_manager.outgoing[tid] = {
+                "to": peer,
+                "filename": source_path.name,
+                "path": source_path,
+                "sender": DirectFileSender(source_path),
+                "mime": guess_mime(source_path.name),
+                "size": source_path.stat().st_size,
+            }
+        info = self._ft_manager.outgoing[tid]
+        _log.info("Relay file offer session=%s peer=%s filename=%s size=%d",
+                  tid, peer, source_path.name, info["size"])
+        card = existing_card or self._ft_cards.get(tid)
+        if card is None:
+            card = FileCard(tid, source_path.name, source_path.stat().st_size,
+                            outgoing=True, theme=self._theme)
+            if hasattr(card, "cancel_requested"):
+                card.cancel_requested.connect(self._cancel_transfer)
+            self._chat.add_file_card(card)
+        self._ft_cards[tid] = card
+        if not self._bridge.send_frame(T.FILE_OFFER,
+                                       to=peer,
+                                       transfer_id=tid,
+                                       filename=source_path.name,
+                                       size=info["size"],
+                                       mime=info["mime"]):
+            card.set_error("连接不可用")
+            self._ft_cards.pop(tid, None)
+            self._ft_manager.cancel(tid)
+
     def _on_file_offer(self, p: dict):
         tid, from_user = p["transfer_id"], p["from"]
         filename = p["filename"]
@@ -2268,7 +2520,7 @@ class MainWindow(QMainWindow):
         card = FileCard(tid, filename, size, outgoing=False, theme=self._theme)
         card.cancel_requested.connect(self._cancel_transfer)
         self._ft_cards[tid] = card
-        self._chat.add_file_card(card)
+        self._add_dm_file_card(from_user, card)
 
         # Auto-accept
         self._bridge.send_frame(T.FILE_ACCEPT, to=from_user, transfer_id=tid)
@@ -2349,6 +2601,17 @@ class MainWindow(QMainWindow):
         self._direct_file_senders.pop(tid, None)
 
     def _cancel_transfer(self, tid: str):
+        pending_webrtc = self._webrtc_file_pending.pop(tid, None)
+        if pending_webrtc is not None:
+            peer = pending_webrtc.get("peer")
+            _log.info("WEBRTC file cancel session=%s peer=%s", tid, peer or "")
+            if peer:
+                self._bridge.send_frame(T.WEBRTC_CLOSE, to=peer, session_id=tid)
+            self._run_webrtc_task(self._webrtc_transfer.close(tid))
+            if card := self._ft_cards.pop(tid, None):
+                card.set_error("已取消")
+            return
+
         info = self._ft_manager.outgoing.get(tid)
         if info:
             self._bridge.send_frame(T.FILE_ERROR,
@@ -2536,7 +2799,7 @@ class MainWindow(QMainWindow):
                 self._ft_manager.outgoing.pop(tid, None)
                 return
             if card := self._ft_cards.get(tid):
-                card.set_done(save_path=str(info.get("path", "")) or None)
+                card.set_done()
             self._direct_file_senders.pop(tid, None)
             self._ft_manager.outgoing.pop(tid, None)
             return
@@ -2757,7 +3020,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _open_settings(self):
         dlg = SettingsDialog(self._server_url, self._username, self._theme,
-                             str(self._ft_manager._dir), self._close_pref, self)
+                             str(self._ft_manager._dir), self._close_pref,
+                             self._load_ice_servers_text(), self)
         self._style_dialog(dlg)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2777,6 +3041,13 @@ class MainWindow(QMainWindow):
         if new_pref != self._close_pref:
             self._save_close_pref(new_pref)
 
+        ice_text = v.get("ice_servers", "")
+        if ice_text != self._load_ice_servers_text():
+            self._save_ice_servers_text(ice_text)
+            self._ice_servers = load_ice_servers({"BEAM_ICE_SERVERS": ice_text})
+            self._webrtc_transfer = self._new_webrtc_transfer(self._ft_manager._dir,
+                                                              self._ice_servers)
+
         self._rail.set_username(self._username)
         self._apply_theme()
 
@@ -2789,6 +3060,7 @@ class MainWindow(QMainWindow):
 
     _PREF_FILE   = pathlib.Path.home() / ".beamchat" / "close_pref.txt"
     _DL_DIR_FILE = pathlib.Path.home() / ".beamchat" / "download_dir.txt"
+    _ICE_FILE    = pathlib.Path.home() / ".beamchat" / "ice_servers.txt"
     _DEFAULT_DL  = pathlib.Path.home() / "AppData" / "Local" / "BeamChat" / "downloads"
 
     def _load_download_dir(self) -> pathlib.Path:
@@ -2819,6 +3091,25 @@ class MainWindow(QMainWindow):
         try:
             self._PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
             self._PREF_FILE.write_text(pref or "")
+        except Exception:
+            pass
+
+    def _load_ice_servers_text(self) -> str:
+        try:
+            return self._ICE_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+
+    def _load_ice_servers(self) -> list[dict]:
+        raw = self._load_ice_servers_text()
+        if raw:
+            return load_ice_servers({"BEAM_ICE_SERVERS": raw})
+        return load_ice_servers()
+
+    def _save_ice_servers_text(self, value: str):
+        try:
+            self._ICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._ICE_FILE.write_text(value.strip(), encoding="utf-8")
         except Exception:
             pass
 

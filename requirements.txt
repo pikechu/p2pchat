@@ -4,3 +4,4 @@ rich>=13.0
 PyQt6>=6.6.0
 sounddevice>=0.4.6
 numpy>=1.26.0
+aiortc>=1.9.0

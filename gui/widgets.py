@@ -465,11 +465,11 @@ class ConvRowWidget(QWidget):
         bot_row.addWidget(self._prev_lbl)
         bot_row.addStretch()
 
-        if unread:
-            badge = QLabel(str(unread))
-            badge.setObjectName("UnreadBadge")
-            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            bot_row.addWidget(badge)
+        self._unread_badge = QLabel("")
+        self._unread_badge.setObjectName("UnreadBadge")
+        self._unread_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bot_row.addWidget(self._unread_badge)
+        self.set_unread(unread)
         mid.addLayout(bot_row)
 
         lay.addLayout(mid)
@@ -497,6 +497,10 @@ class ConvRowWidget(QWidget):
         self._prev_lbl.setText(text[:50])
         if ts:
             self._time_lbl.setText(datetime.fromtimestamp(ts).strftime("%H:%M"))
+
+    def set_unread(self, unread: int):
+        self._unread_badge.setText(str(unread) if unread else "")
+        self._unread_badge.setVisible(unread > 0)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:

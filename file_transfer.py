@@ -1,5 +1,7 @@
 """File chunking, reassembly, and transfer state management."""
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import math

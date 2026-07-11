@@ -231,6 +231,77 @@ def test_file_offer_to_unknown_user_returns_error(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
+def test_webrtc_offer_routed_to_recipient(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "webrtc_alice")
+        bob = await _connect(server_port, "webrtc_bob")
+
+        await alice.send(pack(
+            T.WEBRTC_OFFER,
+            to="webrtc_bob",
+            session_id="rtc-1",
+            sdp={"type": "offer", "sdp": "v=0"},
+        ))
+        frame = await _recv_until_type(bob, T.WEBRTC_OFFER)
+        assert frame["payload"]["from"] == "webrtc_alice"
+        assert frame["payload"]["session_id"] == "rtc-1"
+        assert frame["payload"]["sdp"]["type"] == "offer"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_webrtc_answer_and_ice_routed_back(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "webrtc_offer_peer")
+        bob = await _connect(server_port, "webrtc_answer_peer")
+
+        await bob.send(pack(
+            T.WEBRTC_ANSWER,
+            to="webrtc_offer_peer",
+            session_id="rtc-2",
+            sdp={"type": "answer", "sdp": "v=0"},
+        ))
+        answer = await _recv_until_type(alice, T.WEBRTC_ANSWER)
+        assert answer["payload"]["from"] == "webrtc_answer_peer"
+        assert answer["payload"]["session_id"] == "rtc-2"
+
+        await alice.send(pack(
+            T.WEBRTC_ICE,
+            to="webrtc_answer_peer",
+            session_id="rtc-2",
+            candidate={"candidate": "candidate:1", "sdpMid": "0", "sdpMLineIndex": 0},
+        ))
+        ice = await _recv_until_type(bob, T.WEBRTC_ICE)
+        assert ice["payload"]["from"] == "webrtc_offer_peer"
+        assert ice["payload"]["candidate"]["candidate"] == "candidate:1"
+
+        await alice.close()
+        await bob.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_webrtc_signal_to_unknown_user_returns_error(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "webrtc_unknown_sender")
+
+        await alice.send(pack(
+            T.WEBRTC_OFFER,
+            to="missing_webrtc_peer",
+            session_id="rtc-missing",
+            sdp={"type": "offer", "sdp": "v=0"},
+        ))
+        frame = await _recv_until_type(alice, T.ERROR)
+        assert "missing_webrtc_peer" in frame["payload"]["message"]
+
+        await alice.close()
+
+    event_loop.run_until_complete(run())
+
+
 def test_room_file_share_rejects_files_larger_than_50mb(server_port, event_loop):
     async def run():
         alice = await _connect(server_port, "room_sender")

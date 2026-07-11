@@ -84,7 +84,7 @@ def test_set_name_welcome(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
-def test_duplicate_name_rejected(server_port, event_loop):
+def test_duplicate_name_takes_over_existing_connection(server_port, event_loop):
     async def run():
         ws1 = await _connect(server_port, "dup_user")
         ws2 = await ws_connect.connect(f"ws://127.0.0.1:{server_port}")
@@ -92,7 +92,8 @@ def test_duplicate_name_rejected(server_port, event_loop):
 
         await ws2.send(pack(T.SET_NAME, name="dup_user"))
         frame = await _recv(ws2)
-        assert frame["type"] == T.ERROR
+        assert frame["type"] == T.SYSTEM
+        assert "Name set to 'dup_user'" in frame["payload"]["message"]
 
         await ws1.close()
         await ws2.close()
