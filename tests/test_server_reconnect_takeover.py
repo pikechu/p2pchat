@@ -10,7 +10,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import websockets.legacy.client as ws_connect
-from protocol import T, pack, unpack
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from identity import DeviceIdentity, sign_key_bundle
+from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
 
 
 def _free_port() -> int:
@@ -23,7 +27,8 @@ def _free_port() -> int:
 def server_port():
     port = _free_port()
     proc = subprocess.Popen(
-        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port)],
+        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port),
+         "--no-message-persistence"],
         cwd=os.path.join(os.path.dirname(__file__), ".."),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -43,6 +48,15 @@ def event_loop():
 
 async def _connect_raw(port):
     ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
+    identity = DeviceIdentity(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
+    ephemeral = X25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    await ws.send(pack(T.CLIENT_HELLO,
+                       client_version=CLIENT_VERSION,
+                       protocol_version=PROTOCOL_VERSION,
+                       capabilities=CLIENT_CAPABILITIES,
+                       key_bundle=identity.public_bundle(
+                           ephemeral, sign_key_bundle(identity, ephemeral, PROTOCOL_VERSION), PROTOCOL_VERSION
+                       )))
     await ws.recv()
     return ws
 
@@ -52,13 +66,12 @@ def test_same_name_reconnect_takes_over_old_socket(server_port, event_loop):
         ws1 = await _connect_raw(server_port)
         await ws1.send(pack(T.SET_NAME, name="pp"))
         first = unpack(await asyncio.wait_for(ws1.recv(), timeout=3))
-        assert first["type"] == T.SYSTEM
+        assert first["type"] == T.READY
 
         ws2 = await _connect_raw(server_port)
         await ws2.send(pack(T.SET_NAME, name="pp"))
         second = unpack(await asyncio.wait_for(ws2.recv(), timeout=3))
-        assert second["type"] == T.SYSTEM
-        assert second["payload"]["message"] == "Name set to 'pp'"
+        assert second["type"] == T.READY
 
         with pytest.raises(Exception):
             await asyncio.wait_for(ws1.recv(), timeout=1)

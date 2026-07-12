@@ -2,10 +2,12 @@ import sys, os, hashlib, tempfile, pathlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import base64
+import json
 import pytest
 from file_transfer import (
     CHUNK_SIZE, split_file, reassemble_chunks,
-    DirectFileSender, file_sha256, FileTransferManager, RoomFileSender,
+    DirectFileSender, EncryptedFileReceiver, EncryptedFileSender,
+    FileCryptoError, file_sha256, FileTransferManager, RoomFileSender,
 )
 
 
@@ -239,3 +241,92 @@ def test_direct_file_sender_streams_incrementally():
     assert rebuilt == data
     assert sender.ready_to_finish() is True
     assert sender.sha256_hex == hashlib.sha256(data).hexdigest()
+
+
+# ── encrypted file transfer ──────────────────────────────────────────────────
+
+def test_encrypted_file_sender_receiver_round_trips_without_leaking_metadata(tmp_path):
+    key = b"K" * 32
+    data = b"secret payload" * 4000
+    path = tmp_path / "机密.txt"
+    path.write_bytes(data)
+
+    sender = EncryptedFileSender(
+        path, key, transfer_id="enc1", scope_type="dm",
+        scope_id="alice-bob", sender="alice", recipient="bob",
+    )
+    offer = sender.offer_payload()
+    relay_json = json.dumps(offer, ensure_ascii=False)
+
+    assert "机密.txt" not in relay_json
+    assert "text/plain" not in relay_json
+    assert hashlib.sha256(data).hexdigest() not in relay_json
+
+    receiver = EncryptedFileReceiver(
+        tmp_path / "downloads", key, transfer_id="enc1", scope_type="dm",
+        scope_id="alice-bob", sender="alice", recipient="bob",
+    )
+    metadata = receiver.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+    assert metadata["filename"] == "机密.txt"
+    assert metadata["size"] == len(data)
+
+    chunk_frames = []
+    while payload := sender.next_payload():
+        chunk_frames.append(payload)
+        assert "secret payload" not in json.dumps(payload)
+        receiver.add_chunk(payload["index"], payload["total"], payload["encrypted_chunk"])
+
+    done = sender.done_payload()
+    save_path = receiver.finish(done["encrypted_done"])
+
+    assert save_path.read_bytes() == data
+    assert save_path.name == "机密.txt"
+
+
+@pytest.mark.parametrize("mutator", [
+    lambda chunks: [chunks[1], chunks[0]] if len(chunks) > 1 else chunks,
+    lambda chunks: [chunks[0], chunks[0]],
+])
+def test_encrypted_file_receiver_rejects_reorder_or_duplicate_and_deletes_part(tmp_path, mutator):
+    key = b"K" * 32
+    data = b"A" * (CHUNK_SIZE + 7)
+    path = tmp_path / "payload.bin"
+    path.write_bytes(data)
+    sender = EncryptedFileSender(path, key, transfer_id="enc2", scope_type="room", scope_id="ROOM01", sender="alice")
+    chunks = []
+    while payload := sender.next_payload():
+        chunks.append(payload)
+
+    receiver = EncryptedFileReceiver(tmp_path / "downloads", key, transfer_id="enc2", scope_type="room", scope_id="ROOM01", sender="alice")
+    receiver.begin(sender.offer_payload()["encrypted_metadata"], sender.size, sender.total_chunks)
+
+    with pytest.raises(FileCryptoError):
+        for payload in mutator(chunks):
+            receiver.add_chunk(payload["index"], payload["total"], payload["encrypted_chunk"])
+
+    assert not (tmp_path / "downloads" / ".enc2.part").exists()
+
+
+def test_encrypted_file_receiver_rejects_tamper_truncate_and_wrong_scope(tmp_path):
+    key = b"K" * 32
+    data = b"tamper me"
+    path = tmp_path / "payload.bin"
+    path.write_bytes(data)
+    sender = EncryptedFileSender(path, key, transfer_id="enc3", scope_type="dm", scope_id="alice-bob", sender="alice", recipient="bob")
+    offer = sender.offer_payload()
+    chunk = sender.next_payload()
+    assert chunk is not None
+
+    wrong_scope = EncryptedFileReceiver(tmp_path / "wrong", key, transfer_id="enc3", scope_type="room", scope_id="ROOM01", sender="alice")
+    with pytest.raises(FileCryptoError):
+        wrong_scope.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+
+    receiver = EncryptedFileReceiver(tmp_path / "downloads", key, transfer_id="enc3", scope_type="dm", scope_id="alice-bob", sender="alice", recipient="bob")
+    receiver.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+    tampered = dict(chunk["encrypted_chunk"])
+    tampered["ciphertext"] = tampered["ciphertext"][:-4]
+
+    with pytest.raises(FileCryptoError):
+        receiver.add_chunk(chunk["index"], chunk["total"], tampered)
+
+    assert not (tmp_path / "downloads" / ".enc3.part").exists()

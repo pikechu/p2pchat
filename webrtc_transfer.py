@@ -12,12 +12,10 @@ import logging
 import pathlib
 import uuid
 import json
-import hashlib
-import base64
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from file_transfer import FileTransferManager, guess_mime
+from file_transfer import EncryptedFileReceiver, EncryptedFileSender, FileCryptoError, FileTransferManager, guess_mime
 from ice_config import load_ice_servers
 from protocol import T
 
@@ -31,6 +29,7 @@ FileSentCallback = Callable[[pathlib.Path, dict[str, Any]], Any]
 FileProgressCallback = Callable[[dict[str, Any]], Any]
 ChannelOpenCallback = Callable[[dict[str, Any]], Any]
 SessionClosedCallback = Callable[[dict[str, Any]], Any]
+FileKeyProvider = Callable[[str, str], bytes]
 
 WEBRTC_BUFFER_HIGH_WATER = 1_000_000
 WEBRTC_BUFFER_POLL_SECONDS = 0.01
@@ -58,6 +57,8 @@ class WebRTCTransfer:
         on_file_progress: FileProgressCallback | None = None,
         on_channel_open: ChannelOpenCallback | None = None,
         on_session_closed: SessionClosedCallback | None = None,
+        file_key_provider: FileKeyProvider,
+        local_user: str = "",
         ice_servers: list[dict[str, Any]] | None = None,
     ):
         self._send_signal = send_signal
@@ -69,9 +70,12 @@ class WebRTCTransfer:
         self._on_file_progress = on_file_progress
         self._on_channel_open = on_channel_open
         self._on_session_closed = on_session_closed
+        self._file_key_provider = file_key_provider
+        self._local_user = str(local_user)
         self._ice_servers = ice_servers if ice_servers is not None else load_ice_servers()
         self._sessions: dict[str, WebRTCSession] = {}
         self._incoming_meta: dict[str, dict[str, Any]] = {}
+        self._incoming_receivers: dict[str, EncryptedFileReceiver] = {}
 
     async def start_offer(
         self,
@@ -96,16 +100,13 @@ class WebRTCTransfer:
             to=peer,
             session_id=session_id,
             sdp=self._description_to_payload(description),
-            filename=path.name,
-            size=path.stat().st_size,
         )
         return session_id
 
     async def handle_offer(self, payload: dict) -> str:
         peer = str(payload["from"])
         session_id = str(payload["session_id"])
-        log.info("WEBRTC handle_offer session=%s peer=%s filename=%s size=%s",
-                 session_id, peer, payload.get("filename", ""), payload.get("size", ""))
+        log.info("WEBRTC handle_offer session=%s peer=%s", session_id, peer)
         pc = self._create_peer_connection()
         self._sessions[session_id] = WebRTCSession(session_id, peer, pc)
         self._bind_peer_events(session_id)
@@ -148,16 +149,19 @@ class WebRTCTransfer:
             raise RuntimeError(f"WebRTC session '{session_id}' has no file path")
 
         path = session.path
-        hasher = hashlib.sha256()
         size = path.stat().st_size
+        file_key = self._file_key_provider(session.peer, session_id)
+        encrypted_sender = EncryptedFileSender(
+            path, file_key, transfer_id=session_id, scope_type="dm",
+            scope_id=f"webrtc:{session_id}", sender=self._local_user, recipient=session.peer,
+        )
+        offer = encrypted_sender.offer_payload()
         log.info("WEBRTC send_file_start session=%s peer=%s filename=%s size=%d",
                  session_id, session.peer, path.name, size)
         session.channel.send(json.dumps({
             "kind": "file-start",
             "transfer_id": session_id,
-            "filename": path.name,
-            "size": size,
-            "mime": guess_mime(path.name),
+            **offer,
         }))
         self._emit_progress({
             "direction": "send",
@@ -167,28 +171,28 @@ class WebRTCTransfer:
             "size": size,
             "progress": 0,
         })
-        for index, total, data_b64 in FileTransferManager.iter_file_chunks(path):
+        while payload := encrypted_sender.next_payload():
             await self._wait_for_channel_buffer(session.channel)
-            hasher.update(base64.b64decode(data_b64))
             session.channel.send(json.dumps({
                 "kind": "file-chunk",
                 "transfer_id": session_id,
-                "index": index,
-                "total": total,
-                "data": data_b64,
+                "index": payload["index"],
+                "total": payload["total"],
+                "encrypted_chunk": payload["encrypted_chunk"],
             }))
+            encrypted_sender.acknowledge(payload["index"])
             self._emit_progress({
                 "direction": "send",
                 "peer": session.peer,
                 "transfer_id": session_id,
                 "filename": path.name,
                 "size": size,
-                "progress": int((index + 1) / max(total, 1) * 100),
+                "progress": int((payload["index"] + 1) / max(payload["total"], 1) * 100),
             })
         session.channel.send(json.dumps({
             "kind": "file-done",
             "transfer_id": session_id,
-            "sha256": hasher.hexdigest(),
+            **encrypted_sender.done_payload(),
         }))
         log.info("WEBRTC send_file_done session=%s peer=%s filename=%s size=%d",
                  session_id, session.peer, path.name, size)
@@ -209,22 +213,35 @@ class WebRTCTransfer:
         transfer_id = str(payload.get("transfer_id", ""))
 
         if kind == "file-start":
+            receiver = EncryptedFileReceiver(
+                self._ft_manager._dir,
+                self._file_key_provider(from_user, transfer_id),
+                transfer_id=transfer_id,
+                scope_type="dm",
+                scope_id=f"webrtc:{transfer_id}",
+                sender=from_user,
+                recipient=self._local_user,
+            )
+            try:
+                metadata = receiver.begin(
+                    payload.get("encrypted_metadata"),
+                    int(payload.get("size", 0)),
+                    int(payload.get("total", 1)),
+                )
+            except (FileCryptoError, TypeError, ValueError) as exc:
+                log.warning("WEBRTC recv_file_start_rejected session=%s peer=%s error=%s",
+                            transfer_id, from_user, exc)
+                return None
             log.info("WEBRTC recv_file_start session=%s peer=%s filename=%s size=%s",
-                     transfer_id, from_user, payload.get("filename", ""), payload.get("size", ""))
+                     transfer_id, from_user, metadata["filename"], metadata["size"])
+            self._incoming_receivers[transfer_id] = receiver
             self._incoming_meta[transfer_id] = {
                 "from_user": from_user,
                 "transfer_id": transfer_id,
-                "filename": str(payload.get("filename", "file")),
-                "size": int(payload.get("size", 0)),
-                "mime": str(payload.get("mime", "application/octet-stream")),
+                "filename": metadata["filename"],
+                "size": metadata["size"],
+                "mime": metadata["mime"],
             }
-            self._ft_manager.begin_incoming(
-                transfer_id,
-                from_user,
-                self._incoming_meta[transfer_id]["filename"],
-                self._incoming_meta[transfer_id]["size"],
-                self._incoming_meta[transfer_id]["mime"],
-            )
             self._emit_progress({
                 "direction": "receive",
                 "peer": from_user,
@@ -238,12 +255,17 @@ class WebRTCTransfer:
         if kind == "file-chunk":
             index = int(payload.get("index", 0))
             total = int(payload.get("total", 1))
-            self._ft_manager.add_chunk(
-                transfer_id,
-                index,
-                total,
-                str(payload.get("data", "")),
-            )
+            receiver = self._incoming_receivers.get(transfer_id)
+            if receiver is None:
+                return None
+            try:
+                receiver.add_chunk(index, total, payload.get("encrypted_chunk"))
+            except FileCryptoError as exc:
+                log.warning("WEBRTC recv_file_chunk_rejected session=%s peer=%s index=%s error=%s",
+                            transfer_id, from_user, index, exc)
+                self._incoming_receivers.pop(transfer_id, None)
+                self._incoming_meta.pop(transfer_id, None)
+                return None
             meta = self._incoming_meta.get(transfer_id, {})
             self._emit_progress({
                 "direction": "receive",
@@ -256,10 +278,16 @@ class WebRTCTransfer:
             return None
 
         if kind == "file-done":
-            save_path = self._ft_manager.finish_incoming(
-                transfer_id,
-                str(payload.get("sha256", "")),
-            )
+            receiver = self._incoming_receivers.pop(transfer_id, None)
+            if receiver is None:
+                return None
+            try:
+                save_path = receiver.finish(payload.get("encrypted_done"))
+            except FileCryptoError as exc:
+                log.warning("WEBRTC recv_file_done_rejected session=%s peer=%s error=%s",
+                            transfer_id, from_user, exc)
+                self._incoming_meta.pop(transfer_id, None)
+                return None
             meta = self._incoming_meta.pop(transfer_id, None)
             if save_path is not None and self._on_file_received is not None and meta is not None:
                 self._on_file_received(save_path, meta)

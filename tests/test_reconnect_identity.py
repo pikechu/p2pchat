@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import QMessageBox
 
 from gui.window import MainWindow
 from protocol import T
+from secure_session import SecureSessionError, SessionState
 
 
 @pytest.fixture(scope="module")
@@ -33,6 +34,8 @@ def _make_window_stub():
     window._voice_call.state.name = "IDLE"
     window._bridge = MagicMock()
     window._bridge.send_frame = MagicMock(return_value=True)
+    window._username = "me"
+    window._dm_peers = set()
     window._rooms = {}
     window._reconnect_room_id = ""
     window._server_room_id = ""
@@ -50,7 +53,7 @@ def _make_window_stub():
     return window
 
 
-def test_on_connected_only_sends_set_name(app):
+def test_on_connected_waits_for_ready(app):
     window = _make_window_stub()
     window._username = "pp"
 
@@ -58,24 +61,23 @@ def test_on_connected_only_sends_set_name(app):
         MainWindow._on_connected(window)
 
     assert window._identified is False
-    window._bridge.send_frame.assert_called_once_with(T.SET_NAME, name="pp")
+    window._bridge.send_frame.assert_not_called()
 
 
-def test_name_set_system_unblocks_followup_requests(app):
+def test_ready_unblocks_followup_requests(app):
     window = _make_window_stub()
     window._username = "pp"
     window._identified = False
     window._reconnect_room_id = "ROOM01"
-    window._rooms = {"ROOM01": {"_password": "pw"}}
+    window._rooms = {"ROOM01": {"access_token": "token-123"}}
 
-    with patch("gui.window.derive_key", return_value="derived-key"):
-        MainWindow._dispatch_frame(window, T.SYSTEM, {"message": "Name set to 'pp'"}, 0.0)
+    MainWindow._dispatch_frame(window, T.READY, {"name": "pp"}, 0.0)
 
     assert window._identified is True
     window._send_avatar.assert_called_once()
     assert window._bridge.send_frame.call_args_list[0].args == (T.LIST_ROOMS,)
     assert window._bridge.send_frame.call_args_list[1].args == (T.JOIN_ROOM,)
-    assert window._bridge.send_frame.call_args_list[1].kwargs == {"room_id": "ROOM01", "password": "pw"}
+    assert window._bridge.send_frame.call_args_list[1].kwargs == {"room_id": "ROOM01", "access_token": "token-123"}
 
 
 def test_transient_identity_errors_do_not_popup(app):
@@ -90,6 +92,68 @@ def test_transient_identity_errors_do_not_popup(app):
 
     warning.assert_not_called()
     set_title.assert_called_once()
+
+
+def test_encrypted_dm_decrypt_failure_shows_key_unavailable(app):
+    window = _make_window_stub()
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.decrypt_dm.side_effect = SecureSessionError(
+        SessionState.UNAVAILABLE, "加密私聊密钥不可用"
+    )
+
+    with patch.object(QMessageBox, "warning") as warning:
+        MainWindow._show_decrypted_dm(window, {"sender_name": "alice"}, 0.0)
+
+    warning.assert_called_once_with(window, "加密私聊", "加密私聊密钥不可用")
+
+
+def test_gui_syncs_known_dm_peers(app):
+    window = _make_window_stub()
+    window._dm_peers = {"bob"}
+    window._username = "alice"
+    window._message_offsets = {"dm:scope-alice-bob": 9}
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.dm_scope_id.return_value = "scope-alice-bob"
+
+    MainWindow._sync_dm_messages(window)
+
+    window._bridge.send_frame.assert_called_once_with(
+        T.SYNC_MESSAGES,
+        scopes=[{"scope_type": "dm", "scope_id": "scope-alice-bob", "after_message_id": 9}],
+        limit=200,
+    )
+
+
+def test_message_ttl_button_sends_room_setting(app):
+    window = _make_window_stub()
+    window._chat.current_room_id = "ROOM01"
+
+    MainWindow._on_message_ttl_requested(window, 365 * 24 * 60 * 60)
+
+    window._bridge.send_frame.assert_called_once_with(
+        T.SET_MESSAGE_TTL,
+        scope_type="room",
+        scope_id="ROOM01",
+        ttl_seconds=365 * 24 * 60 * 60,
+    )
+
+
+def test_message_ttl_button_sends_dm_setting(app):
+    window = _make_window_stub()
+    window._chat.current_room_id = "@bob"
+    window._dms = {"@bob": "bob"}
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.dm_scope_id.return_value = "dm-scope"
+
+    MainWindow._on_message_ttl_requested(window, 0)
+
+    window._bridge.send_frame.assert_called_once_with(
+        T.SET_MESSAGE_TTL,
+        scope_type="dm",
+        scope_id="dm-scope",
+        to="bob",
+        ttl_seconds=0,
+    )
 
 
 def test_start_file_send_rejects_files_larger_than_50mb(app, tmp_path):

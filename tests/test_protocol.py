@@ -2,7 +2,15 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json
-from protocol import T, pack, unpack
+from protocol import (
+    CLIENT_CAPABILITIES,
+    CLIENT_VERSION,
+    PROTOCOL_VERSION,
+    SERVER_CAPABILITIES,
+    T,
+    pack,
+    unpack,
+)
 
 
 def test_file_offer_type_exists():
@@ -47,6 +55,30 @@ def test_webrtc_signal_types_exist():
     assert T.WEBRTC_ICE == "WEBRTC_ICE"
     assert T.WEBRTC_CLOSE == "WEBRTC_CLOSE"
     assert T.WEBRTC_ERROR == "WEBRTC_ERROR"
+
+
+def test_offline_sync_protocol_types_exist():
+    assert T.CLIENT_HELLO == "CLIENT_HELLO"
+    assert T.SERVER_HELLO == "SERVER_HELLO"
+    assert T.READY == "READY"
+    assert T.GET_PEER_KEY == "GET_PEER_KEY"
+    assert T.PEER_KEY_BUNDLE == "PEER_KEY_BUNDLE"
+    assert T.SEND_ENCRYPTED_MSG == "SEND_ENCRYPTED_MSG"
+    assert T.NEW_ENCRYPTED_MSG == "NEW_ENCRYPTED_MSG"
+    assert T.SYNC_MESSAGES == "SYNC_MESSAGES"
+    assert T.SYNC_MESSAGES_RESULT == "SYNC_MESSAGES_RESULT"
+
+
+def test_protocol_versioning_constants_exist():
+    assert PROTOCOL_VERSION >= 3
+    assert CLIENT_VERSION
+    assert "offline_message_sync" in CLIENT_CAPABILITIES
+    assert "offline_message_sync" in SERVER_CAPABILITIES
+    for capability in (
+        "authenticated_key_exchange", "encrypted_files", "encrypted_voice", "ttl_policy",
+    ):
+        assert capability in CLIENT_CAPABILITIES
+        assert capability in SERVER_CAPABILITIES
 
 
 def test_file_offer_pack_roundtrip():

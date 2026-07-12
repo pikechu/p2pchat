@@ -6,7 +6,11 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import websockets.legacy.client as ws_connect
-from protocol import T, pack
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from identity import DeviceIdentity, sign_key_bundle
+from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack
 
 
 def _free_port():
@@ -19,7 +23,8 @@ def _free_port():
 def server_port():
     port = _free_port()
     proc = subprocess.Popen(
-        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port)],
+        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port),
+         "--no-message-persistence"],
         cwd=os.path.join(os.path.dirname(__file__), ".."),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -38,9 +43,18 @@ def event_loop():
 
 async def _connect(port, name):
     ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
-    await ws.recv()   # WELCOME
+    identity = DeviceIdentity(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
+    ephemeral = X25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    await ws.send(pack(T.CLIENT_HELLO,
+                       client_version=CLIENT_VERSION,
+                       protocol_version=PROTOCOL_VERSION,
+                       capabilities=CLIENT_CAPABILITIES,
+                       key_bundle=identity.public_bundle(
+                           ephemeral, sign_key_bundle(identity, ephemeral, PROTOCOL_VERSION), PROTOCOL_VERSION
+                       )))
+    await ws.recv()   # SERVER_HELLO
     await ws.send(pack(T.SET_NAME, name=name))
-    await ws.recv()   # SYSTEM
+    await ws.recv()   # READY
     return ws
 
 

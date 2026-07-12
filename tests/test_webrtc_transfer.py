@@ -7,9 +7,15 @@ import types
 
 import pytest
 
-from file_transfer import CHUNK_SIZE, file_sha256, split_file
+from file_transfer import CHUNK_SIZE, EncryptedFileSender, file_sha256, split_file
 from protocol import T
 from webrtc_transfer import WebRTCTransfer
+
+TEST_WEBRTC_FILE_KEY = b"W" * 32
+
+
+def _test_file_key(_peer: str, _session_id: str) -> bytes:
+    return TEST_WEBRTC_FILE_KEY
 
 
 class FakeDescription:
@@ -76,6 +82,42 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _encrypted_webrtc_messages(tmp_path, transfer_id: str, filename: str, data: bytes):
+    source_dir = tmp_path / f"src-{transfer_id}"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    path = source_dir / filename
+    path.write_bytes(data)
+    sender = EncryptedFileSender(
+        path,
+        TEST_WEBRTC_FILE_KEY,
+        transfer_id=transfer_id,
+        scope_type="dm",
+        scope_id=f"webrtc:{transfer_id}",
+        sender="alice",
+        recipient="me",
+    )
+    offer = sender.offer_payload()
+    messages = [{
+        "kind": "file-start",
+        "transfer_id": transfer_id,
+        **offer,
+    }]
+    while payload := sender.next_payload():
+        messages.append({
+            "kind": "file-chunk",
+            "transfer_id": transfer_id,
+            "index": payload["index"],
+            "total": payload["total"],
+            "encrypted_chunk": payload["encrypted_chunk"],
+        })
+    messages.append({
+        "kind": "file-done",
+        "transfer_id": transfer_id,
+        **sender.done_payload(),
+    })
+    return messages
+
+
 def test_start_offer_creates_data_channel_and_sends_offer(tmp_path):
     sent = []
     peers = []
@@ -88,7 +130,9 @@ def test_start_offer_creates_data_channel_and_sends_offer(tmp_path):
         return peer
 
     transfer = WebRTCTransfer(lambda msg_type, **payload: sent.append((msg_type, payload)),
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
     session_id = _run(transfer.start_offer("bob", path, session_id="s1"))
 
@@ -100,8 +144,6 @@ def test_start_offer_creates_data_channel_and_sends_offer(tmp_path):
             "to": "bob",
             "session_id": "s1",
             "sdp": {"type": "offer", "sdp": "offer-sdp"},
-            "filename": "file.bin",
-            "size": 3,
         },
     )]
 
@@ -116,7 +158,9 @@ def test_handle_offer_sends_answer():
         return peer
 
     transfer = WebRTCTransfer(lambda msg_type, **payload: sent.append((msg_type, payload)),
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
     _run(transfer.handle_offer({
         "from": "alice",
@@ -144,7 +188,9 @@ def test_handle_answer_and_ice_update_existing_session():
         return peer
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", pathlib.Path(__file__), session_id="s3"))
 
     _run(transfer.handle_answer({
@@ -166,7 +212,9 @@ def test_handle_answer_and_ice_update_existing_session():
 
 def test_handle_answer_for_unknown_session_raises():
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              peer_factory=FakePeerConnection)
+                              peer_factory=FakePeerConnection,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
     with pytest.raises(KeyError, match="unknown WebRTC session"):
         _run(transfer.handle_answer({
@@ -188,58 +236,46 @@ def test_send_file_writes_start_chunks_and_done_frames(tmp_path):
         return peer
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="send1"))
 
     _run(transfer.send_file("send1"))
 
     frames = [json.loads(raw) for raw in peers[0].channels[0].sent]
-    assert frames[0] == {
-        "kind": "file-start",
-        "transfer_id": "send1",
-        "filename": "payload.bin",
-        "size": len(data),
-        "mime": "application/octet-stream",
-    }
+    relay_json = json.dumps(frames)
+    assert "payload.bin" not in relay_json
+    assert split_file(data)[0] not in relay_json
+    assert file_sha256(data) not in relay_json
+    assert frames[0]["kind"] == "file-start"
+    assert frames[0]["transfer_id"] == "send1"
+    assert frames[0]["size"] == len(data)
+    assert "encrypted_metadata" in frames[0]
     assert frames[1]["kind"] == "file-chunk"
     assert frames[1]["index"] == 0
     assert frames[1]["total"] == 2
-    assert frames[1]["data"] == split_file(data)[0]
+    assert "encrypted_chunk" in frames[1]
+    assert "data" not in frames[1]
     assert frames[2]["kind"] == "file-chunk"
     assert frames[2]["index"] == 1
-    assert frames[3] == {
-        "kind": "file-done",
-        "transfer_id": "send1",
-        "sha256": file_sha256(data),
-    }
+    assert frames[3]["kind"] == "file-done"
+    assert frames[3]["transfer_id"] == "send1"
+    assert "encrypted_done" in frames[3]
+    assert "sha256" not in frames[3]
 
 
 def test_handle_data_message_reassembles_file(tmp_path):
     data = b"hello over datachannel"
-    chunks = split_file(data)
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=FakePeerConnection,
-                              downloads_dir=tmp_path)
+                              downloads_dir=tmp_path,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
-    assert transfer.handle_data_message("alice", json.dumps({
-        "kind": "file-start",
-        "transfer_id": "recv1",
-        "filename": "../safe.txt",
-        "size": len(data),
-        "mime": "text/plain",
-    })) is None
-    assert transfer.handle_data_message("alice", json.dumps({
-        "kind": "file-chunk",
-        "transfer_id": "recv1",
-        "index": 0,
-        "total": len(chunks),
-        "data": chunks[0],
-    })) is None
-    save_path = transfer.handle_data_message("alice", json.dumps({
-        "kind": "file-done",
-        "transfer_id": "recv1",
-        "sha256": file_sha256(data),
-    }))
+    save_path = None
+    for message in _encrypted_webrtc_messages(tmp_path, "recv1", "safe.txt", data):
+        save_path = transfer.handle_data_message("alice", json.dumps(message))
 
     assert save_path is not None
     assert save_path.parent == tmp_path
@@ -259,7 +295,9 @@ def test_start_offer_sends_local_ice_candidates(tmp_path):
         return peer
 
     transfer = WebRTCTransfer(lambda msg_type, **payload: sent.append((msg_type, payload)),
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="ice1"))
 
     peers[0].handlers["icecandidate"]({"candidate": "candidate:1"})
@@ -274,7 +312,6 @@ def test_incoming_datachannel_message_is_reassembled(tmp_path):
     sent = []
     peers = []
     data = b"from remote channel"
-    chunks = split_file(data)
 
     def peer_factory():
         peer = FakePeerConnection()
@@ -283,7 +320,9 @@ def test_incoming_datachannel_message_is_reassembled(tmp_path):
 
     transfer = WebRTCTransfer(lambda msg_type, **payload: sent.append((msg_type, payload)),
                               peer_factory=peer_factory,
-                              downloads_dir=tmp_path)
+                              downloads_dir=tmp_path,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.handle_offer({
         "from": "alice",
         "session_id": "dc1",
@@ -292,25 +331,9 @@ def test_incoming_datachannel_message_is_reassembled(tmp_path):
     channel = FakeDataChannel("file")
     peers[0].handlers["datachannel"](channel)
 
-    assert channel.handlers["message"](json.dumps({
-        "kind": "file-start",
-        "transfer_id": "dc1",
-        "filename": "remote.bin",
-        "size": len(data),
-        "mime": "application/octet-stream",
-    })) is None
-    assert channel.handlers["message"](json.dumps({
-        "kind": "file-chunk",
-        "transfer_id": "dc1",
-        "index": 0,
-        "total": len(chunks),
-        "data": chunks[0],
-    })) is None
-    save_path = channel.handlers["message"](json.dumps({
-        "kind": "file-done",
-        "transfer_id": "dc1",
-        "sha256": file_sha256(data),
-    }))
+    save_path = None
+    for message in _encrypted_webrtc_messages(tmp_path, "dc1", "remote.bin", data):
+        save_path = channel.handlers["message"](json.dumps(message))
 
     assert save_path is not None
     assert save_path.name == "remote.bin"
@@ -328,7 +351,9 @@ def test_offer_channel_open_sends_file(tmp_path):
         return peer
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="open1"))
 
     peers[0].channels[0].handlers["open"]()
@@ -351,7 +376,9 @@ def test_channel_open_callback_gets_session_meta(tmp_path):
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=peer_factory,
-                              on_channel_open=lambda meta: opened.append(meta))
+                              on_channel_open=lambda meta: opened.append(meta),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="open-cb"))
 
     peers[0].channels[0].handlers["open"]()
@@ -388,7 +415,9 @@ def test_default_peer_factory_passes_ice_configuration(monkeypatch):
     monkeypatch.setitem(sys.modules, "aiortc", fake_aiortc)
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              ice_servers=[{"urls": ["turn:turn.example.com"], "username": "u", "credential": "p"}])
+                              ice_servers=[{"urls": ["turn:turn.example.com"], "username": "u", "credential": "p"}],
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     peer = transfer._default_peer_factory()
 
     assert isinstance(peer, FakeRTCPeerConnection)
@@ -400,34 +429,15 @@ def test_default_peer_factory_passes_ice_configuration(monkeypatch):
 def test_receive_complete_callback_gets_saved_path(tmp_path):
     completed = []
     data = b"callback-data"
-    chunks = split_file(data)
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=FakePeerConnection,
                               downloads_dir=tmp_path,
-                              on_file_received=lambda path, meta: completed.append((path, meta)))
+                              on_file_received=lambda path, meta: completed.append((path, meta)),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
     save_path = None
-    for message in [
-        {
-            "kind": "file-start",
-            "transfer_id": "cb1",
-            "filename": "callback.bin",
-            "size": len(data),
-            "mime": "application/octet-stream",
-        },
-        {
-            "kind": "file-chunk",
-            "transfer_id": "cb1",
-            "index": 0,
-            "total": len(chunks),
-            "data": chunks[0],
-        },
-        {
-            "kind": "file-done",
-            "transfer_id": "cb1",
-            "sha256": file_sha256(data),
-        },
-    ]:
+    for message in _encrypted_webrtc_messages(tmp_path, "cb1", "callback.bin", data):
         save_path = transfer.handle_data_message("alice", json.dumps(message))
 
     assert completed == [(
@@ -456,7 +466,9 @@ def test_send_complete_callback_gets_source_path_and_meta(tmp_path):
 
     transfer = WebRTCTransfer(lambda msg_type, **payload: sent.append((msg_type, payload)),
                               peer_factory=peer_factory,
-                              on_file_sent=lambda path, meta: completed.append((path, meta)))
+                              on_file_sent=lambda path, meta: completed.append((path, meta)),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="sent1"))
 
     _run(transfer.send_file("sent1"))
@@ -487,7 +499,9 @@ def test_send_file_reports_chunk_progress(tmp_path):
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=peer_factory,
-                              on_file_progress=lambda meta: progress.append(meta))
+                              on_file_progress=lambda meta: progress.append(meta),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="prog1"))
 
     _run(transfer.send_file("prog1"))
@@ -506,27 +520,15 @@ def test_send_file_reports_chunk_progress(tmp_path):
 def test_receive_datachannel_reports_chunk_progress(tmp_path):
     progress = []
     data = b"R" * (CHUNK_SIZE + 1)
-    chunks = split_file(data)
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=FakePeerConnection,
                               downloads_dir=tmp_path,
-                              on_file_progress=lambda meta: progress.append(meta))
+                              on_file_progress=lambda meta: progress.append(meta),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
-    transfer.handle_data_message("alice", json.dumps({
-        "kind": "file-start",
-        "transfer_id": "recv-progress",
-        "filename": "recv-progress.bin",
-        "size": len(data),
-        "mime": "application/octet-stream",
-    }))
-    for index, chunk in enumerate(chunks):
-        transfer.handle_data_message("alice", json.dumps({
-            "kind": "file-chunk",
-            "transfer_id": "recv-progress",
-            "index": index,
-            "total": len(chunks),
-            "data": chunk,
-        }))
+    for message in _encrypted_webrtc_messages(tmp_path, "recv-progress", "recv-progress.bin", data)[:-1]:
+        transfer.handle_data_message("alice", json.dumps(message))
 
     assert [item["progress"] for item in progress] == [0, 50, 100]
     assert progress[-1]["direction"] == "receive"
@@ -546,7 +548,9 @@ def test_datachannel_close_reports_session_closed(tmp_path):
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
                               peer_factory=peer_factory,
-                              on_session_closed=lambda meta: closed.append(meta))
+                              on_session_closed=lambda meta: closed.append(meta),
+                              file_key_provider=_test_file_key,
+                              local_user="me")
     _run(transfer.start_offer("bob", path, session_id="close1"))
 
     peers[0].channels[0].handlers["close"]()
@@ -569,7 +573,9 @@ def test_webrtc_transfer_logs_key_session_events(tmp_path, caplog):
         return peer
 
     transfer = WebRTCTransfer(lambda *_args, **_kwargs: None,
-                              peer_factory=peer_factory)
+                              peer_factory=peer_factory,
+                              file_key_provider=_test_file_key,
+                              local_user="me")
 
     with caplog.at_level(logging.INFO, logger="webrtc_transfer"):
         _run(transfer.start_offer("bob", path, session_id="log1"))

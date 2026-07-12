@@ -19,7 +19,7 @@ sounddevice_stub.OutputStream = object
 sys.modules.setdefault("sounddevice", sounddevice_stub)
 
 from gui.window import MainWindow
-from file_transfer import CHUNK_SIZE, DirectFileSender, FileTransferManager
+from file_transfer import CHUNK_SIZE, DirectFileSender, EncryptedFileSender, FileTransferManager
 from protocol import T, unpack
 
 
@@ -43,7 +43,21 @@ def _make_window_stub(tmp_path: pathlib.Path):
     window._webrtc_transfer.start_offer = AsyncMock()
     window._webrtc_transfer.close = AsyncMock()
     window._webrtc_file_pending = {}
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.file_key = MagicMock(return_value=(b"D" * 32, "dm-scope"))
+    window._encrypted_file_receivers = {}
+    window._username = "me"
     return window
+
+
+def _encrypted_offer(tmp_path: pathlib.Path, transfer_id: str, filename: str, data: bytes):
+    path = tmp_path / filename
+    path.write_bytes(data)
+    sender = EncryptedFileSender(
+        path, b"D" * 32, transfer_id=transfer_id, scope_type="dm",
+        scope_id="dm-scope", sender="bob", recipient="me",
+    )
+    return sender.offer_payload()
 
 
 def test_direct_file_accept_streams_file_without_chunk_buffer(tmp_path):
@@ -258,12 +272,11 @@ def test_incoming_direct_file_offer_targets_sender_dm(tmp_path):
     card = MagicMock()
 
     with patch("gui.window.FileCard", return_value=card):
+        offer = _encrypted_offer(tmp_path, "relay1", "doc.txt", b"abc")
         MainWindow._on_file_offer(window, {
             "from": "bob",
             "transfer_id": "relay1",
-            "filename": "doc.txt",
-            "size": 3,
-            "mime": "text/plain",
+            **offer,
         })
 
     assert window._dms["@bob"] == "bob"

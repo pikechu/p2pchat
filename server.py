@@ -15,20 +15,24 @@ from __future__ import annotations
 import asyncio
 import argparse
 import base64
+import binascii
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import pathlib
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
 import websockets
 import websockets.exceptions
 
-from protocol import T, pack, unpack
+from protocol import CLIENT_VERSION, PROTOCOL_VERSION, REQUIRED_CAPABILITIES, SERVER_CAPABILITIES, T, pack, unpack
 from file_transfer import CHUNK_SIZE
 
 logging.basicConfig(
@@ -48,6 +52,7 @@ log.addHandler(_fh)
 # Characters used for room IDs — omits 0/O and 1/I/L to reduce confusion
 _ID_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 _ID_LEN = 6
+_REQUIRED_CAPABILITIES = frozenset(REQUIRED_CAPABILITIES)
 
 
 def _new_room_id(existing: set) -> str:
@@ -59,17 +64,15 @@ def _new_room_id(existing: set) -> str:
 
 # ── Data model ───────────────────────────────────────────────────────────────
 
-def _hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
-
-
 @dataclass
 class Room:
     id: str
     name: str
     creator: str
-    locked: bool = False          # True when a password was set at creation
-    password_hash: str = ""       # SHA-256 of the creation password; "" = open
+    locked: bool = True
+    salt: str = ""
+    encrypted_access_token: dict | None = None
+    access_token_hash: str = ""
     created_at: float = field(default_factory=time.time)
     icon: str = ""                # optional emoji icon set by creator
     seq: int = 0
@@ -80,18 +83,33 @@ class Room:
 # ── Server ───────────────────────────────────────────────────────────────────
 
 MAX_FILE_BYTES = 50 * 1024 * 1024   # 50 MB per room-shared file
+AEAD_TAG_BYTES = 16
 TRANSFER_TTL_SECONDS = 10 * 60
+DEFAULT_ROOM_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_DM_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 _ROOMS_FILE = pathlib.Path.home() / ".p2pchat_rooms.json"
+_MESSAGE_DB_FILE = pathlib.Path.home() / ".beamchat" / "beam_server.db"
 
 
 class ChatServer:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        message_db_path: str | Path | None = None,
+        enable_message_persistence: bool = True,
+        default_room_message_ttl_seconds: int | None = DEFAULT_ROOM_MESSAGE_TTL_SECONDS,
+        default_dm_message_ttl_seconds: int | None = DEFAULT_DM_MESSAGE_TTL_SECONDS,
+        min_message_ttl_seconds: int = 60,
+        max_message_ttl_seconds: int = 365 * 24 * 60 * 60,
+    ):
         self._rooms: Dict[str, Room] = {}
         # websocket → username  (populated after SET_NAME)
         self._ws_to_name: Dict[object, str] = {}
         # username → websocket
         self._name_to_ws: Dict[str, object] = {}
+        # 仅保存已就绪在线用户的公开密钥包，连接关闭时立即删除。
+        self._public_key_directory: Dict[str, dict] = {}
         # username → room_id
         self._user_room: Dict[str, str] = {}
         # room_id → {seq: sender_username}  — for ack routing
@@ -105,6 +123,326 @@ class ChatServer:
         # transfer_id → {from_user, to_user, filename, size, mime, progress...}
         # Direct FILE_* payloads are also streamed through without buffering.
         self._direct_transfer_meta: Dict[str, dict] = {}
+        self._message_db_path = Path(message_db_path) if message_db_path else _MESSAGE_DB_FILE
+        self._enable_message_persistence = enable_message_persistence
+        self._default_room_message_ttl_seconds = default_room_message_ttl_seconds
+        self._default_dm_message_ttl_seconds = default_dm_message_ttl_seconds
+        self._min_message_ttl_seconds = min_message_ttl_seconds
+        self._max_message_ttl_seconds = max_message_ttl_seconds
+        if self._enable_message_persistence:
+            self._init_message_db()
+
+    @staticmethod
+    def _dm_scope_id(user_a: str, user_b: str) -> str:
+        pair = "\x00".join(sorted([user_a, user_b]))
+        return hashlib.sha256(pair.encode("utf-8")).hexdigest()
+
+    def _init_message_db(self):
+        self._message_db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._message_db_path) as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  scope_type TEXT NOT NULL,
+                  scope_id TEXT NOT NULL,
+                  sender_name TEXT NOT NULL,
+                  recipient_name TEXT,
+                  sender_device_id TEXT,
+                  client_msg_id TEXT,
+                  msg_type TEXT NOT NULL,
+                  ciphertext TEXT NOT NULL,
+                  crypto_meta TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  expires_at INTEGER,
+                  deleted_at INTEGER
+                )
+            """)
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_scope_id
+                ON messages(scope_type, scope_id, id)
+            """)
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_expires
+                ON messages(expires_at)
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS room_settings (
+                  room_id TEXT PRIMARY KEY,
+                  message_ttl_seconds INTEGER,
+                  persist_messages INTEGER NOT NULL DEFAULT 1,
+                  updated_at INTEGER NOT NULL
+                )
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS dm_settings (
+                  dm_id TEXT PRIMARY KEY,
+                  message_ttl_seconds INTEGER,
+                  persist_messages INTEGER NOT NULL DEFAULT 1,
+                  updated_at INTEGER NOT NULL
+                )
+            """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(messages)").fetchall()}
+            if "recipient_name" not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN recipient_name TEXT")
+
+    def _clamp_ttl(self, ttl_seconds: int | None) -> int | None:
+        if ttl_seconds is None:
+            return None
+        ttl = int(ttl_seconds)
+        if ttl <= 0:
+            return None
+        return max(self._min_message_ttl_seconds, min(self._max_message_ttl_seconds, ttl))
+
+    def _scope_ttl(self, scope_type: str, scope_id: str) -> int | None:
+        default = (
+            self._default_room_message_ttl_seconds
+            if scope_type == "room"
+            else self._default_dm_message_ttl_seconds
+        )
+        table = "room_settings" if scope_type == "room" else "dm_settings"
+        key_col = "room_id" if scope_type == "room" else "dm_id"
+        try:
+            with sqlite3.connect(self._message_db_path) as db:
+                row = db.execute(
+                    f"SELECT message_ttl_seconds, persist_messages FROM {table} WHERE {key_col} = ?",
+                    (scope_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row is not None and not row[1]:
+            return None
+        if row is not None and row[0] == 0:
+            return 0
+        ttl = row[0] if row is not None and row[0] is not None else default
+        return self._clamp_ttl(ttl)
+
+    def _set_scope_ttl(self, scope_type: str, scope_id: str, ttl_seconds: int) -> int:
+        if scope_type not in {"room", "dm"}:
+            raise ValueError("scope_type must be room or dm")
+        ttl = int(ttl_seconds)
+        if ttl < 0:
+            raise ValueError("ttl_seconds must be >= 0")
+        stored_ttl = 0 if ttl == 0 else self._clamp_ttl(ttl)
+        table = "room_settings" if scope_type == "room" else "dm_settings"
+        key_col = "room_id" if scope_type == "room" else "dm_id"
+        now = int(time.time())
+        self._init_message_db()
+        with sqlite3.connect(self._message_db_path) as db:
+            db.execute(
+                f"""
+                INSERT INTO {table} ({key_col}, message_ttl_seconds, persist_messages, updated_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT({key_col}) DO UPDATE SET
+                  message_ttl_seconds = excluded.message_ttl_seconds,
+                  persist_messages = 1,
+                  updated_at = excluded.updated_at
+                """,
+                (scope_id, stored_ttl, now),
+            )
+        return int(stored_ttl or 0)
+
+    def _store_encrypted_message(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        sender_name: str,
+        recipient_name: str | None = None,
+        client_msg_id: str = "",
+        msg_type: str = "text",
+        ciphertext: str,
+        crypto_meta: dict | None = None,
+        sender_device_id: str | None = None,
+        ttl_seconds: int | None = None,
+        now: int | float | None = None,
+    ) -> dict:
+        if not self._enable_message_persistence:
+            raise RuntimeError("message persistence is disabled")
+        if scope_type not in {"room", "dm"}:
+            raise ValueError("scope_type must be room or dm")
+        created_at = int(time.time() if now is None else now)
+        ttl = self._clamp_ttl(ttl_seconds)
+        expires_at = created_at + ttl if ttl else None
+        meta_json = json.dumps(crypto_meta or {}, ensure_ascii=False, sort_keys=True)
+        with sqlite3.connect(self._message_db_path) as db:
+            cur = db.execute(
+                """
+                INSERT INTO messages (
+                  scope_type, scope_id, sender_name, recipient_name, sender_device_id, client_msg_id,
+                  msg_type, ciphertext, crypto_meta, created_at, expires_at, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    scope_type,
+                    scope_id,
+                    sender_name,
+                    recipient_name,
+                    sender_device_id,
+                    client_msg_id,
+                    msg_type,
+                    ciphertext,
+                    meta_json,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            message_id = int(cur.lastrowid)
+        return {
+            "message_id": message_id,
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "sender_name": sender_name,
+            "recipient_name": recipient_name,
+            "sender_device_id": sender_device_id,
+            "client_msg_id": client_msg_id,
+            "msg_type": msg_type,
+            "ciphertext": ciphertext,
+            "crypto_meta": crypto_meta or {},
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+
+    def _maybe_persist_room_message(
+        self,
+        *,
+        room_id: str,
+        sender_name: str,
+        payload: dict,
+        now: int | float | None = None,
+    ) -> dict | None:
+        if not self._enable_message_persistence or not payload.get("encrypted"):
+            return None
+        text = str(payload.get("text", ""))
+        if not text:
+            return None
+        ttl = self._scope_ttl("room", room_id)
+        if ttl is None:
+            return None
+        return self._store_encrypted_message(
+            scope_type="room",
+            scope_id=room_id,
+            sender_name=sender_name,
+            client_msg_id=str(payload.get("client_mid", "")),
+            msg_type=str(payload.get("msg_type", "text")),
+            ciphertext=text,
+            crypto_meta=payload.get("crypto_meta") or {"alg": "Fernet", "legacy_payload": True},
+            ttl_seconds=ttl,
+            now=now,
+        )
+
+    def _maybe_persist_dm_message(
+        self,
+        *,
+        sender_name: str,
+        to_user: str,
+        payload: dict,
+        now: int | float | None = None,
+    ) -> dict | None:
+        if not self._enable_message_persistence or not payload.get("encrypted"):
+            return None
+        text = str(payload.get("text", ""))
+        if not text:
+            return None
+        dm_id = str(payload.get("scope_id") or self._dm_scope_id(sender_name, to_user))
+        ttl = self._scope_ttl("dm", dm_id)
+        if ttl is None:
+            return None
+        return self._store_encrypted_message(
+            scope_type="dm",
+            scope_id=dm_id,
+            sender_name=sender_name,
+            recipient_name=to_user,
+            client_msg_id=str(payload.get("client_mid", "")),
+            msg_type=str(payload.get("msg_type", "text")),
+            ciphertext=text,
+            crypto_meta=payload.get("crypto_meta") or {"alg": "unspecified"},
+            ttl_seconds=ttl,
+            now=now,
+        )
+
+    def _load_messages_for_sync(
+        self,
+        scopes: list[dict],
+        *,
+        limit: int = 200,
+        requester: str | None = None,
+        now: int | float | None = None,
+    ) -> list[dict]:
+        if not self._enable_message_persistence:
+            return []
+        now_i = int(time.time() if now is None else now)
+        limit_i = max(1, min(int(limit or 200), 500))
+        out: list[dict] = []
+        with sqlite3.connect(self._message_db_path) as db:
+            db.row_factory = sqlite3.Row
+            for scope in scopes[:50]:
+                scope_type = str(scope.get("scope_type", ""))
+                scope_id = str(scope.get("scope_id", ""))
+                after = self._safe_int(scope.get("after_message_id", 0), default=0) or 0
+                if scope_type not in {"room", "dm"} or not scope_id:
+                    continue
+                if scope_type == "dm" and requester:
+                    rows = db.execute(
+                        """
+                        SELECT * FROM messages
+                        WHERE scope_type = ?
+                          AND scope_id = ?
+                          AND id > ?
+                          AND deleted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > ?)
+                          AND (sender_name = ? OR recipient_name = ?)
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (scope_type, scope_id, after, now_i, requester, requester, limit_i - len(out)),
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        """
+                        SELECT * FROM messages
+                        WHERE scope_type = ?
+                          AND scope_id = ?
+                          AND id > ?
+                          AND deleted_at IS NULL
+                          AND (expires_at IS NULL OR expires_at > ?)
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (scope_type, scope_id, after, now_i, limit_i - len(out)),
+                    ).fetchall()
+                for row in rows:
+                    try:
+                        crypto_meta = json.loads(row["crypto_meta"] or "{}")
+                    except json.JSONDecodeError:
+                        crypto_meta = {}
+                    out.append({
+                        "message_id": int(row["id"]),
+                        "scope_type": row["scope_type"],
+                        "scope_id": row["scope_id"],
+                        "sender_name": row["sender_name"],
+                        "recipient_name": row["recipient_name"],
+                        "sender_device_id": row["sender_device_id"],
+                        "client_msg_id": row["client_msg_id"] or "",
+                        "msg_type": row["msg_type"],
+                        "ciphertext": row["ciphertext"],
+                        "crypto_meta": crypto_meta,
+                        "created_at": int(row["created_at"]),
+                        "expires_at": row["expires_at"],
+                    })
+                    if len(out) >= limit_i:
+                        return out
+        return out
+
+    def _delete_expired_messages(self, *, now: int | float | None = None) -> int:
+        if not self._enable_message_persistence:
+            return 0
+        now_i = int(time.time() if now is None else now)
+        with sqlite3.connect(self._message_db_path) as db:
+            cur = db.execute(
+                "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now_i,),
+            )
+            return int(cur.rowcount or 0)
 
     @staticmethod
     def _safe_int(value, *, default: int | None = None) -> int | None:
@@ -170,6 +508,49 @@ class ChatServer:
             await self._send(ws, T.ERROR, message=f"User '{to_user}' disconnected")
             return False
 
+    @staticmethod
+    def _has_legacy_file_fields(payload: dict, fields: set[str]) -> bool:
+        return any(field in payload for field in fields)
+
+    @staticmethod
+    def _valid_envelope(envelope) -> bool:
+        try:
+            ChatServer._envelope_ciphertext_size(envelope)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _envelope_ciphertext_size(envelope) -> int:
+        if not isinstance(envelope, dict) or set(envelope) != {"version", "nonce", "ciphertext"}:
+            raise ValueError("invalid envelope")
+        if envelope.get("version") != 1:
+            raise ValueError("invalid envelope version")
+        try:
+            nonce = base64.b64decode(envelope["nonce"], validate=True)
+            ciphertext = base64.b64decode(envelope["ciphertext"], validate=True)
+        except (binascii.Error, TypeError, ValueError) as exc:
+            raise ValueError("invalid envelope encoding") from exc
+        if len(nonce) != 12:
+            raise ValueError("invalid nonce")
+        if len(ciphertext) < AEAD_TAG_BYTES:
+            raise ValueError("invalid ciphertext")
+        return len(ciphertext)
+
+    @staticmethod
+    def _expected_chunk_ciphertext_size(size: int, index: int, total: int) -> int:
+        if total <= 0 or index < 0 or index >= total:
+            raise ValueError("invalid chunk position")
+        if size == 0:
+            plaintext_size = 0
+        elif index < total - 1:
+            plaintext_size = CHUNK_SIZE
+        else:
+            plaintext_size = size - CHUNK_SIZE * (total - 1)
+        if plaintext_size < 0 or plaintext_size > CHUNK_SIZE:
+            raise ValueError("invalid declared size")
+        return plaintext_size + AEAD_TAG_BYTES
+
     async def _handle_direct_file(self, ws, username: str, mtype: str, payload: dict):
         to_user = str(payload.get("to", ""))
         tid = str(payload.get("transfer_id", ""))
@@ -181,11 +562,35 @@ class ChatServer:
             return
 
         if mtype == T.FILE_OFFER:
+            if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 code="PLAINTEXT_FORBIDDEN",
+                                 message="PLAINTEXT_FORBIDDEN")
+                return
             size = self._safe_int(payload.get("size", 0))
+            total = self._safe_int(payload.get("total", 0))
+            ciphertext_size = self._safe_int(payload.get("ciphertext_size", 0))
             if size is None or size < 0:
                 await self._send(ws, T.FILE_ERROR,
                                  to=to_user, transfer_id=tid,
                                  message="非法文件大小")
+                return
+            if total is None or total != max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE):
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="invalid total")
+                return
+            expected_ciphertext_size = size + total * AEAD_TAG_BYTES
+            if ciphertext_size is None or ciphertext_size != expected_ciphertext_size:
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="invalid ciphertext_size")
+                return
+            if not self._valid_envelope(payload.get("encrypted_metadata")):
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="invalid encrypted_metadata")
                 return
             if size > MAX_FILE_BYTES:
                 await self._send(ws, T.FILE_ERROR,
@@ -198,13 +603,11 @@ class ChatServer:
             self._direct_transfer_meta[tid] = {
                 "from_user": username,
                 "to_user": to_user,
-                "filename": str(payload.get("filename", "file")),
                 "size": size,
-                "mime": str(payload.get("mime", "")),
-                "total_chunks": max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE),
+                "ciphertext_size": ciphertext_size,
+                "total_chunks": total,
                 "next_index": 0,
-                "received_bytes": 0,
-                "hasher": hashlib.sha256(),
+                "received_ciphertext_bytes": 0,
                 "last_seen": time.time(),
             }
             await self._forward_to_user(ws, username, to_user, T.FILE_OFFER, **payload)
@@ -229,6 +632,11 @@ class ChatServer:
             return
 
         if meta is None:
+            if mtype in (T.FILE_CHUNK, T.FILE_DONE):
+                await self._send(ws, T.FILE_ERROR,
+                                 to=to_user, transfer_id=tid,
+                                 message="unknown transfer")
+                return
             await self._forward_to_user(ws, username, to_user, T(mtype), **payload)
             return
         if meta["from_user"] != username or meta["to_user"] != to_user:
@@ -236,6 +644,9 @@ class ChatServer:
             return
 
         if mtype == T.FILE_CHUNK:
+            if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                await self._fail_direct_transfer(ws, tid, to_user, "PLAINTEXT_FORBIDDEN")
+                return
             index = self._safe_int(payload.get("index", 0))
             total = self._safe_int(payload.get("total", 1))
             if index is None or total is None or total <= 0 or index < 0 or index >= total:
@@ -247,42 +658,39 @@ class ChatServer:
             if index != meta["next_index"]:
                 await self._fail_direct_transfer(ws, tid, to_user, "invalid index order")
                 return
-            data_b64 = str(payload.get("data", ""))
             try:
-                chunk = base64.b64decode(data_b64, validate=True)
-            except Exception:
-                await self._fail_direct_transfer(ws, tid, to_user, "invalid chunk data")
+                chunk_ciphertext_size = self._envelope_ciphertext_size(payload.get("encrypted_chunk"))
+            except ValueError:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid encrypted_chunk")
                 return
-            is_last = index == total - 1
-            if (not is_last and len(chunk) != CHUNK_SIZE) or len(chunk) > CHUNK_SIZE:
-                await self._fail_direct_transfer(ws, tid, to_user, "invalid chunk size")
+            expected_size = self._expected_chunk_ciphertext_size(meta["size"], index, total)
+            if chunk_ciphertext_size != expected_size:
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid encrypted chunk size")
                 return
-            next_size = meta["received_bytes"] + len(chunk)
-            if next_size > meta["size"]:
-                await self._fail_direct_transfer(ws, tid, to_user, "received bytes exceed file size")
+            next_size = meta["received_ciphertext_bytes"] + chunk_ciphertext_size
+            if next_size > meta["ciphertext_size"]:
+                await self._fail_direct_transfer(ws, tid, to_user, "ciphertext bytes exceed declared size")
                 return
-            if is_last and next_size != meta["size"]:
-                await self._fail_direct_transfer(ws, tid, to_user, "final chunk size mismatch")
-                return
-            meta["hasher"].update(chunk)
-            meta["received_bytes"] = next_size
+            meta["received_ciphertext_bytes"] = next_size
             meta["next_index"] = index + 1
             meta["last_seen"] = time.time()
             await self._forward_to_user(ws, username, to_user, T.FILE_CHUNK,
-                                        **{**payload, "data": data_b64})
+                                        **payload)
             return
 
         if mtype == T.FILE_DONE:
-            if meta["next_index"] != meta["total_chunks"] or meta["received_bytes"] != meta["size"]:
+            if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                await self._fail_direct_transfer(ws, tid, to_user, "PLAINTEXT_FORBIDDEN")
+                return
+            if meta["next_index"] != meta["total_chunks"] or meta["received_ciphertext_bytes"] != meta["ciphertext_size"]:
                 await self._fail_direct_transfer(ws, tid, to_user, "file is incomplete")
                 return
-            sha256_hex = str(payload.get("sha256", ""))
-            if meta["hasher"].hexdigest() != sha256_hex:
-                await self._fail_direct_transfer(ws, tid, to_user, "sha256 mismatch")
+            if not self._valid_envelope(payload.get("encrypted_done")):
+                await self._fail_direct_transfer(ws, tid, to_user, "invalid encrypted_done")
                 return
             self._direct_transfer_meta.pop(tid, None)
             await self._forward_to_user(ws, username, to_user, T.FILE_DONE,
-                                        **{**payload, "sha256": sha256_hex})
+                                        **payload)
 
     async def _cleanup_transfer_meta_loop(self):
         while True:
@@ -290,6 +698,9 @@ class ChatServer:
             stale = self._prune_stale_transfers()
             if stale:
                 log.info("pruned %d stale transfer(s)", len(stale))
+            expired = self._delete_expired_messages()
+            if expired:
+                log.info("deleted %d expired encrypted message(s)", expired)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -302,7 +713,9 @@ class ChatServer:
                 room = Room(
                     id=r["id"], name=r["name"], creator=r["creator"],
                     locked=r.get("locked", False),
-                    password_hash=r.get("password_hash", ""),
+                    salt=r.get("salt", ""),
+                    encrypted_access_token=r.get("encrypted_access_token") or {},
+                    access_token_hash=r.get("access_token_hash", ""),
                     created_at=r.get("created_at", time.time()),
                     icon=r.get("icon", ""),
                 )
@@ -315,7 +728,9 @@ class ChatServer:
         try:
             data = {"rooms": [
                 {"id": r.id, "name": r.name, "creator": r.creator,
-                 "locked": r.locked, "password_hash": r.password_hash,
+                 "locked": r.locked, "salt": r.salt,
+                 "encrypted_access_token": r.encrypted_access_token or {},
+                 "access_token_hash": r.access_token_hash,
                  "created_at": r.created_at, "icon": r.icon}
                 for r in self._rooms.values()
             ]}
@@ -408,12 +823,33 @@ class ChatServer:
         await self._evict(username)
         await self._send(ws, T.ROOM_LEFT)
 
+    @staticmethod
+    def _valid_key_bundle_format(bundle) -> bool:
+        """只检查公开密钥包的编码与长度，不在服务端验证身份签名。"""
+        expected_lengths = {
+            "identity_public": 32, "prekey_public": 32, "ephemeral_public": 32,
+            "prekey_signature": 64, "ephemeral_signature": 64,
+        }
+        if not isinstance(bundle, dict) or set(bundle) != set(expected_lengths):
+            return False
+        try:
+            return all(
+                isinstance(bundle[field], str)
+                and len(base64.b64decode(bundle[field], validate=True)) == length
+                for field, length in expected_lengths.items()
+            )
+        except (binascii.Error, ValueError, TypeError):
+            return False
+
+    async def _handshake_error(self, ws, code: str, message: str, *, recoverable: bool = False):
+        await self._send(ws, T.ERROR, code=code, message=message, recoverable=recoverable)
+
     # ── connection handler ───────────────────────────────────────────────────
 
     async def handle(self, ws):
         username: Optional[str] = None
-        await self._send(ws, T.WELCOME,
-                         message="Connected. Use SET_NAME to identify yourself.")
+        state = "HELLO"
+        key_bundle: dict | None = None
 
         try:
             async for raw in ws:
@@ -426,8 +862,41 @@ class ChatServer:
                 mtype   = msg.get("type", "")
                 payload = msg.get("payload", {})
 
+                if not isinstance(payload, dict):
+                    await self._handshake_error(ws, "PROTOCOL_INCOMPATIBLE", "协议载荷格式无效")
+                    await ws.close()
+                    break
+                if state == "HELLO" and mtype != T.CLIENT_HELLO:
+                    await self._handshake_error(ws, "PROTOCOL_INCOMPATIBLE", "首帧必须为 CLIENT_HELLO")
+                    await ws.close()
+                    break
+
+                # ── CLIENT_HELLO ────────────────────────────────────────────
+                if mtype == T.CLIENT_HELLO:
+                    client_protocol = self._safe_int(payload.get("protocol_version"), default=0)
+                    capabilities = payload.get("capabilities")
+                    if state != "HELLO" or client_protocol != PROTOCOL_VERSION or not isinstance(capabilities, list) \
+                            or not _REQUIRED_CAPABILITIES.issubset(capabilities) \
+                            or not self._valid_key_bundle_format(payload.get("key_bundle")):
+                        await self._handshake_error(ws, "PROTOCOL_INCOMPATIBLE", "客户端协议版本、能力或密钥包不兼容")
+                        await ws.close()
+                        break
+                    key_bundle = dict(payload["key_bundle"])
+                    state = "IDENTIFYING"
+                    await self._send(
+                        ws,
+                        T.SERVER_HELLO,
+                        server_version=CLIENT_VERSION,
+                        protocol_version=PROTOCOL_VERSION,
+                        capabilities=SERVER_CAPABILITIES,
+                    )
+                    continue
+
                 # ── SET_NAME ─────────────────────────────────────────────────
                 if mtype == T.SET_NAME:
+                    if state != "IDENTIFYING":
+                        await self._handshake_error(ws, "HANDSHAKE_NOT_READY", "请先完成 CLIENT_HELLO")
+                        continue
                     name = str(payload.get("name", "")).strip()[:32]
                     if not name:
                         await self._send(ws, T.ERROR, message="Name is empty")
@@ -448,8 +917,22 @@ class ChatServer:
                     username = name
                     self._ws_to_name[ws] = username
                     self._name_to_ws[username] = ws
-                    await self._send(ws, T.SYSTEM, message=f"Name set to '{username}'")
+                    self._public_key_directory[username] = key_bundle
+                    state = "READY"
+                    await self._send(ws, T.READY, name=username)
                     log.info("user '%s' connected", username)
+
+                elif state != "READY":
+                    await self._handshake_error(ws, "HANDSHAKE_NOT_READY", "连接尚未就绪", recoverable=True)
+                    continue
+
+                elif mtype == T.GET_PEER_KEY:
+                    peer_name = str(payload.get("name", "")).strip()[:32]
+                    peer_bundle = self._public_key_directory.get(peer_name)
+                    if peer_bundle is None:
+                        await self._send(ws, T.ERROR, code="PEER_KEY_UNAVAILABLE", message="对端不在线或无公开密钥包", recoverable=True)
+                        continue
+                    await self._send(ws, T.PEER_KEY_BUNDLE, name=peer_name, key_bundle=peer_bundle)
 
                 # ── CREATE_ROOM ──────────────────────────────────────────────
                 elif mtype == T.CREATE_ROOM:
@@ -458,19 +941,34 @@ class ChatServer:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
                     room_name = str(payload.get("name", f"{username}'s room"))[:64]
-                    pw        = str(payload.get("password", ""))
-                    locked    = bool(pw)
+                    requested_id = str(payload.get("room_id", "")).strip().upper()
+                    salt = payload.get("salt")
+                    encrypted_access_token = payload.get("encrypted_access_token")
+                    access_token_hash = str(payload.get("access_token_hash", ""))
+                    if (
+                        len(requested_id) != _ID_LEN
+                        or any(char not in _ID_CHARS for char in requested_id)
+                        or requested_id in self._rooms
+                        or not isinstance(salt, str)
+                        or not isinstance(encrypted_access_token, dict)
+                        or len(access_token_hash) != 64
+                        or any(char not in "0123456789abcdef" for char in access_token_hash)
+                    ):
+                        await self._send(ws, T.ERROR, code="INVALID_ROOM_METADATA", message="房间加密元数据无效")
+                        continue
                     # leave current room if any
                     if username in self._user_room:
                         await self._leave(username, ws)
-                    rid  = _new_room_id(set(self._rooms))
+                    rid = requested_id
                     room = Room(id=rid, name=room_name, creator=username,
-                                locked=locked, password_hash=_hash_password(pw) if pw else "")
+                                locked=True, salt=salt,
+                                encrypted_access_token=encrypted_access_token,
+                                access_token_hash=access_token_hash)
                     room.members[username] = ws
                     self._rooms[rid]       = room
                     self._user_room[username] = rid
                     await self._send(ws, T.ROOM_CREATED,
-                                     room_id=rid, name=room_name, locked=locked,
+                                     room_id=rid, name=room_name, locked=True,
                                      creator=username, created_at=room.created_at)
                     self._save_rooms()
                     log.info("room %s '%s' created by %s", rid, room_name, username)
@@ -486,11 +984,11 @@ class ChatServer:
                                          message=f"Room '{rid}' does not exist")
                         continue
                     room = self._rooms[rid]
-                    if room.locked:
-                        pw = str(payload.get("password", ""))
-                        if _hash_password(pw) != room.password_hash:
-                            await self._send(ws, T.ERROR, message="Wrong password")
-                            continue
+                    access_token = str(payload.get("access_token", ""))
+                    supplied_hash = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+                    if not access_token or not hmac.compare_digest(supplied_hash, room.access_token_hash):
+                        await self._send(ws, T.ERROR, code="ROOM_ACCESS_DENIED", message="房间访问令牌无效")
+                        continue
                     if username in self._user_room:
                         await self._leave(username, ws)
                     room.members[username] = ws
@@ -527,33 +1025,165 @@ class ChatServer:
 
                 # ── SEND_MSG ─────────────────────────────────────────────────
                 elif mtype == T.SEND_MSG:
+                    await self._send(ws, T.ERROR, code="PLAINTEXT_FORBIDDEN", message="房间消息必须使用 AEAD 加密", recoverable=False)
+
+                # ── SEND_ENCRYPTED_MSG ──────────────────────────────────────
+                elif mtype == T.SEND_ENCRYPTED_MSG:
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
-                    rid = self._user_room.get(username)
-                    if not rid or rid not in self._rooms:
-                        await self._send(ws, T.ERROR, message="Not in a room")
+                    scope_type = str(payload.get("scope_type", ""))
+                    scope_id = str(payload.get("scope_id", ""))
+                    ciphertext = str(payload.get("ciphertext", ""))
+                    if scope_type not in {"room", "dm"} or not scope_id or not ciphertext:
+                        await self._send(ws, T.ERROR, message="Invalid encrypted message payload")
                         continue
-                    room = self._rooms[rid]
-                    text = str(payload.get("text", ""))
-                    if not text:
+                    recipient_name = None
+                    if scope_type == "room" and self._user_room.get(username) != scope_id:
+                        await self._send(ws, T.ERROR, message="Not in requested room")
                         continue
-                    room.seq += 1
-                    # Track seq → sender for ack routing
-                    self._seq_to_sender.setdefault(rid, {})[room.seq] = username
-                    reply_to  = payload.get("reply_to")
-                    client_mid = payload.get("client_mid", "")
-                    extra = {"reply_to": reply_to} if reply_to else {}
-                    # Relay to everyone else; sender displays locally
-                    await self._broadcast(room, T.NEW_MSG,
-                                          exclude=username,
-                                          sender=username,
-                                          text=text,
-                                          encrypted=bool(payload.get("encrypted")),
-                                          seq=room.seq,
-                                          **extra)
-                    # Echo seq + client_mid back to sender for bubble tracking
-                    await self._send(ws, T.SEND_ACK, seq=room.seq, client_mid=client_mid)
+                    if scope_type == "dm":
+                        recipient_name = str(payload.get("to", "")).strip()[:32]
+                        if not recipient_name:
+                            await self._send(ws, T.ERROR, message="DM encrypted messages require a recipient")
+                            continue
+                        canonical_scope_id = self._dm_scope_id(username, recipient_name)
+                        if scope_id != canonical_scope_id:
+                            await self._send(ws, T.ERROR, message="DM scope_id does not match sender/recipient")
+                            continue
+                    ttl = self._scope_ttl(scope_type, scope_id)
+                    stored = None
+                    if self._enable_message_persistence and ttl is not None:
+                        stored = self._store_encrypted_message(
+                            scope_type=scope_type,
+                            scope_id=scope_id,
+                            sender_name=username,
+                            recipient_name=recipient_name,
+                            client_msg_id=str(payload.get("client_msg_id", "")),
+                            msg_type=str(payload.get("msg_type", "text")),
+                            ciphertext=ciphertext,
+                            crypto_meta=payload.get("crypto_meta") or {},
+                            ttl_seconds=ttl,
+                        )
+                    event_payload = dict(stored or {
+                        "scope_type": scope_type,
+                        "scope_id": scope_id,
+                        "sender_name": username,
+                        "recipient_name": recipient_name,
+                        "client_msg_id": str(payload.get("client_msg_id", "")),
+                        "content_type": str(payload.get("msg_type", "text")),
+                        "ciphertext": ciphertext,
+                        "crypto_meta": payload.get("crypto_meta") or {},
+                        "created_at": int(time.time()),
+                        "expires_at": None,
+                    })
+                    if "msg_type" in event_payload:
+                        event_payload["content_type"] = event_payload.pop("msg_type")
+                    if scope_type == "room":
+                        room = self._rooms.get(scope_id)
+                        if room is not None:
+                            await self._broadcast(
+                                room,
+                                T.NEW_ENCRYPTED_MSG,
+                                exclude=username,
+                                **event_payload,
+                            )
+                    elif recipient_name:
+                        target_ws = self._name_to_ws.get(recipient_name)
+                        if target_ws is not None:
+                            try:
+                                await target_ws.send(pack(T.NEW_ENCRYPTED_MSG, **event_payload))
+                            except websockets.exceptions.ConnectionClosed:
+                                await self._evict(recipient_name)
+                                self._name_to_ws.pop(recipient_name, None)
+                    await self._send(
+                        ws,
+                        T.SEND_ACK,
+                        seq=stored["message_id"] if stored else 0,
+                        client_mid=payload.get("client_msg_id", ""),
+                        message_id=stored["message_id"] if stored else 0,
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                    )
+
+                # ── SYNC_MESSAGES ───────────────────────────────────────────
+                elif mtype == T.SYNC_MESSAGES:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    requested = payload.get("scopes", [])
+                    if not isinstance(requested, list):
+                        await self._send(ws, T.ERROR, message="Invalid sync scopes")
+                        continue
+                    allowed = []
+                    for scope in requested:
+                        if not isinstance(scope, dict):
+                            continue
+                        scope_type = str(scope.get("scope_type", ""))
+                        scope_id = str(scope.get("scope_id", ""))
+                        if scope_type == "room" and scope_id in self._rooms:
+                            room = self._rooms[scope_id]
+                            if username in room.members:
+                                allowed.append(scope)
+                        elif scope_type == "dm":
+                            allowed.append(scope)
+                    messages = self._load_messages_for_sync(
+                        allowed,
+                        limit=self._safe_int(payload.get("limit"), default=200) or 200,
+                        requester=username,
+                    )
+                    await self._send(
+                        ws,
+                        T.SYNC_MESSAGES_RESULT,
+                        messages=messages,
+                        has_more=False,
+                    )
+
+                # ── SET_MESSAGE_TTL ────────────────────────────────────────
+                elif mtype == T.SET_MESSAGE_TTL:
+                    if not username:
+                        await self._send(ws, T.ERROR, message="SET_NAME first")
+                        continue
+                    scope_type = str(payload.get("scope_type", ""))
+                    scope_id = str(payload.get("scope_id", ""))
+                    ttl_seconds = self._safe_int(payload.get("ttl_seconds", -1))
+                    if scope_type not in {"room", "dm"} or not scope_id or ttl_seconds is None or ttl_seconds < 0:
+                        await self._send(ws, T.ERROR, message="Invalid TTL settings")
+                        continue
+                    peer_name = str(payload.get("to", "")).strip()[:32]
+                    if scope_type == "room":
+                        if self._user_room.get(username) != scope_id:
+                            await self._send(ws, T.ERROR, message="Not in requested room")
+                            continue
+                    else:
+                        if not peer_name or self._dm_scope_id(username, peer_name) != scope_id:
+                            await self._send(ws, T.ERROR, message="DM scope_id does not match sender/recipient")
+                            continue
+                    try:
+                        stored_ttl = self._set_scope_ttl(scope_type, scope_id, ttl_seconds)
+                    except (ValueError, sqlite3.Error):
+                        await self._send(ws, T.ERROR, message="Failed to update TTL settings")
+                        continue
+                    event = {
+                        "scope_type": scope_type,
+                        "scope_id": scope_id,
+                        "ttl_seconds": stored_ttl,
+                        "updated_by": username,
+                    }
+                    await self._send(ws, T.MESSAGE_TTL_UPDATED, **event)
+                    if scope_type == "room":
+                        room = self._rooms.get(scope_id)
+                        if room is not None:
+                            await self._broadcast(room, T.MESSAGE_TTL_UPDATED,
+                                                  exclude=username, **event)
+                    elif peer_name:
+                        target_ws = self._name_to_ws.get(peer_name)
+                        if target_ws is not None:
+                            try:
+                                await target_ws.send(pack(T.MESSAGE_TTL_UPDATED, **event))
+                            except websockets.exceptions.ConnectionClosed:
+                                await self._evict(peer_name)
+                                self._name_to_ws.pop(peer_name, None)
 
                 # ── TYPING ───────────────────────────────────────────────────
                 elif mtype == T.TYPING:
@@ -614,11 +1244,35 @@ class ChatServer:
                                          transfer_id=payload.get("transfer_id", ""),
                                          message="Not in a room")
                         continue
+                    if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         code="PLAINTEXT_FORBIDDEN",
+                                         message="PLAINTEXT_FORBIDDEN")
+                        continue
                     size = self._safe_int(payload.get("size", 0))
+                    total = self._safe_int(payload.get("total", 0))
+                    ciphertext_size = self._safe_int(payload.get("ciphertext_size", 0))
                     if size is None or size < 0:
                         await self._send(ws, T.FILE_ROOM_ERROR,
                                          transfer_id=payload.get("transfer_id", ""),
                                          message="非法文件大小")
+                        continue
+                    if total is None or total != max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE):
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="invalid total")
+                        continue
+                    expected_ciphertext_size = size + total * AEAD_TAG_BYTES
+                    if ciphertext_size is None or ciphertext_size != expected_ciphertext_size:
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="invalid ciphertext_size")
+                        continue
+                    if not self._valid_envelope(payload.get("encrypted_metadata")):
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="invalid encrypted_metadata")
                         continue
                     if size > MAX_FILE_BYTES:
                         await self._send(ws, T.FILE_ROOM_ERROR,
@@ -626,18 +1280,14 @@ class ChatServer:
                                          message=f"文件过大（最大 {MAX_FILE_BYTES//1024//1024} MB）")
                         continue
                     tid = str(payload.get("transfer_id", ""))
-                    fname = str(payload.get("filename", "file"))
-                    mime  = str(payload.get("mime", ""))
                     self._transfer_meta[tid] = {
                         "room_id":   rid,
                         "from_user": username,
-                        "filename":  fname,
                         "size":      size,
-                        "mime":      mime,
-                        "total_chunks": max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE),
+                        "ciphertext_size": ciphertext_size,
+                        "total_chunks": total,
                         "next_index": 0,
-                        "received_bytes": 0,
-                        "hasher": hashlib.sha256(),
+                        "received_ciphertext_bytes": 0,
                         "pending_receivers": set(),
                         "done_sent": False,
                         "created_at": time.time(),
@@ -649,8 +1299,10 @@ class ChatServer:
                         self._transfer_meta[tid]["pending_receivers"] = set(room.members) - {username}
                         await self._broadcast(room, T.FILE_ROOM_SHARE,
                                               exclude=username,
-                                              transfer_id=tid, filename=fname,
-                                              size=size, mime=mime,
+                                              transfer_id=tid,
+                                              encrypted_metadata=payload.get("encrypted_metadata"),
+                                              size=size, total=total,
+                                              ciphertext_size=ciphertext_size,
                                               from_user=username, room_id=rid)
 
                 elif mtype == T.FILE_ROOM_CHUNK:
@@ -659,6 +1311,9 @@ class ChatServer:
                     if meta is None:
                         continue
                     if meta["from_user"] != username:
+                        continue
+                    if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                        await self._fail_room_transfer(ws, tid, "PLAINTEXT_FORBIDDEN")
                         continue
                     index = self._safe_int(payload.get("index", 0))
                     total = self._safe_int(payload.get("total", 1))
@@ -671,25 +1326,20 @@ class ChatServer:
                     if index != meta["next_index"]:
                         await self._fail_room_transfer(ws, tid, "invalid index order")
                         continue
-                    data_b64 = str(payload.get("data", ""))
                     try:
-                        chunk = base64.b64decode(data_b64, validate=True)
-                    except Exception:
-                        await self._fail_room_transfer(ws, tid, "invalid chunk data")
+                        chunk_ciphertext_size = self._envelope_ciphertext_size(payload.get("encrypted_chunk"))
+                    except ValueError:
+                        await self._fail_room_transfer(ws, tid, "invalid encrypted_chunk")
                         continue
-                    is_last = index == total - 1
-                    if (not is_last and len(chunk) != CHUNK_SIZE) or len(chunk) > CHUNK_SIZE:
-                        await self._fail_room_transfer(ws, tid, "invalid chunk size")
+                    expected_size = self._expected_chunk_ciphertext_size(meta["size"], index, total)
+                    if chunk_ciphertext_size != expected_size:
+                        await self._fail_room_transfer(ws, tid, "invalid encrypted chunk size")
                         continue
-                    next_size = meta["received_bytes"] + len(chunk)
-                    if next_size > meta["size"]:
-                        await self._fail_room_transfer(ws, tid, "received bytes exceed file size")
+                    next_size = meta["received_ciphertext_bytes"] + chunk_ciphertext_size
+                    if next_size > meta["ciphertext_size"]:
+                        await self._fail_room_transfer(ws, tid, "ciphertext bytes exceed declared size")
                         continue
-                    if is_last and next_size != meta["size"]:
-                        await self._fail_room_transfer(ws, tid, "final chunk size mismatch")
-                        continue
-                    meta["hasher"].update(chunk)
-                    meta["received_bytes"] = next_size
+                    meta["received_ciphertext_bytes"] = next_size
                     meta["next_index"] = index + 1
                     meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
@@ -700,7 +1350,7 @@ class ChatServer:
                                               transfer_id=tid,
                                               index=index,
                                               total=total,
-                                              data=data_b64)
+                                              encrypted_chunk=payload.get("encrypted_chunk"))
                         await self._send(ws, T.FILE_ROOM_CHUNK_ACK,
                                          transfer_id=tid, index=index)
 
@@ -711,27 +1361,26 @@ class ChatServer:
                         continue
                     if meta["from_user"] != username:
                         continue
-                    if meta["next_index"] != meta["total_chunks"] or meta["received_bytes"] != meta["size"]:
+                    if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
+                        await self._fail_room_transfer(ws, tid, "PLAINTEXT_FORBIDDEN")
+                        continue
+                    if meta["next_index"] != meta["total_chunks"] or meta["received_ciphertext_bytes"] != meta["ciphertext_size"]:
                         await self._fail_room_transfer(ws, tid, "file is incomplete")
                         continue
-                    sha256_hex = str(payload.get("sha256", ""))
-                    if meta["hasher"].hexdigest() != sha256_hex:
-                        await self._fail_room_transfer(ws, tid, "sha256 mismatch")
+                    if not self._valid_envelope(payload.get("encrypted_done")):
+                        await self._fail_room_transfer(ws, tid, "invalid encrypted_done")
                         continue
                     meta["last_seen"] = time.time()
                     room = self._rooms.get(meta["room_id"])
                     if room:
                         meta["done_sent"] = True
-                        log.info("file '%s' (%d B) shared by %s in room %s",
-                                 meta["filename"], meta["size"],
-                                 meta["from_user"], meta["room_id"])
+                        log.info("encrypted file (%d B) shared by %s in room %s",
+                                 meta["size"], meta["from_user"], meta["room_id"])
                         await self._broadcast(room, T.FILE_ROOM_DONE,
                                               exclude=username,
                                               transfer_id=tid,
-                                              sha256=sha256_hex,
-                                              filename=meta["filename"],
+                                              encrypted_done=payload.get("encrypted_done"),
                                               size=meta["size"],
-                                              mime=meta["mime"],
                                               from_user=meta["from_user"],
                                               room_id=meta["room_id"])
                         if not meta["pending_receivers"]:
@@ -764,29 +1413,13 @@ class ChatServer:
 
                 # ── SEND_DM (user-to-user direct message) ───────────────────
                 elif mtype == T.SEND_DM:
-                    if not username:
-                        await self._send(ws, T.ERROR, message="SET_NAME first")
-                        continue
-                    to_user = str(payload.get("to", ""))
-                    if to_user not in self._name_to_ws:
-                        await self._send(ws, T.ERROR,
-                                         message=f"User '{to_user}' not online")
-                        continue
-                    text       = str(payload.get("text", ""))
-                    client_mid = payload.get("client_mid", "")
-                    target_ws  = self._name_to_ws[to_user]
-                    try:
-                        await target_ws.send(pack(
-                            T.RECV_DM,
-                            **{"from": username, "text": text, "client_mid": client_mid}
-                        ))
-                        await self._send(ws, T.DM_ACK,
-                                         client_mid=client_mid, to=to_user)
-                    except websockets.exceptions.ConnectionClosed:
-                        await self._evict(to_user)
-                        self._name_to_ws.pop(to_user, None)
-                        await self._send(ws, T.ERROR,
-                                         message=f"User '{to_user}' disconnected")
+                    await self._send(
+                        ws,
+                        T.ERROR,
+                        code="PLAINTEXT_FORBIDDEN",
+                        message="明文私聊已禁用，请使用加密私聊协议",
+                        recoverable=False,
+                    )
 
                 # ── LIST_ROOMS ───────────────────────────────────────────────
                 elif mtype == T.LIST_ROOMS:
@@ -797,6 +1430,8 @@ class ChatServer:
                             "creator":    r.creator,
                             "members":    len(r.members),
                             "locked":     r.locked,
+                            "salt":       r.salt,
+                            "encrypted_access_token": r.encrypted_access_token or {},
                             "created_at": r.created_at,
                             "icon":       r.icon,
                         }
@@ -899,15 +1534,30 @@ class ChatServer:
         finally:
             if username:
                 await self._evict(username)
-                self._name_to_ws.pop(username, None)
+                if self._name_to_ws.get(username) is ws:
+                    self._name_to_ws.pop(username, None)
+                    self._public_key_directory.pop(username, None)
             self._ws_to_name.pop(ws, None)
             log.info("user '%s' disconnected", username or "<anon>")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def _main(host: str, port: int):
-    server = ChatServer()
+async def _main(
+    host: str,
+    port: int,
+    *,
+    message_db_path: str | None = None,
+    enable_message_persistence: bool = True,
+    default_room_message_ttl_seconds: int | None = DEFAULT_ROOM_MESSAGE_TTL_SECONDS,
+    default_dm_message_ttl_seconds: int | None = DEFAULT_DM_MESSAGE_TTL_SECONDS,
+):
+    server = ChatServer(
+        message_db_path=message_db_path,
+        enable_message_persistence=enable_message_persistence,
+        default_room_message_ttl_seconds=default_room_message_ttl_seconds,
+        default_dm_message_ttl_seconds=default_dm_message_ttl_seconds,
+    )
     log.info("═" * 50)
     log.info("  P2P Chat Server  —  ws://%s:%d", host, port)
     log.info("═" * 50)
@@ -927,8 +1577,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="P2P Chat relay server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=int(os.environ.get("PORT", 8765)), type=int)
+    parser.add_argument("--message-db", default=os.environ.get("BEAM_MESSAGE_DB", ""),
+                        help="SQLite path for encrypted message persistence")
+    parser.add_argument("--no-message-persistence", action="store_true",
+                        help="Disable server-side encrypted message persistence")
+    parser.add_argument("--default-room-message-ttl", type=int,
+                        default=int(os.environ.get("BEAM_DEFAULT_ROOM_MESSAGE_TTL", DEFAULT_ROOM_MESSAGE_TTL_SECONDS)),
+                        help="Default room encrypted message TTL in seconds")
+    parser.add_argument("--default-dm-message-ttl", type=int,
+                        default=int(os.environ.get("BEAM_DEFAULT_DM_MESSAGE_TTL", DEFAULT_DM_MESSAGE_TTL_SECONDS)),
+                        help="Default DM encrypted message TTL in seconds")
     args = parser.parse_args()
     try:
-        asyncio.run(_main(args.host, args.port))
+        asyncio.run(_main(
+            args.host,
+            args.port,
+            message_db_path=args.message_db or None,
+            enable_message_persistence=not args.no_message_persistence,
+            default_room_message_ttl_seconds=args.default_room_message_ttl,
+            default_dm_message_ttl_seconds=args.default_dm_message_ttl,
+        ))
     except KeyboardInterrupt:
         log.info("Server stopped")

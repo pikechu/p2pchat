@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -21,6 +22,23 @@ def _resource(relative: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
 
+
+def load_client_config() -> dict:
+    path = _resource("beam_config.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_default_server_url() -> str:
+    config = load_client_config()
+    return str(config.get("server_url") or "ws://106.55.8.122:8765")
+
 # Windows: force UTF-8 so chat messages with any charset render correctly
 # sys.stdout/stderr are None in --windowed (no console) packaged builds
 if sys.platform == "win32":
@@ -31,8 +49,9 @@ if sys.platform == "win32":
 
 
 def main():
+    client_config = load_client_config()
     parser = argparse.ArgumentParser(description="Beam P2P Chat — GUI client")
-    parser.add_argument("--server", default="ws://106.55.8.122:8765",
+    parser.add_argument("--server", default=load_default_server_url(),
                         help="Server WebSocket URL")
     parser.add_argument("--name",   default="",
                         help="Your display name")
@@ -64,6 +83,7 @@ def main():
         server_url=args.server,
         username=username,
         theme=args.theme,
+        allow_custom_server=bool(client_config.get("allow_custom_server", True)),
     )
     win.show()
     sys.exit(app.exec())

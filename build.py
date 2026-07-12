@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import pathlib
 import shutil
@@ -27,6 +28,18 @@ HOOK_CONTENT = """\
 # Auto-build BeamChat.exe after every git commit
 python "$(git rev-parse --show-toplevel)/build.py"
 """
+
+DEFAULT_CLIENT_CONFIG = {
+    "server_url": "ws://106.55.8.122:8765",
+    "anonymous_mode": True,
+    "allow_custom_server": True,
+    "enable_room_password": True,
+    "enable_message_persistence": True,
+    "default_room_message_ttl_seconds": 604800,
+    "default_dm_message_ttl_seconds": 604800,
+    "max_file_mb": 500,
+    "rooms_persist_when_empty": True,
+}
 
 # Qt modules we actually import (checked via grep on the codebase)
 # Do NOT add --collect-all=PyQt6 — that pulls in WebEngine/3D/QML (~150 MB wasted)
@@ -93,6 +106,29 @@ def _ensure_pyinstaller():
         _run([sys.executable, "-m", "pip", "install", "pyinstaller", "-q"])
 
 
+def load_build_config(path: pathlib.Path | str | None = None, **overrides) -> dict:
+    config = dict(DEFAULT_CLIENT_CONFIG)
+    if path:
+        raw = pathlib.Path(path).read_text(encoding="utf-8")
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            raise ValueError("build config must be a JSON object")
+        config.update(loaded)
+    for key, value in overrides.items():
+        if value is not None:
+            config[key] = value
+    if not str(config.get("server_url", "")).strip():
+        raise ValueError("server_url cannot be empty")
+    return config
+
+
+def write_client_build_config(config: dict, path: pathlib.Path | str | None = None) -> pathlib.Path:
+    target = pathlib.Path(path) if path else ROOT / "build" / "beam_config.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
 def install_hook():
     hook_dir = ROOT / ".git" / "hooks"
     if not hook_dir.exists():
@@ -106,7 +142,7 @@ def install_hook():
     print(f"Hook installed: {HOOK_SRC}")
 
 
-def build(debug: bool = False):
+def build(debug: bool = False, config: dict | None = None):
     _ensure_pyinstaller()
 
     mode = "DEBUG" if debug else "RELEASE"
@@ -119,6 +155,8 @@ def build(debug: bool = False):
             shutil.rmtree(d)
         elif d.is_file():
             d.unlink()
+
+    config_path = write_client_build_config(config or DEFAULT_CLIENT_CONFIG)
 
     icon_ico = ROOT / "assets" / "icon.ico"
     icon_png = ROOT / "assets" / "icon.png"
@@ -137,6 +175,9 @@ def build(debug: bool = False):
 
     if icon_png.exists():
         cmd += [f"--add-data={icon_png}{os.pathsep}assets"]
+
+    if config_path.exists():
+        cmd += [f"--add-data={config_path}{os.pathsep}."]
 
     for imp in HIDDEN_IMPORTS:
         cmd += ["--hidden-import", imp]
@@ -166,6 +207,14 @@ def main():
     ap = argparse.ArgumentParser(description="Build BeamChat.exe")
     ap.add_argument("--debug",     action="store_true",
                     help="Build with console window (see runtime errors)")
+    ap.add_argument("--config", type=pathlib.Path,
+                    help="JSON build config, e.g. {'server_url': 'wss://example.com'}")
+    ap.add_argument("--server-url",
+                    help="Default server WebSocket URL baked into the packaged client")
+    ap.add_argument("--anonymous", action="store_true",
+                    help="Record anonymous_mode=true in the packaged config")
+    ap.add_argument("--no-custom-server", action="store_true",
+                    help="Record allow_custom_server=false in the packaged config")
     ap.add_argument("--hook",      action="store_true",
                     help="Install git post-commit hook, then build")
     ap.add_argument("--hook-only", action="store_true",
@@ -176,7 +225,13 @@ def main():
         install_hook()
 
     if not args.hook_only:
-        build(debug=args.debug)
+        config = load_build_config(
+            args.config,
+            server_url=args.server_url,
+            anonymous_mode=True if args.anonymous else None,
+            allow_custom_server=False if args.no_custom_server else None,
+        )
+        build(debug=args.debug, config=config)
 
 
 if __name__ == "__main__":

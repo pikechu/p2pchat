@@ -3,12 +3,16 @@
 import asyncio
 import logging
 import traceback
+from pathlib import Path
 
 import websockets.legacy.client as _ws_legacy
 import websockets.exceptions
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from protocol import T, pack, unpack
+from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
+from identity import IdentityStore, sign_key_bundle
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 _log = logging.getLogger(__name__)
 
@@ -22,15 +26,18 @@ class WSBridge(QThread):
     reconnecting = pyqtSignal(int)   # attempt number (1-based)
     send_error   = pyqtSignal(str)
 
-    def __init__(self, url: str, parent=None):
+    def __init__(self, url: str, parent=None, username: str | None = None):
         super().__init__(parent)
         self._url   = url
+        self._username = username
         self._loop:       asyncio.AbstractEventLoop | None = None
         self._queue:      asyncio.Queue | None = None
         self._stop_event: asyncio.Event | None = None
         self._ws    = None
         self._stop  = False
         self._connected = False
+        self._identity = IdentityStore(Path.home() / ".beamchat" / "identity.json").load_or_create()
+        self._ephemeral_private: X25519PrivateKey | None = None
 
     # ── public API (called from GUI thread) ───────────────────────────────────
 
@@ -122,9 +129,35 @@ class WSBridge(QThread):
             ) as ws:
                 self._ws    = ws
                 self._queue = asyncio.Queue()
+                self._ephemeral_private = X25519PrivateKey.generate()
+                ephemeral_public = self._ephemeral_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+                await ws.send(pack(
+                    T.CLIENT_HELLO,
+                    client_version=CLIENT_VERSION,
+                    protocol_version=PROTOCOL_VERSION,
+                    capabilities=CLIENT_CAPABILITIES,
+                    key_bundle=self._identity.public_bundle(
+                        ephemeral_public,
+                        sign_key_bundle(self._identity, ephemeral_public, PROTOCOL_VERSION),
+                        PROTOCOL_VERSION,
+                    ),
+                ))
+                raw = await ws.recv()
+                hello = unpack(raw)
+                if hello.get("type") != T.SERVER_HELLO:
+                    raise ConnectionError("服务器未接受严格握手")
+                self.received.emit(raw)
+                if self._username:
+                    await ws.send(pack(T.SET_NAME, name=self._username))
+                    raw = await ws.recv()
+                    ready = unpack(raw)
+                    if ready.get("type") != T.READY:
+                        raise ConnectionError("服务器未完成身份确认")
                 self._connected = True
+                if self._username:
+                    self.received.emit(raw)
                 self.connected.emit()
-                _log.info("Connected to %s", self._url)
+                _log.info("已完成服务器握手：%s", self._url)
                 recv = asyncio.create_task(self._recv_loop(ws))
                 send = asyncio.create_task(self._send_loop(ws))
                 done, pending = await asyncio.wait(
