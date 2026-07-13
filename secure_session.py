@@ -169,18 +169,19 @@ class SecureSessionManager:
             metadata = message["crypto_meta"]
             bundle = metadata["sender_key_bundle"]
             envelope = json.loads(message["ciphertext"])
+            peer_identity_public: bytes | None = None
             if sender != self._own_name:
                 bundle_identity = self._bundle_identity_public(bundle)
                 if not verify_key_bundle(bundle, PROTOCOL_VERSION):
                     raise SecureSessionError(SessionState.UNAVAILABLE, "加密私聊密钥不可用")
-                if self._peer_identity_from_envelope(envelope) != bundle_identity:
-                    raise SecureSessionError(SessionState.UNAVAILABLE, "加密私聊密钥不可用")
                 if self._sender_prekey_from_envelope(envelope) != self._decode_public(bundle, "prekey_public"):
                     raise SecureSessionError(SessionState.UNAVAILABLE, "加密私聊密钥不可用")
                 self.cache_peer_bundle(peer, bundle)
+                peer_identity_public = bundle_identity
             if sender != self._own_name and self.ensure_peer(peer) is not SessionState.READY:
                 raise SecureSessionError(SessionState.FROZEN, "加密私聊密钥不可用")
-            peer_identity_public = self._peer_identity_from_envelope(envelope)
+            if peer_identity_public is None:
+                peer_identity_public = self._peer_identity_from_envelope(envelope)
             plaintext = decrypt_dm_envelope(
                 self._identity.prekey_private,
                 self._identity.identity_public,

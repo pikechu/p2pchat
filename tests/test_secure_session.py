@@ -59,6 +59,25 @@ def test_sender_can_decrypt_own_synced_dm(tmp_path):
     assert alice_manager.decrypt_dm(stored) == "自己同步也能解密"
 
 
+def test_dm_between_local_profiles_with_same_device_identity_decrypts(tmp_path):
+    shared = _identity()
+    alice_manager = SecureSessionManager(shared, TrustStore(tmp_path / "alice-trust.json"), "alice")
+    bob_manager = SecureSessionManager(shared, TrustStore(tmp_path / "bob-trust.json"), "bob")
+    alice_manager.cache_peer_bundle("bob", _bundle(shared))
+
+    outbound = alice_manager.encrypt_dm("bob", "同机多开也能解密", "m-local")
+    stored = {
+        "sender_name": "alice",
+        "recipient_name": "bob",
+        "client_msg_id": outbound["client_msg_id"],
+        "scope_id": outbound["scope_id"],
+        "ciphertext": outbound["ciphertext"],
+        "crypto_meta": outbound["crypto_meta"],
+    }
+
+    assert bob_manager.decrypt_dm(stored) == "同机多开也能解密"
+
+
 def test_file_and_voice_keys_are_ready_and_separated(tmp_path):
     alice = _identity()
     bob = _identity()
