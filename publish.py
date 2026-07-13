@@ -28,7 +28,17 @@ from rich.text import Text
 console = Console()
 
 SERVICE_NAME  = "p2pchat"
-SERVER_FILES  = ["server.py", "protocol.py", "crypto.py"]
+SERVER_FILES  = [
+    "server.py",
+    "protocol.py",
+    "crypto.py",
+    "e2e_crypto.py",
+    "file_transfer.py",
+    "identity.py",
+    "secure_session.py",
+    "voice_crypto.py",
+    "requirements-server.txt",
+]
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -86,7 +96,7 @@ def _auto_commit_message(files: list[str]) -> str:
     if not files:
         return "chore: update"
     # 分类
-    server = [f for f in files if f in ("server.py", "protocol.py", "crypto.py")]
+    server = [f for f in files if f in SERVER_FILES]
     gui    = [f for f in files if f.startswith("gui/")]
     tests  = [f for f in files if f.startswith("tests/")]
     other  = [f for f in files if f not in server and f not in gui and f not in tests]
