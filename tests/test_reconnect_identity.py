@@ -17,6 +17,7 @@ sys.modules.setdefault("sounddevice", sounddevice_stub)
 
 from PyQt6.QtWidgets import QApplication, QMessageBox, QMenu
 
+from crypto import create_room_access_metadata
 from gui.window import MainWindow, TTLMenuButton
 from protocol import T, TTL_VALUES
 from secure_session import SecureSessionError, SessionState
@@ -38,6 +39,7 @@ def _make_window_stub():
     window._rooms = {}
     window._reconnect_room_id = ""
     window._server_room_id = ""
+    window._implicit_leave = False
     window._identified = True
     window._conv = MagicMock()
     window._chat = MagicMock()
@@ -214,6 +216,55 @@ def test_ttl_menu_button_values_and_current_item(app, monkeypatch):
     assert [action.text() for action in actions] == ["一天", "一周", "一个月", "一年", "永久"]
     assert [action.isChecked() for action in actions] == [False, False, True, False, False]
     assert "一个月" in button.toolTip()
+
+
+def test_room_click_reprompts_when_cached_password_is_wrong(app):
+    window = _make_window_stub()
+    metadata = create_room_access_metadata("ROOM01", "正确密码")
+    window._rooms = {
+        "ROOM01": {
+            "name": "旧房间",
+            "locked": True,
+            "metadata": dict(metadata),
+            "password": "旧密码",
+        }
+    }
+    window._chat.current_room_id = ""
+
+    with patch.object(MainWindow, "_prompt_room_password", return_value="正确密码") as prompt, \
+         patch.object(QMessageBox, "warning") as warning:
+        MainWindow._on_room_selected(window, "ROOM01")
+
+    prompt.assert_called_once()
+    warning.assert_not_called()
+    window._bridge.send_frame.assert_called_once_with(
+        T.JOIN_ROOM,
+        room_id="ROOM01",
+        access_token=metadata.access_token,
+    )
+    assert window._rooms["ROOM01"]["password"] == "正确密码"
+
+
+def test_room_click_does_not_leave_current_room_before_token_is_valid(app):
+    window = _make_window_stub()
+    metadata = create_room_access_metadata("ROOM01", "正确密码")
+    window._rooms = {
+        "ROOM01": {
+            "name": "旧房间",
+            "locked": True,
+            "metadata": dict(metadata),
+            "password": "错误密码",
+        }
+    }
+    window._chat.current_room_id = "CURRENT"
+    window._server_room_id = "CURRENT"
+
+    with patch.object(MainWindow, "_prompt_room_password", return_value=None), \
+         patch.object(QMessageBox, "warning"):
+        MainWindow._on_room_selected(window, "ROOM01")
+
+    window._bridge.send_frame.assert_not_called()
+    assert window._implicit_leave is False
 
 
 def test_start_file_send_rejects_files_larger_than_50mb(app, tmp_path):

@@ -3138,30 +3138,48 @@ class MainWindow(QMainWindow):
             return
         room = self._rooms.get(room_id, {})
         pw = room.get("password", "")
-        # Locked room with no stored password — ask the user
+        metadata = room.get("metadata", {})
+        access_token = ""
+        # 加密房间没有本地密码时，先询问用户再尝试加入。
         if room.get("locked") and not pw:
-            from PyQt6.QtWidgets import QInputDialog
-            dlg = QInputDialog(self)
-            dlg.setWindowTitle("加入房间")
-            dlg.setLabelText("请输入房间密码：")
-            dlg.setTextEchoMode(QLineEdit.EchoMode.Password)
-            self._style_dialog(dlg)
-            if dlg.exec() != QDialog.DialogCode.Accepted:
+            prompted = self._prompt_room_password()
+            if prompted is None:
                 return
-            pw = dlg.textValue()
+            pw = prompted
+        try:
+            access_token = decrypt_room_access_token(room_id, pw, metadata)
+        except Exception:
+            if room.get("locked") and pw:
+                prompted = self._prompt_room_password("房间密码已失效或不正确，请重新输入：")
+                if prompted is None:
+                    return
+                pw = prompted
+                try:
+                    access_token = decrypt_room_access_token(room_id, pw, metadata)
+                except Exception:
+                    QMessageBox.warning(self, "加入房间", "房间访问令牌认证失败")
+                    return
+            else:
+                QMessageBox.warning(self, "加入房间", "房间访问令牌认证失败")
+                return
         if self._server_room_id:
             self._on_typing_stop()
             self._implicit_leave = True
             self._bridge.send_frame(T.LEAVE_ROOM)
-        metadata = room.get("metadata", {})
-        try:
-            access_token = decrypt_room_access_token(room_id, pw, metadata)
-        except Exception:
-            QMessageBox.warning(self, "加入房间", "房间访问令牌认证失败")
-            return
         self._rooms.setdefault(room_id, {})["password"] = pw
         self._rooms[room_id]["access_token"] = access_token
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, access_token=access_token)
+
+    def _prompt_room_password(self, label: str = "请输入房间密码：") -> str | None:
+        from PyQt6.QtWidgets import QInputDialog
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("加入房间")
+        dlg.setLabelText(label)
+        dlg.setTextEchoMode(QLineEdit.EchoMode.Password)
+        self._style_dialog(dlg)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.textValue()
 
     @pyqtSlot()
     def _on_create_room(self):
