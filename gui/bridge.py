@@ -19,6 +19,10 @@ _log = logging.getLogger(__name__)
 _RECONNECT_DELAYS = [1, 2, 4, 8, 15, 30]  # seconds between attempts
 
 
+class ProtocolIncompatibleError(ConnectionError):
+    """表示服务端没有完成当前客户端要求的严格协议握手。"""
+
+
 class WSBridge(QThread):
     received     = pyqtSignal(str)
     connected    = pyqtSignal()
@@ -109,6 +113,8 @@ class WSBridge(QThread):
 
             try:
                 await self._connect()
+            except ProtocolIncompatibleError:
+                break
             except Exception:
                 pass  # disconnect already emitted inside _connect()
 
@@ -145,14 +151,20 @@ class WSBridge(QThread):
                 raw = await ws.recv()
                 hello = unpack(raw)
                 if hello.get("type") != T.SERVER_HELLO:
-                    raise ConnectionError("服务器未接受严格握手")
+                    reason = "服务器协议不兼容：未接受严格握手"
+                    if hello.get("type") == T.ERROR:
+                        reason = str(hello.get("payload", {}).get("message") or reason)
+                    raise ProtocolIncompatibleError(reason)
                 self.received.emit(raw)
                 if self._username:
                     await ws.send(pack(T.SET_NAME, name=self._username))
                     raw = await ws.recv()
                     ready = unpack(raw)
                     if ready.get("type") != T.READY:
-                        raise ConnectionError("服务器未完成身份确认")
+                        reason = "服务器协议不兼容：未完成身份确认"
+                        if ready.get("type") == T.ERROR:
+                            reason = str(ready.get("payload", {}).get("message") or reason)
+                        raise ProtocolIncompatibleError(reason)
                 self._connected = True
                 if self._username:
                     self.received.emit(raw)
@@ -184,6 +196,11 @@ class WSBridge(QThread):
             self._connected = False
             _log.error("Connection timed out")
             self.disconnected.emit("timed out during handshake")
+            raise
+        except ProtocolIncompatibleError as exc:
+            self._connected = False
+            _log.error("Protocol incompatible: %s", exc)
+            self.disconnected.emit(str(exc))
             raise
         except OSError as exc:
             self._connected = False

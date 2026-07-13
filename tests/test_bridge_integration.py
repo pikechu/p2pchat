@@ -3,12 +3,15 @@ Integration tests: WSBridge connects to a real server and sends/receives frames.
 Verifies the create-room / join-room GUI flow end-to-end.
 """
 import os
+import asyncio
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
+import websockets
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -83,6 +86,36 @@ def _room_metadata(room_id: str, password: str = "测试密码"):
     return create_room_access_metadata(room_id, password)
 
 
+class _LegacyWelcomeServer:
+    def __init__(self):
+        self.port = _free_port()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        assert self._ready.wait(3)
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=3)
+
+    def _run(self):
+        async def handler(ws):
+            await ws.send(pack(T.WELCOME, message="old server"))
+            await asyncio.sleep(0.2)
+
+        async def main():
+            async with websockets.serve(handler, "127.0.0.1", self.port):
+                self._ready.set()
+                while not self._stop.is_set():
+                    await asyncio.sleep(0.05)
+
+        asyncio.run(main())
+
+
 def _send_and_wait(bridge: WSBridge, msg_type, expected_type: str,
                    timeout_ms: int = 3000, **kwargs) -> dict | None:
     """Send a frame and wait for the first received frame of expected_type."""
@@ -131,6 +164,30 @@ def test_bridge_connects_after_server_hello(app, server_port):
 
     bridge.close()
     bridge.wait(2000)
+
+
+def test_bridge_stops_reconnecting_when_server_uses_legacy_protocol(app):
+    legacy = _LegacyWelcomeServer().start()
+    bridge = WSBridge(f"ws://127.0.0.1:{legacy.port}", username="legacy_user")
+    disconnected = []
+    reconnecting = []
+    bridge.disconnected.connect(lambda reason: disconnected.append(reason))
+    bridge.reconnecting.connect(lambda attempt: reconnecting.append(attempt))
+    try:
+        bridge.start()
+        _wait_for_signal(bridge.disconnected, timeout_ms=3000)
+        QTimer.singleShot(1200, lambda: None)
+        loop = QEventLoop()
+        QTimer.singleShot(1200, loop.quit)
+        loop.exec()
+    finally:
+        bridge.close()
+        bridge.wait(2000)
+        legacy.stop()
+
+    assert disconnected
+    assert "严格握手" in disconnected[0] or "协议不兼容" in disconnected[0]
+    assert reconnecting == []
 
 
 def test_bridge_set_name_receives_ready(app, server_port):

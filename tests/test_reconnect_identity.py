@@ -56,15 +56,27 @@ def _make_window_stub():
     return window
 
 
-def test_on_connected_waits_for_ready(app):
+def test_on_connected_does_not_send_followup_requests(app):
     window = _make_window_stub()
     window._username = "pp"
+    window._identified = False
 
     with patch.object(MainWindow, "setWindowTitle"):
         MainWindow._on_connected(window)
 
     assert window._identified is False
     window._bridge.send_frame.assert_not_called()
+
+
+def test_on_connected_does_not_clear_ready_state(app):
+    window = _make_window_stub()
+    window._username = "pp"
+    window._identified = True
+
+    with patch.object(MainWindow, "setWindowTitle"):
+        MainWindow._on_connected(window)
+
+    assert window._identified is True
 
 
 def test_ready_unblocks_followup_requests(app):

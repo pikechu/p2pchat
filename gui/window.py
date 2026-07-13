@@ -1731,7 +1731,6 @@ class MainWindow(QMainWindow):
             self._voice_call.state_changed.connect(self._on_call_state_changed)
             self._voice_call.mode_changed.connect(self._on_call_mode_changed)
             self._voice_call.duration_tick.connect(self._on_call_duration)
-        self._identified = False
         self.setWindowTitle("Beam — P2P Chat")
 
     @pyqtSlot(int)
@@ -1744,7 +1743,10 @@ class MainWindow(QMainWindow):
             self._voice_call.hangup()
         _log.error("bridge disconnected: %s", reason)
         self._identified = False
-        self.setWindowTitle("Beam — P2P Chat  [断线]")
+        if "严格握手" in reason or "协议不兼容" in reason or "PROTOCOL_INCOMPATIBLE" in reason:
+            self.setWindowTitle("Beam — P2P Chat  [服务器协议不兼容]")
+        else:
+            self.setWindowTitle("Beam — P2P Chat  [断线]")
         # Save room for auto-reconnect before clearing server state
         self._reconnect_room_id = self._server_room_id
         self._server_room_id = ""
