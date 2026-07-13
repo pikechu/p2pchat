@@ -18,7 +18,7 @@ sys.modules.setdefault("sounddevice", sounddevice_stub)
 from PyQt6.QtWidgets import QApplication, QMessageBox, QMenu
 
 from crypto import create_room_access_metadata
-from gui.window import MainWindow, TTLMenuButton
+from gui.window import MainWindow, RoomSearchDialog, TTLMenuButton
 from protocol import T, TTL_VALUES
 from secure_session import SecureSessionError, SessionState
 
@@ -245,6 +245,32 @@ def test_room_click_reprompts_when_cached_password_is_wrong(app):
     assert window._rooms["ROOM01"]["password"] == "正确密码"
 
 
+def test_room_click_uses_empty_password_before_prompting(app):
+    window = _make_window_stub()
+    metadata = create_room_access_metadata("ROOM01", "")
+    window._rooms = {
+        "ROOM01": {
+            "name": "公开房间",
+            "locked": True,
+            "metadata": dict(metadata),
+            "password": "",
+        }
+    }
+    window._chat.current_room_id = ""
+
+    with patch.object(MainWindow, "_prompt_room_password") as prompt, \
+         patch.object(QMessageBox, "warning") as warning:
+        MainWindow._on_room_selected(window, "ROOM01")
+
+    prompt.assert_not_called()
+    warning.assert_not_called()
+    window._bridge.send_frame.assert_called_once_with(
+        T.JOIN_ROOM,
+        room_id="ROOM01",
+        access_token=metadata.access_token,
+    )
+
+
 def test_room_click_does_not_leave_current_room_before_token_is_valid(app):
     window = _make_window_stub()
     metadata = create_room_access_metadata("ROOM01", "正确密码")
@@ -265,6 +291,30 @@ def test_room_click_does_not_leave_current_room_before_token_is_valid(app):
 
     window._bridge.send_frame.assert_not_called()
     assert window._implicit_leave is False
+
+
+def test_room_search_joins_empty_password_room_without_prompt(app):
+    metadata = create_room_access_metadata("ROOM01", "")
+    dialog = RoomSearchDialog(
+        {
+            "ROOM01": {
+                "name": "公开房间",
+                "locked": True,
+                "metadata": dict(metadata),
+                "members": [],
+                "creator": "alice",
+            }
+        },
+        "bob",
+    )
+    emitted = []
+    dialog.join_requested.connect(lambda room_id, password: emitted.append((room_id, password)))
+
+    with patch("PyQt6.QtWidgets.QInputDialog.getText") as get_text:
+        dialog._on_join("ROOM01", True)
+
+    get_text.assert_not_called()
+    assert emitted == [("ROOM01", "")]
 
 
 def test_start_file_send_rejects_files_larger_than_50mb(app, tmp_path):

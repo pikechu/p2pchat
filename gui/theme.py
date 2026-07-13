@@ -240,6 +240,35 @@ def make_qss(theme: str = "light") -> str:
 
     /* ── Dialogs ────────────────────────────────────────── */
     #Dialog {{ background: {t['bg']}; border: 1px solid {t['line_strong']}; border-radius: 10px; }}
+    QInputDialog {{
+        background: {t['bg']};
+        color: {t['fg']};
+    }}
+    QInputDialog QLabel {{
+        background: {t['bg']};
+        color: {t['fg']};
+        font-size: 13px;
+    }}
+    QInputDialog QLineEdit {{
+        background: {t['bg_input']};
+        border: 1px solid {t['line']};
+        border-radius: 6px;
+        padding: 8px 10px;
+        font-size: 13.5px;
+        color: {t['fg']};
+    }}
+    QInputDialog QLineEdit:focus {{ border-color: {t['accent']}; }}
+    QInputDialog QPushButton {{
+        background: {t['bg_input']};
+        color: {t['fg']};
+        border: 1px solid {t['line']};
+        border-radius: 6px;
+        padding: 5px 18px;
+        font-size: 13px;
+    }}
+    QInputDialog QPushButton:hover {{
+        background: {t['bg_hover']};
+    }}
 
     /* ── QMessageBox (overrides the transparent QWidget rule) ── */
     QMessageBox {{

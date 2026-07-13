@@ -96,7 +96,7 @@ async def _create_room(ws, name: str, password: str = "测试密码") -> dict:
     room_id = uuid.uuid4().hex.upper().translate(str.maketrans({"0": "A", "1": "B", "I": "C", "L": "D", "O": "E"}))[:6]
     metadata = create_room_access_metadata(room_id, password)
     _room_material[room_id] = (password, metadata)
-    await ws.send(pack(T.CREATE_ROOM, room_id=room_id, name=name, **dict(metadata)))
+    await ws.send(pack(T.CREATE_ROOM, room_id=room_id, name=name, locked=bool(password), **dict(metadata)))
     return await _recv(ws)
 
 
@@ -188,6 +188,22 @@ def test_create_room_uses_access_token_metadata(server_port, event_loop):
         frame = await _create_room(ws, "Secret", "pw123")
         assert frame["type"] == T.ROOM_CREATED
         assert frame["payload"].get("locked") is True
+        await ws.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_create_room_without_password_is_unlocked(server_port, event_loop):
+    async def run():
+        ws = await _connect(server_port, "creator_public")
+        frame = await _create_room(ws, "Public", "")
+        assert frame["type"] == T.ROOM_CREATED
+        assert frame["payload"].get("locked") is False
+
+        await ws.send(pack(T.LIST_ROOMS))
+        rooms = (await _recv(ws))["payload"]["rooms"]
+        listed = next(room for room in rooms if room["id"] == frame["payload"]["room_id"])
+        assert listed["locked"] is False
         await ws.close()
 
     event_loop.run_until_complete(run())

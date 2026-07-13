@@ -634,7 +634,8 @@ class ChatClient:
                 self._pending_pw = password
                 self._pending_room_metadata = metadata
                 log.info("CREATE_ROOM  name=%s", room_name)
-                await self._send(T.CREATE_ROOM, room_id=room_id, name=room_name, **dict(metadata))
+                await self._send(T.CREATE_ROOM, room_id=room_id, name=room_name,
+                                 locked=bool(password), **dict(metadata))
 
             elif cmd == "join":
                 if not args:

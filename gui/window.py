@@ -101,7 +101,7 @@ class RoomDialog(QDialog):
         lay.setContentsMargins(24, 20, 24, 20)
         lay.setSpacing(16)
 
-        title = "Join Room" if mode == "join" else "Create Room"
+        title = "加入房间" if mode == "join" else "创建房间"
         lay.addWidget(_lbl(title, "DialogTitle"))
 
         form = QFormLayout()
@@ -111,25 +111,25 @@ class RoomDialog(QDialog):
         if mode == "create":
             self._name = QLineEdit()
             self._name.setObjectName("FormInput")
-            self._name.setPlaceholderText("e.g.  core-devs")
-            form.addRow(_lbl("Room name", "FormLabel"), self._name)
+            self._name.setPlaceholderText("例如：core-devs")
+            form.addRow(_lbl("房间名称", "FormLabel"), self._name)
         else:
             self._room_id = QLineEdit()
             self._room_id.setObjectName("FormInput")
-            self._room_id.setPlaceholderText("6-char room ID")
+            self._room_id.setPlaceholderText("6 位房间 ID")
             self._room_id.setMaxLength(6)
-            form.addRow(_lbl("Room ID", "FormLabel"), self._room_id)
+            form.addRow(_lbl("房间 ID", "FormLabel"), self._room_id)
 
         self._password = QLineEdit()
         self._password.setObjectName("FormInput")
         self._password.setEchoMode(QLineEdit.EchoMode.Password)
-        self._password.setPlaceholderText("optional — enables E2E encryption")
-        form.addRow(_lbl("Password", "FormLabel"), self._password)
+        self._password.setPlaceholderText("可留空；设置后加入者需要输入密码")
+        form.addRow(_lbl("房间密码", "FormLabel"), self._password)
         lay.addLayout(form)
 
         btns = QHBoxLayout()
         btns.setSpacing(8)
-        cancel = _btn("Cancel", "BtnGhost")
+        cancel = _btn("取消", "BtnGhost")
         cancel.clicked.connect(self.reject)
         ok = _btn(title, "BtnPrimary")
         ok.clicked.connect(self.accept)
@@ -1225,7 +1225,7 @@ class RoomSearchDialog(QDialog):
 
     def _on_join(self, room_id: str, locked: bool):
         password = ""
-        if locked:
+        if locked and not self._can_join_with_empty_password(room_id):
             from PyQt6.QtWidgets import QInputDialog
             pw, ok = QInputDialog.getText(
                 self, "密码保护", "请输入房间密码：",
@@ -1236,6 +1236,14 @@ class RoomSearchDialog(QDialog):
             password = pw
         self.join_requested.emit(room_id, password)
         self.accept()
+
+    def _can_join_with_empty_password(self, room_id: str) -> bool:
+        metadata = self._rooms.get(room_id, {}).get("metadata", {})
+        try:
+            decrypt_room_access_token(room_id, "", metadata)
+            return True
+        except Exception:
+            return False
 
 
 # ── Full chat panel ───────────────────────────────────────────────────────────
@@ -3140,17 +3148,12 @@ class MainWindow(QMainWindow):
         pw = room.get("password", "")
         metadata = room.get("metadata", {})
         access_token = ""
-        # 加密房间没有本地密码时，先询问用户再尝试加入。
-        if room.get("locked") and not pw:
-            prompted = self._prompt_room_password()
-            if prompted is None:
-                return
-            pw = prompted
         try:
             access_token = decrypt_room_access_token(room_id, pw, metadata)
         except Exception:
-            if room.get("locked") and pw:
-                prompted = self._prompt_room_password("房间密码已失效或不正确，请重新输入：")
+            if room.get("locked"):
+                prompt_label = "请输入房间密码：" if not pw else "房间密码已失效或不正确，请重新输入："
+                prompted = self._prompt_room_password(prompt_label)
                 if prompted is None:
                     return
                 pw = prompted
@@ -3198,7 +3201,8 @@ class MainWindow(QMainWindow):
         _log.info("CREATE_ROOM request: name=%r locked=%s", v["name"], bool(v["password"]))
         if self._server_room_id:
             self._implicit_leave = True
-        self._bridge.send_frame(T.CREATE_ROOM, room_id=room_id, name=v["name"], **dict(metadata))
+        self._bridge.send_frame(T.CREATE_ROOM, room_id=room_id, name=v["name"],
+                                locked=bool(v["password"]), **dict(metadata))
 
     @pyqtSlot()
     def _on_search_rooms(self):

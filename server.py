@@ -1058,6 +1058,7 @@ class ChatServer:
                     salt = payload.get("salt")
                     encrypted_access_token = payload.get("encrypted_access_token")
                     access_token_hash = str(payload.get("access_token_hash", ""))
+                    locked = bool(payload.get("locked", True))
                     if (
                         len(requested_id) != _ID_LEN
                         or any(char not in _ID_CHARS for char in requested_id)
@@ -1074,14 +1075,14 @@ class ChatServer:
                         await self._leave(username, ws)
                     rid = requested_id
                     room = Room(id=rid, name=room_name, creator=username,
-                                locked=True, salt=salt,
+                                locked=locked, salt=salt,
                                 encrypted_access_token=encrypted_access_token,
                                 access_token_hash=access_token_hash)
                     room.members[username] = ws
                     self._rooms[rid]       = room
                     self._user_room[username] = rid
                     await self._send(ws, T.ROOM_CREATED,
-                                     room_id=rid, name=room_name, locked=True,
+                                     room_id=rid, name=room_name, locked=locked,
                                      creator=username, created_at=room.created_at)
                     self._save_rooms()
                     log.info("room %s '%s' created by %s", rid, room_name, username)
