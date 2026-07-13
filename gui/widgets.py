@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QFrame, QPushButton, QGridLayout, QScrollArea, QMenu,
 )
 
+from .popups import popup_above_global_pos
 from .theme import TOKENS, avatar_stops
 
 
@@ -293,7 +294,7 @@ class BubbleWidget(QFrame):
         menu = QMenu(self)
         copy_act  = menu.addAction("⎘  Copy")
         reply_act = menu.addAction("↩  Reply")
-        chosen = menu.exec(self.mapToGlobal(pos))
+        chosen = popup_above_global_pos(menu, self.mapToGlobal(pos))
         if chosen == copy_act:
             from PyQt6.QtWidgets import QApplication
             QApplication.clipboard().setText(self._text)

@@ -15,9 +15,11 @@ sounddevice_stub.InputStream = object
 sounddevice_stub.OutputStream = object
 sys.modules.setdefault("sounddevice", sounddevice_stub)
 
+from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QApplication, QMessageBox, QMenu
 
 from crypto import create_room_access_metadata
+from gui.popups import popup_above_global_pos
 from gui.window import MainWindow, RoomSearchDialog, TTLMenuButton
 from protocol import T, TTL_VALUES
 from secure_session import SecureSessionError, SessionState
@@ -276,6 +278,40 @@ def test_ttl_menu_button_values_and_current_item(app, monkeypatch):
     assert [action.text() for action in actions] == ["一天", "一周", "一个月", "一年", "永久"]
     assert [action.isChecked() for action in actions] == [False, False, True, False, False]
     assert "一个月" in button.toolTip()
+
+
+def test_ttl_menu_button_opens_above_button(app, monkeypatch):
+    button = TTLMenuButton()
+    captured = {}
+
+    def fake_exec(menu, pos, *_args, **_kwargs):
+        captured["pos"] = pos
+        captured["menu_height"] = menu.sizeHint().height()
+        return None
+
+    monkeypatch.setattr(QMenu, "exec", fake_exec)
+    button._open_menu()
+
+    button_top = button.mapToGlobal(button.rect().topLeft()).y()
+    assert captured["pos"].y() <= button_top - captured["menu_height"]
+
+
+def test_popup_above_global_pos_offsets_menu_by_its_height(app, monkeypatch):
+    menu = QMenu()
+    menu.addAction("复制")
+    anchor = QPoint(120, 240)
+    captured = {}
+
+    def fake_exec(self, pos, *_args, **_kwargs):
+        captured["pos"] = pos
+        captured["height"] = self.sizeHint().height()
+        return None
+
+    monkeypatch.setattr(QMenu, "exec", fake_exec)
+    popup_above_global_pos(menu, anchor)
+
+    assert captured["pos"].x() == anchor.x()
+    assert captured["pos"].y() == anchor.y() - captured["height"]
 
 
 def test_room_click_reprompts_when_cached_password_is_wrong(app):

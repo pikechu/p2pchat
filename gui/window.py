@@ -65,6 +65,7 @@ from .widgets import (
     DayMarkWidget, ConvRowWidget, TypingWidget, EmojiPanel,
     FileCard, ImageCard, VideoCard,
 )
+from .popups import popup_above_global_pos, popup_above_widget
 from voice_call import VoiceCall, CallState
 from .call_widget import CallWidget, IncomingCallDialog
 
@@ -741,7 +742,7 @@ class TTLMenuButton(QPushButton):
             action.setChecked(ttl_seconds == self._ttl_seconds)
             action.triggered.connect(lambda _checked=False, ttl=ttl_seconds: self.ttl_selected.emit(ttl))
             menu.addAction(action)
-        menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+        popup_above_widget(menu, self)
 
     @classmethod
     def label_for(cls, ttl_seconds: int) -> str:
@@ -2484,7 +2485,7 @@ class MainWindow(QMainWindow):
         from PyQt6.QtGui import QCursor
         menu = QMenu(self)
         delete_action = menu.addAction("删除聊天室")
-        if menu.exec(QCursor.pos()) == delete_action:
+        if popup_above_global_pos(menu, QCursor.pos()) == delete_action:
             reply = QMessageBox.question(
                 self, "删除聊天室",
                 f"确定要永久删除聊天室「{room.get('name', room_id)}」吗？\n所有成员将被踢出，无法恢复。",
