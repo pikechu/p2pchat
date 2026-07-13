@@ -495,34 +495,67 @@ class ChatServer:
                 if scope_type not in {"room", "dm"} or not scope_id:
                     continue
                 if scope_type == "dm" and requester:
-                    rows = db.execute(
-                        """
-                        SELECT * FROM messages
-                        WHERE scope_type = ?
-                          AND scope_id = ?
-                          AND id > ?
-                          AND deleted_at IS NULL
-                          AND (expires_at IS NULL OR expires_at > ?)
-                          AND (sender_name = ? OR recipient_name = ?)
-                        ORDER BY id ASC
-                        LIMIT ?
-                        """,
-                        (scope_type, scope_id, after, now_i, requester, requester, limit_i - len(out)),
-                    ).fetchall()
+                    if after <= 0:
+                        rows = db.execute(
+                            """
+                            SELECT * FROM (
+                              SELECT * FROM messages
+                              WHERE scope_type = ?
+                                AND scope_id = ?
+                                AND deleted_at IS NULL
+                                AND (expires_at IS NULL OR expires_at > ?)
+                                AND (sender_name = ? OR recipient_name = ?)
+                              ORDER BY id DESC
+                              LIMIT ?
+                            ) ORDER BY id ASC
+                            """,
+                            (scope_type, scope_id, now_i, requester, requester, limit_i - len(out)),
+                        ).fetchall()
+                    else:
+                        rows = db.execute(
+                            """
+                            SELECT * FROM messages
+                            WHERE scope_type = ?
+                              AND scope_id = ?
+                              AND id > ?
+                              AND deleted_at IS NULL
+                              AND (expires_at IS NULL OR expires_at > ?)
+                              AND (sender_name = ? OR recipient_name = ?)
+                            ORDER BY id ASC
+                            LIMIT ?
+                            """,
+                            (scope_type, scope_id, after, now_i, requester, requester, limit_i - len(out)),
+                        ).fetchall()
                 else:
-                    rows = db.execute(
-                        """
-                        SELECT * FROM messages
-                        WHERE scope_type = ?
-                          AND scope_id = ?
-                          AND id > ?
-                          AND deleted_at IS NULL
-                          AND (expires_at IS NULL OR expires_at > ?)
-                        ORDER BY id ASC
-                        LIMIT ?
-                        """,
-                        (scope_type, scope_id, after, now_i, limit_i - len(out)),
-                    ).fetchall()
+                    if after <= 0:
+                        rows = db.execute(
+                            """
+                            SELECT * FROM (
+                              SELECT * FROM messages
+                              WHERE scope_type = ?
+                                AND scope_id = ?
+                                AND deleted_at IS NULL
+                                AND (expires_at IS NULL OR expires_at > ?)
+                              ORDER BY id DESC
+                              LIMIT ?
+                            ) ORDER BY id ASC
+                            """,
+                            (scope_type, scope_id, now_i, limit_i - len(out)),
+                        ).fetchall()
+                    else:
+                        rows = db.execute(
+                            """
+                            SELECT * FROM messages
+                            WHERE scope_type = ?
+                              AND scope_id = ?
+                              AND id > ?
+                              AND deleted_at IS NULL
+                              AND (expires_at IS NULL OR expires_at > ?)
+                            ORDER BY id ASC
+                            LIMIT ?
+                            """,
+                            (scope_type, scope_id, after, now_i, limit_i - len(out)),
+                        ).fetchall()
                 for row in rows:
                     try:
                         crypto_meta = json.loads(row["crypto_meta"] or "{}")

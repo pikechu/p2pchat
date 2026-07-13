@@ -1576,6 +1576,7 @@ class MainWindow(QMainWindow):
         # client_mid (local int) → BubbleWidget, moved to seq key after SEND_ACK
         self._pending_bubbles: dict[int, BubbleWidget] = {}
         self._seq_bubbles:     dict[int, BubbleWidget] = {}
+        self._displayed_message_ids: set[str] = set()
         self._msg_counter = 0
 
         # DM state: "@peer" → peer username
@@ -1947,6 +1948,11 @@ class MainWindow(QMainWindow):
             rid       = payload.get("room_id", self._chat.current_room_id or "")
             seq       = payload.get("seq", 0)
             reply_to  = payload.get("reply_to")
+            message_id = payload.get("message_id", 0)
+            message_key = self._displayed_message_key("room", rid, message_id)
+            if message_key and message_key in self._displayed_message_ids:
+                self._update_message_offset("room", rid, message_id)
+                return
 
             # Decrypt if needed
             if encrypted:
@@ -1968,13 +1974,17 @@ class MainWindow(QMainWindow):
             if active:
                 self._chat.add_message(sender, text, ts, outgoing=False,
                                        seq=seq, quote=reply_to)
-                self._update_message_offset("room", rid, payload.get("message_id", 0))
+                if message_key:
+                    self._displayed_message_ids.add(message_key)
+                self._update_message_offset("room", rid, message_id)
                 # Received while room is visible → mark as read
                 if seq and self._bridge:
                     self._bridge.send_frame(T.MSG_ACK, seq=seq, status="read")
             else:
                 self._conv.set_preview(rid, f"{sender}: {text}", ts)
-                self._update_message_offset("room", rid, payload.get("message_id", 0))
+                if message_key:
+                    self._displayed_message_ids.add(message_key)
+                self._update_message_offset("room", rid, message_id)
                 # Delivered but not yet read
                 if seq and self._bridge:
                     self._bridge.send_frame(T.MSG_ACK, seq=seq, status="delivered")
@@ -2058,6 +2068,13 @@ class MainWindow(QMainWindow):
             # Server confirmed our message was received and assigned a seq
             client_mid = payload.get("client_mid", -1)
             seq        = payload.get("seq", 0)
+            message_key = self._displayed_message_key(
+                payload.get("scope_type", "room"),
+                payload.get("scope_id", self._server_room_id),
+                payload.get("message_id", 0),
+            )
+            if message_key:
+                self._displayed_message_ids.add(message_key)
             self._update_message_offset(
                 payload.get("scope_type", "room"),
                 payload.get("scope_id", self._server_room_id),
@@ -3512,6 +3529,12 @@ class MainWindow(QMainWindow):
     def _offset_key(self, scope_type: str, scope_id: str) -> str:
         return f"{scope_type}:{scope_id}"
 
+    def _displayed_message_key(self, scope_type: str, scope_id: str, message_id) -> str:
+        mid = int(message_id or 0)
+        if mid <= 0 or not scope_id:
+            return ""
+        return f"{scope_type}:{scope_id}:{mid}"
+
     def _load_message_offsets(self) -> dict[str, int]:
         try:
             data = json.loads(self._STATE_FILE.read_text(encoding="utf-8"))
@@ -3558,7 +3581,7 @@ class MainWindow(QMainWindow):
             scopes=[{
                 "scope_type": "room",
                 "scope_id": room_id,
-                "after_message_id": self._message_offsets.get(self._offset_key("room", room_id), 0),
+                "after_message_id": 0,
             }],
             limit=200,
         )

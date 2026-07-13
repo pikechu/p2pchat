@@ -48,6 +48,10 @@ def expected_executable_path(platform: str | None = None) -> pathlib.Path:
     return DIST / f"{APP_NAME}{suffix}"
 
 
+def pyinstaller_dist_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("BEAM_PYINSTALLER_DIST_DIR") or DIST)
+
+
 def default_artifact_copy_dir(platform: str | None = None) -> pathlib.Path:
     platform_name = platform or sys.platform
     if platform_name.startswith("win"):
@@ -186,10 +190,13 @@ def build(debug: bool = False, config: dict | None = None):
     icon_ico = ROOT / "assets" / "icon.ico"
     icon_png = ROOT / "assets" / "icon.png"
 
+    build_dist = pyinstaller_dist_dir()
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         f"--name={APP_NAME}",
+        f"--distpath={build_dist}",
     ]
 
     if not debug:
@@ -216,8 +223,16 @@ def build(debug: bool = False, config: dict | None = None):
     _run(cmd, cwd=ROOT)
     elapsed = time.time() - t0
 
-    exe = expected_executable_path()
-    if exe.exists():
+    built_exe = build_dist / expected_executable_path().name
+    if built_exe.exists():
+        exe = expected_executable_path()
+        if built_exe.resolve() != exe.resolve():
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(built_exe, exe)
+            except PermissionError as exc:
+                print(f"WARN: cannot update {exe}: {exc}")
+                exe = built_exe
         mb = exe.stat().st_size / 1024 / 1024
         print(f"\nOK: {exe.name}   {mb:.0f} MB   built in {elapsed:.0f}s")
         print(f"    {exe}\n")

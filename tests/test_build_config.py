@@ -9,6 +9,7 @@ from build import (
     default_artifact_copy_dir,
     expected_executable_path,
     load_build_config,
+    pyinstaller_dist_dir,
     write_client_build_config,
 )
 from gui_client import load_default_server_url
@@ -45,6 +46,13 @@ def test_build_output_path_uses_platform_extension():
 def test_default_artifact_copy_dir_matches_beam_build():
     assert default_artifact_copy_dir("win32").as_posix() == "F:/beam-build"
     assert default_artifact_copy_dir("linux").as_posix() == "/mnt/f/beam-build"
+
+
+def test_pyinstaller_dist_dir_can_use_environment(tmp_path, monkeypatch):
+    custom_dist = tmp_path / "dist-out"
+    monkeypatch.setenv("BEAM_PYINSTALLER_DIST_DIR", str(custom_dist))
+
+    assert pyinstaller_dist_dir() == custom_dist
 
 
 def test_copy_build_artifact_copies_only_exe(tmp_path):

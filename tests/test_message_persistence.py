@@ -228,6 +228,30 @@ def test_expired_messages_are_not_synced(tmp_path):
     assert [m["client_msg_id"] for m in messages] == ["fresh"]
 
 
+def test_initial_room_history_sync_returns_latest_limited_messages(tmp_path):
+    server = ChatServer(message_db_path=tmp_path / "beam.db", min_message_ttl_seconds=1)
+    for index in range(3):
+        server._store_encrypted_message(
+            scope_type="room",
+            scope_id="ROOM01",
+            sender_name="alice",
+            client_msg_id=f"m{index}",
+            msg_type="text",
+            ciphertext=f"cipher-{index}",
+            crypto_meta={},
+            ttl_seconds=1000,
+            now=100 + index,
+        )
+
+    messages = server._load_messages_for_sync(
+        [{"scope_type": "room", "scope_id": "ROOM01", "after_message_id": 0}],
+        limit=2,
+        now=200,
+    )
+
+    assert [m["client_msg_id"] for m in messages] == ["m1", "m2"]
+
+
 def test_dm_sync_only_returns_messages_for_requester(tmp_path):
     server = ChatServer(message_db_path=tmp_path / "beam.db")
     dm_id = server._dm_scope_id("alice", "bob")

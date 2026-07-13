@@ -36,6 +36,7 @@ def _make_window_stub():
     window._bridge.send_frame = MagicMock(return_value=True)
     window._username = "me"
     window._dm_peers = set()
+    window._displayed_message_ids = set()
     window._rooms = {}
     window._reconnect_room_id = ""
     window._server_room_id = ""
@@ -166,6 +167,65 @@ def test_gui_syncs_known_dm_peers(app):
         scopes=[{"scope_type": "dm", "scope_id": "scope-alice-bob", "after_message_id": 9}],
         limit=200,
     )
+
+
+def test_gui_room_sync_requests_history_from_start(app):
+    window = _make_window_stub()
+    window._message_offsets = {"room:ROOM01": 42}
+
+    MainWindow._sync_room_messages(window, "ROOM01")
+
+    window._bridge.send_frame.assert_called_once_with(
+        T.SYNC_MESSAGES,
+        scopes=[{"scope_type": "room", "scope_id": "ROOM01", "after_message_id": 0}],
+        limit=200,
+    )
+
+
+def test_gui_skips_duplicate_room_history_messages(app):
+    window = _make_window_stub()
+    window._rooms = {
+        "ROOM01": {
+            "password": "",
+            "salt": "",
+        }
+    }
+    window._chat.current_room_id = "ROOM01"
+    window._displayed_message_ids = {"room:ROOM01:9"}
+
+    MainWindow._dispatch_frame(
+        window,
+        T.NEW_MSG,
+        {"sender": "alice", "text": "重复消息", "room_id": "ROOM01", "message_id": 9},
+        1234,
+    )
+
+    window._chat.add_message.assert_not_called()
+    window._update_message_offset.assert_called_once_with("room", "ROOM01", 9)
+
+
+def test_gui_marks_own_ack_as_displayed_to_skip_history_echo(app):
+    window = _make_window_stub()
+    bubble = MagicMock()
+    window._pending_bubbles = {77: bubble}
+    window._seq_bubbles = {}
+    window._server_room_id = "ROOM01"
+
+    MainWindow._dispatch_frame(
+        window,
+        T.SEND_ACK,
+        {"client_mid": 77, "seq": 3, "scope_type": "room", "scope_id": "ROOM01", "message_id": 12},
+        0,
+    )
+
+    assert "room:ROOM01:12" in window._displayed_message_ids
+    MainWindow._dispatch_frame(
+        window,
+        T.NEW_MSG,
+        {"sender": "me", "text": "自己发过的消息", "room_id": "ROOM01", "message_id": 12},
+        1234,
+    )
+    window._chat.add_message.assert_not_called()
 
 
 def test_message_ttl_button_sends_room_setting(app):
