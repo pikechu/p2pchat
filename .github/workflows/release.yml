@@ -1,13 +1,18 @@
-name: Build & Release
+name: 构建并发布
 
-# Trigger: push a tag like  git tag v1.0.1 && git push origin v1.0.1
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "要构建并发布的版本 tag，例如 v1.2.0"
+        required: true
+        type: string
 
 permissions:
-  contents: write   # needed to create GitHub releases
+  contents: write
 
 jobs:
   build:
@@ -15,36 +20,73 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version_tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: 解析发布版本
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.version_tag }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "版本 tag 必须匹配 v数字.数字.数字，当前值：$tag"
+          }
+          "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "RELEASE_VERSION=$($tag.TrimStart('v'))" >> $env:GITHUB_ENV
+
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
 
-      - name: Write version.py from tag
+      - name: 写入版本文件
         shell: python
         run: |
           import os, re
-          tag = os.environ["GITHUB_REF_NAME"]          # e.g. "v1.0.1"
+          tag = os.environ["RELEASE_TAG"]
           ver = tag.lstrip("v")
           with open("version.py", "w") as f:
               f.write(f'__version__ = "{ver}"\n')
 
-      - name: Build EXE
-        run: python build.py
+      - name: 构建 EXE
+        shell: pwsh
+        run: |
+          $env:BEAM_BUILD_DIR = Join-Path $env:RUNNER_TEMP "beam-build"
+          python build.py
 
-      - name: Create GitHub Release and upload EXE
+      - name: 检查构建产物
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/BeamChat.exe")) {
+            throw "未找到 dist/BeamChat.exe"
+          }
+          Get-Item "dist/BeamChat.exe" | Format-List FullName,Length,LastWriteTime
+
+      - name: 保存 Actions 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeamChat-${{ env.RELEASE_TAG }}
+          path: dist/BeamChat.exe
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release 并上传 EXE
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: BeamChat ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: BeamChat ${{ env.RELEASE_TAG }}
           draft: false
           prerelease: false
+          make_latest: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
           files: dist/BeamChat.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
