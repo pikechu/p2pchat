@@ -969,6 +969,56 @@ class ChatServer:
         await self._evict(username)
         await self._send(ws, T.ROOM_LEFT)
 
+    async def _rename_ready_user(self, old_name: str, new_name: str, ws) -> None:
+        """同步已就绪连接改名后依赖用户名索引的内存状态。"""
+        if old_name == new_name:
+            return
+
+        self._ws_to_name[ws] = new_name
+        self._name_to_ws.pop(old_name, None)
+        self._name_to_ws[new_name] = ws
+
+        if old_name in self._public_key_directory:
+            self._public_key_directory[new_name] = self._public_key_directory.pop(old_name)
+        if old_name in self._user_avatar:
+            self._user_avatar[new_name] = self._user_avatar.pop(old_name)
+
+        room_id = self._user_room.pop(old_name, None)
+        if room_id:
+            self._user_room[new_name] = room_id
+            room = self._rooms.get(room_id)
+            if room is not None:
+                was_member = old_name in room.members
+                if old_name in room.members:
+                    room.members.pop(old_name, None)
+                    room.members[new_name] = ws
+                if room.creator == old_name:
+                    room.creator = new_name
+                    self._save_rooms()
+                if was_member:
+                    await self._broadcast(room, T.USER_LEFT, exclude=new_name,
+                                          username=old_name, room_id=room_id)
+                    await self._broadcast(room, T.USER_JOINED, exclude=new_name,
+                                          username=new_name, room_id=room_id)
+
+        for room_senders in self._seq_to_sender.values():
+            for seq, sender in list(room_senders.items()):
+                if sender == old_name:
+                    room_senders[seq] = new_name
+
+        for meta in self._transfer_meta.values():
+            if meta.get("from_user") == old_name:
+                meta["from_user"] = new_name
+            pending = meta.get("pending_receivers")
+            if pending and old_name in pending:
+                pending.discard(old_name)
+                pending.add(new_name)
+        for meta in self._direct_transfer_meta.values():
+            if meta.get("from_user") == old_name:
+                meta["from_user"] = new_name
+            if meta.get("to_user") == old_name:
+                meta["to_user"] = new_name
+
     @staticmethod
     def _valid_key_bundle_format(bundle) -> bool:
         """只检查公开密钥包的编码与长度，不在服务端验证身份签名。"""
@@ -1040,7 +1090,7 @@ class ChatServer:
 
                 # ── SET_NAME ─────────────────────────────────────────────────
                 if mtype == T.SET_NAME:
-                    if state != "IDENTIFYING":
+                    if state not in ("IDENTIFYING", "READY"):
                         await self._handshake_error(ws, "HANDSHAKE_NOT_READY", "请先完成 CLIENT_HELLO")
                         continue
                     name = str(payload.get("name", "")).strip()[:32]
@@ -1057,12 +1107,13 @@ class ChatServer:
                         await self._evict(name)
                         self._ws_to_name.pop(old_ws, None)
                         self._name_to_ws.pop(name, None)
-                    # release old name
-                    if username and username in self._name_to_ws:
-                        del self._name_to_ws[username]
+                    old_username = username
                     username = name
-                    self._ws_to_name[ws] = username
-                    self._name_to_ws[username] = ws
+                    if old_username:
+                        await self._rename_ready_user(old_username, username, ws)
+                    else:
+                        self._ws_to_name[ws] = username
+                        self._name_to_ws[username] = ws
                     self._public_key_directory[username] = key_bundle
                     state = "READY"
                     await self._send(ws, T.READY, name=username)

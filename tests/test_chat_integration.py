@@ -168,6 +168,47 @@ def test_duplicate_name_takes_over_existing_connection(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
+def test_set_name_after_ready_renames_online_user_and_room_member(server_port, event_loop):
+    async def run():
+        ws = await _connect(server_port, "rename_old")
+        room_id = (await _create_room(ws, "Rename Room"))["payload"]["room_id"]
+        observer = await _connect(server_port, "rename_observer")
+        await _join_room(observer, room_id)
+        joined = await _recv(observer)
+        assert joined["type"] == T.ROOM_JOINED
+        assert "rename_old" in joined["payload"]["members"]
+        assert (await _recv(ws))["type"] == T.USER_JOINED
+
+        await ws.send(pack(T.SET_NAME, name="rename_new"))
+        frame = await _recv(ws)
+        assert frame["type"] == T.READY
+        assert frame["payload"]["name"] == "rename_new"
+        left = await _recv(observer)
+        assert left["type"] == T.USER_LEFT
+        assert left["payload"]["username"] == "rename_old"
+        joined = await _recv(observer)
+        assert joined["type"] == T.USER_JOINED
+        assert joined["payload"]["username"] == "rename_new"
+
+        await ws.send(pack(T.LIST_USERS))
+        users = (await _recv(ws))["payload"]["users"]
+        assert "rename_new" in users
+        assert "rename_old" not in users
+
+        newcomer = await _connect(server_port, "rename_newcomer")
+        await _join_room(newcomer, room_id)
+        newcomer_joined = await _recv(newcomer)
+        assert newcomer_joined["type"] == T.ROOM_JOINED
+        assert "rename_new" in newcomer_joined["payload"]["members"]
+        assert "rename_old" not in newcomer_joined["payload"]["members"]
+
+        await ws.close()
+        await observer.close()
+        await newcomer.close()
+
+    event_loop.run_until_complete(run())
+
+
 # ── CREATE_ROOM ───────────────────────────────────────────────────────────────
 
 def test_create_room_returns_room_id(server_port, event_loop):
