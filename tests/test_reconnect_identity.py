@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QMenu
 
 from crypto import create_room_access_metadata
 from gui.popups import popup_above_global_pos
-from gui.window import MainWindow, RoomSearchDialog, TTLMenuButton
+from gui.window import ConvPanel, MainWindow, RoomSearchDialog, TTLMenuButton
 from protocol import T, TTL_VALUES
 from secure_session import SecureSessionError, SessionState
 
@@ -187,6 +187,33 @@ def test_encrypted_dm_uses_dm_decrypt_path_without_room_fallback(app):
     assert "alice" in window._dm_peers
 
 
+def test_inactive_dm_message_increments_unread_and_updates_preview(app):
+    window = _make_window_stub()
+    window._username = "bob"
+    window._dms = {"@alice": "alice"}
+    window._dm_peers = set()
+    window._chat.current_room_id = "ROOM01"
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.decrypt_dm.return_value = "私聊明文"
+
+    MainWindow._show_decrypted_dm(
+        window,
+        {
+            "scope_type": "dm",
+            "scope_id": "dm-scope",
+            "sender_name": "alice",
+            "recipient_name": "bob",
+            "message_id": 9,
+            "created_at": 1234,
+        },
+        1234,
+    )
+
+    window._chat.add_message.assert_not_called()
+    window._conv.set_preview.assert_called_once_with("@alice", "alice: 私聊明文", 1234.0)
+    window._conv.increment_unread.assert_called_once_with("@alice")
+
+
 def test_gui_syncs_known_dm_peers(app):
     window = _make_window_stub()
     window._dm_peers = {"bob"}
@@ -237,6 +264,38 @@ def test_gui_skips_duplicate_room_history_messages(app):
 
     window._chat.add_message.assert_not_called()
     window._update_message_offset.assert_called_once_with("room", "ROOM01", 9)
+
+
+def test_inactive_room_message_increments_unread(app):
+    window = _make_window_stub()
+    window._chat.current_room_id = "ROOM01"
+
+    MainWindow._dispatch_frame(
+        window,
+        T.NEW_MSG,
+        {"sender": "alice", "text": "新消息", "room_id": "ROOM02", "message_id": 10},
+        1234,
+    )
+
+    window._chat.add_message.assert_not_called()
+    window._conv.set_preview.assert_called_once_with("ROOM02", "alice: 新消息", 1234)
+    window._conv.increment_unread.assert_called_once_with("ROOM02")
+
+
+def test_active_room_message_updates_preview_without_unread(app):
+    window = _make_window_stub()
+    window._chat.current_room_id = "ROOM01"
+
+    MainWindow._dispatch_frame(
+        window,
+        T.NEW_MSG,
+        {"sender": "alice", "text": "当前消息", "room_id": "ROOM01", "message_id": 10},
+        1234,
+    )
+
+    window._chat.add_message.assert_called_once()
+    window._conv.set_preview.assert_called_once_with("ROOM01", "alice: 当前消息", 1234)
+    window._conv.increment_unread.assert_not_called()
 
 
 def test_gui_marks_own_ack_as_displayed_to_skip_history_echo(app):
@@ -311,6 +370,23 @@ def test_ttl_menu_button_values_and_current_item(app, monkeypatch):
     assert [action.text() for action in actions] == ["一天", "一周", "一个月", "一年", "永久"]
     assert [action.isChecked() for action in actions] == [False, False, True, False, False]
     assert "一个月" in button.toolTip()
+
+
+def test_conversation_unread_badge_and_activity_moves_row_to_top(app):
+    panel = ConvPanel()
+    panel.upsert_room("ROOM01", "一号房", "alice", 1, False)
+    panel.upsert_room("ROOM02", "二号房", "bob", 1, False)
+
+    panel.increment_unread("ROOM01")
+
+    assert panel._unread["ROOM01"] == 1
+    assert panel._rows["ROOM01"]._unread_badge.text() == "1"
+    assert panel._list_lay.itemAt(0).widget() is panel._rows["ROOM01"]
+
+    panel.set_active("ROOM01")
+
+    assert panel._unread["ROOM01"] == 0
+    assert panel._rows["ROOM01"]._unread_badge.isVisible() is False
 
 
 def test_ttl_menu_button_opens_above_button(app, monkeypatch):

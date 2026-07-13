@@ -424,12 +424,13 @@ class ConvPanel(QWidget):
                     unread: int = 0):
         if room_id in self._rows:
             self._rows[room_id].set_members(members)
+            self._move_row_to_top(room_id)
             return
         row = ConvRowWidget(room_id, name, creator, members, locked, unread,
                             self._theme, conn_state="ok")
         row.clicked.connect(self._on_row_clicked)
         row.right_clicked.connect(self.room_right_clicked)
-        self._list_lay.insertWidget(self._list_lay.count() - 1, row)
+        self._list_lay.insertWidget(0, row)
         self._rows[room_id] = row
 
     def update_members(self, room_id: str, count: int):
@@ -460,12 +461,14 @@ class ConvPanel(QWidget):
     def set_preview(self, room_id: str, text: str, ts: float = 0):
         if row := self._rows.get(room_id):
             row.set_preview(text, ts)
+            self._move_row_to_top(room_id)
 
     def increment_unread(self, room_id: str, amount: int = 1):
         count = self._unread.get(room_id, 0) + amount
         self._unread[room_id] = count
         if row := self._rows.get(room_id):
             row.set_unread(count)
+            self._move_row_to_top(room_id)
 
     def set_conn_state(self, room_id: str, state: str):
         if row := self._rows.get(room_id):
@@ -474,6 +477,13 @@ class ConvPanel(QWidget):
     def _on_row_clicked(self, room_id: str):
         self.set_active(room_id)
         self.room_selected.emit(room_id)
+
+    def _move_row_to_top(self, room_id: str):
+        row = self._rows.get(room_id)
+        if row is None:
+            return
+        self._list_lay.removeWidget(row)
+        self._list_lay.insertWidget(0, row)
 
     def _filter(self, query: str):
         q = query.lower()
@@ -1979,6 +1989,7 @@ class MainWindow(QMainWindow):
             if active:
                 self._chat.add_message(sender, text, ts, outgoing=False,
                                        seq=seq, quote=reply_to)
+                self._conv.set_preview(rid, f"{sender}: {text}", ts)
                 if message_key:
                     self._displayed_message_ids.add(message_key)
                 self._update_message_offset("room", rid, message_id)
@@ -1987,6 +1998,7 @@ class MainWindow(QMainWindow):
                     self._bridge.send_frame(T.MSG_ACK, seq=seq, status="read")
             else:
                 self._conv.set_preview(rid, f"{sender}: {text}", ts)
+                self._conv.increment_unread(rid)
                 if message_key:
                     self._displayed_message_ids.add(message_key)
                 self._update_message_offset("room", rid, message_id)
@@ -2301,8 +2313,10 @@ class MainWindow(QMainWindow):
         message_time = float(payload.get("created_at", ts))
         if self._chat.current_room_id == dm_id:
             self._chat.add_message(peer, text, message_time, outgoing=False)
+            self._conv.set_preview(dm_id, f"{peer}: {text}", message_time)
         else:
             self._conv.set_preview(dm_id, f"{peer}: {text}", message_time)
+            self._conv.increment_unread(dm_id)
         self._update_message_offset("dm", payload.get("scope_id", ""), payload.get("message_id", 0))
         if not self.isActiveWindow():
             QApplication.alert(self, 0)
