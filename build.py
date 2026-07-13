@@ -41,6 +41,31 @@ DEFAULT_CLIENT_CONFIG = {
     "rooms_persist_when_empty": True,
 }
 
+
+def expected_executable_path(platform: str | None = None) -> pathlib.Path:
+    platform_name = platform or sys.platform
+    suffix = ".exe" if platform_name.startswith("win") else ""
+    return DIST / f"{APP_NAME}{suffix}"
+
+
+def default_artifact_copy_dir(platform: str | None = None) -> pathlib.Path:
+    platform_name = platform or sys.platform
+    if platform_name.startswith("win"):
+        return pathlib.Path("F:/beam-build")
+    return pathlib.Path("/mnt/f/beam-build")
+
+
+def copy_build_artifact(exe: pathlib.Path, target_dir: pathlib.Path | None = None) -> pathlib.Path | None:
+    if exe.suffix.lower() != ".exe":
+        return None
+    target_root = pathlib.Path(
+        os.environ.get("BEAM_BUILD_DIR") or target_dir or default_artifact_copy_dir()
+    )
+    target_root.mkdir(parents=True, exist_ok=True)
+    target = target_root / exe.name
+    shutil.copy2(exe, target)
+    return target
+
 # Qt modules we actually import (checked via grep on the codebase)
 # Do NOT add --collect-all=PyQt6 — that pulls in WebEngine/3D/QML (~150 MB wasted)
 HIDDEN_IMPORTS = [
@@ -191,11 +216,14 @@ def build(debug: bool = False, config: dict | None = None):
     _run(cmd, cwd=ROOT)
     elapsed = time.time() - t0
 
-    exe = DIST / f"{APP_NAME}.exe"
+    exe = expected_executable_path()
     if exe.exists():
         mb = exe.stat().st_size / 1024 / 1024
         print(f"\nOK: {exe.name}   {mb:.0f} MB   built in {elapsed:.0f}s")
         print(f"    {exe}\n")
+        copied = copy_build_artifact(exe)
+        if copied is not None:
+            print(f"Copied: {copied}")
         if debug:
             print("Debug build: run the exe from a terminal to see crash output.")
     else:
