@@ -1563,6 +1563,7 @@ class MainWindow(QMainWindow):
             self._username,
         )
         self._pending_dms: dict[str, list[tuple[str, int]]] = {}
+        self._pending_key_requests: set[str] = set()
 
         # Room state: room_id → {name, members, locked, key}
         self._rooms: dict[str, dict] = {}
@@ -1834,6 +1835,9 @@ class MainWindow(QMainWindow):
                 self._webrtc_supported = False
                 self._fallback_all_webrtc_files("server-unsupported")
                 return
+            if payload.get("code") == "PEER_KEY_UNAVAILABLE":
+                self._on_peer_key_unavailable(payload)
+                return
             pending_room = "__pending__" in self._rooms
             if pending_room:
                 _log.error("CREATE_ROOM error: %s", msg)
@@ -2097,15 +2101,16 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.PEER_KEY_BUNDLE:
             peer = str(payload.get("name", ""))
+            self._pending_key_requests.discard(peer)
             try:
                 state = self._secure_sessions.cache_peer_bundle(peer, payload.get("key_bundle", {}))
             except SecureSessionError:
-                QMessageBox.warning(self, "加密私聊", "加密私聊密钥不可用")
-                self._pending_dms.pop(peer, None)
+                self._fail_pending_dm(peer)
+                QMessageBox.warning(self, "加密私聊", "对端安全密钥无效，无法建立加密私聊。")
                 return
             if state is SessionState.FROZEN:
                 change = self._secure_sessions.identity_change(peer)
-                detail = "加密私聊密钥不可用"
+                detail = "对端身份密钥已变化。"
                 if change is not None:
                     detail = f"对端身份密钥已变化。\n旧指纹：{change.old_fingerprint}\n新指纹：{change.new_fingerprint}"
                 answer = QMessageBox.question(
@@ -2116,16 +2121,19 @@ class MainWindow(QMainWindow):
                     self._secure_sessions.accept_peer(peer)
                 else:
                     self._secure_sessions.reject_peer(peer)
-                    self._pending_dms.pop(peer, None)
+                    self._fail_pending_dm(peer)
                     return
             for text, client_mid in self._pending_dms.pop(peer, []):
                 try:
                     self._bridge.send_frame(T.SEND_ENCRYPTED_MSG, **self._secure_sessions.encrypt_dm(peer, text, str(client_mid)))
                 except SecureSessionError:
-                    QMessageBox.warning(self, "加密私聊", "加密私聊密钥不可用")
+                    bubble = self._pending_bubbles.pop(client_mid, None)
+                    if bubble is not None:
+                        bubble.set_status("failed")
+                    QMessageBox.warning(self, "加密私聊", "无法加密这条私聊消息，请重新打开私聊后再试。")
 
         elif mtype == T.RECV_DM:
-            QMessageBox.warning(self, "加密私聊", "加密私聊密钥不可用")
+            QMessageBox.warning(self, "加密私聊", "收到旧版私聊消息，当前版本只显示端到端加密私聊。")
 
         elif mtype == T.DM_ACK:
             client_mid = payload.get("client_mid", -1)
@@ -2251,6 +2259,29 @@ class MainWindow(QMainWindow):
         elif mtype == T.USER_AVATAR:
             self._on_user_avatar(payload)
 
+    def _on_peer_key_unavailable(self, payload: dict):
+        """处理私聊密钥请求失败，并清理本地待发送队列。"""
+        peer = str(payload.get("name") or payload.get("peer") or payload.get("to") or "").strip()
+        if not peer and len(self._pending_key_requests) == 1:
+            peer = next(iter(self._pending_key_requests))
+        if peer:
+            self._pending_key_requests.discard(peer)
+            self._fail_pending_dm(peer)
+        _log.warning("peer key unavailable: %s", peer or "<unknown>")
+        QMessageBox.warning(
+            self,
+            "加密私聊",
+            "对方不在线或还没有完成安全握手，无法建立加密私聊。请确认对方在线后重试。",
+        )
+
+    def _fail_pending_dm(self, peer: str):
+        """把指定对端的待发送私聊标记为失败。"""
+        pending = self._pending_dms.pop(peer, [])
+        for _text, client_mid in pending:
+            bubble = self._pending_bubbles.pop(client_mid, None)
+            if bubble is not None:
+                bubble.set_status("failed")
+
     def _show_decrypted_dm(self, payload: dict, ts: float):
         """解密私聊帧；失败时只显示固定错误，不显示密文或房间提示。"""
         sender = str(payload.get("sender_name") or payload.get("from") or "")
@@ -2259,7 +2290,7 @@ class MainWindow(QMainWindow):
         try:
             text = self._secure_sessions.decrypt_dm(payload)
         except SecureSessionError:
-            QMessageBox.warning(self, "加密私聊", "加密私聊密钥不可用")
+            QMessageBox.warning(self, "加密私聊", "无法解密这条私聊消息。请确认双方都在线并使用最新版本后重新发送。")
             return
         self._dm_peers.add(peer)
         self._save_message_offsets()
@@ -3349,6 +3380,7 @@ class MainWindow(QMainWindow):
             self._dm_peers.add(peer)
             self._save_message_offsets()
             self._pending_dms.setdefault(peer, []).append((text, client_mid))
+            self._pending_key_requests.add(peer)
             self._bridge.send_frame(T.GET_PEER_KEY, name=peer)
             bubble = self._chat.add_message(
                 self._username, text, time.time(), outgoing=True, seq=0)

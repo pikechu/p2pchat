@@ -1127,7 +1127,14 @@ class ChatServer:
                     peer_name = str(payload.get("name", "")).strip()[:32]
                     peer_bundle = self._public_key_directory.get(peer_name)
                     if peer_bundle is None:
-                        await self._send(ws, T.ERROR, code="PEER_KEY_UNAVAILABLE", message="对端不在线或无公开密钥包", recoverable=True)
+                        await self._send(
+                            ws,
+                            T.ERROR,
+                            code="PEER_KEY_UNAVAILABLE",
+                            name=peer_name,
+                            message="对端不在线或无公开密钥包",
+                            recoverable=True,
+                        )
                         continue
                     await self._send(ws, T.PEER_KEY_BUNDLE, name=peer_name, key_bundle=peer_bundle)
 

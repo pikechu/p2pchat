@@ -119,6 +119,7 @@ def test_peer_key_directory_removes_disconnected_user(event_loop):
         frame = unpack(await alice.recv())
         assert frame["type"] == T.ERROR
         assert frame["payload"]["code"] == "PEER_KEY_UNAVAILABLE"
+        assert frame["payload"]["name"] == "bob"
         await alice.close()
     event_loop.run_until_complete(_with_server(test))
 

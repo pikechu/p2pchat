@@ -50,6 +50,9 @@ def _make_window_stub():
     window._send_avatar = MagicMock()
     window._save_message_offsets = MagicMock()
     window._update_message_offset = MagicMock()
+    window._pending_dms = {}
+    window._pending_key_requests = set()
+    window._pending_bubbles = {}
     window.isActiveWindow = MagicMock(return_value=True)
     window.isVisible = MagicMock(return_value=True)
     window._webrtc_file_pending = {}
@@ -124,7 +127,37 @@ def test_encrypted_dm_decrypt_failure_shows_key_unavailable(app):
     with patch.object(QMessageBox, "warning") as warning:
         MainWindow._show_decrypted_dm(window, {"sender_name": "alice"}, 0.0)
 
-    warning.assert_called_once_with(window, "加密私聊", "加密私聊密钥不可用")
+    warning.assert_called_once()
+    assert "无法解密这条私聊消息" in warning.call_args.args[2]
+    assert "加密私聊密钥不可用" not in warning.call_args.args[2]
+
+
+def test_peer_key_unavailable_clears_pending_dm_and_shows_actionable_prompt(app):
+    window = _make_window_stub()
+    bubble = MagicMock()
+    window._pending_dms = {"alice": [("你好", 7)]}
+    window._pending_key_requests = {"alice"}
+    window._pending_bubbles = {7: bubble}
+
+    with patch.object(QMessageBox, "warning") as warning:
+        MainWindow._dispatch_frame(
+            window,
+            T.ERROR,
+            {
+                "code": "PEER_KEY_UNAVAILABLE",
+                "name": "alice",
+                "message": "对端不在线或无公开密钥包",
+            },
+            0.0,
+        )
+
+    assert "alice" not in window._pending_dms
+    assert "alice" not in window._pending_key_requests
+    assert 7 not in window._pending_bubbles
+    bubble.set_status.assert_called_once_with("failed")
+    warning.assert_called_once()
+    assert "对方不在线" in warning.call_args.args[2]
+    assert "加密私聊密钥不可用" not in warning.call_args.args[2]
 
 
 def test_encrypted_dm_uses_dm_decrypt_path_without_room_fallback(app):
