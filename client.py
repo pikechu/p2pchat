@@ -43,7 +43,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
+from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, TTL_VALUES, pack, unpack
 from crypto import (
     create_room_access_metadata,
     decode_room_envelope,
@@ -238,6 +238,7 @@ class ChatClient:
             ("/join <ROOM-ID> [passwd]",     "Join a room by its 6-char ID"),
             ("/leave",                        "Leave the current room"),
             ("/rooms",                        "List all active rooms"),
+            ("/ttl [@peer] [day|week|month|year|permanent]", "查询或设置消息过期时间"),
             ("/me",                           "Show your current status"),
             ("/log [N]",                      "Show last N lines of client.log (default 30)"),
             ("/help",                         "Show this help"),
@@ -249,7 +250,7 @@ class ChatClient:
         console.print(t)
 
     def _show_log(self, n: int = 30):
-        """Print last n lines of client.log to the terminal."""
+        """在终端显示 client.log 的最后 n 行。"""
         if not LOG_FILE.exists():
             _info("No log file yet.")
             return
@@ -264,6 +265,53 @@ class ChatClient:
         except Exception as exc:
             _err(f"Cannot read log file: {exc}")
             log.error("show_log failed: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _ttl_label(ttl_seconds: int) -> str:
+        labels = {
+            TTL_VALUES["day"]: "一天",
+            TTL_VALUES["week"]: "一周",
+            TTL_VALUES["month"]: "一个月",
+            TTL_VALUES["year"]: "一年",
+            TTL_VALUES["permanent"]: "永久",
+        }
+        return labels.get(int(ttl_seconds), f"{int(ttl_seconds)} 秒")
+
+    async def _send_ttl_command(self, args: list[str]):
+        if not self._username:
+            _err("请先设置用户名：/name <用户名>")
+            return
+        if not self._ready:
+            _err("连接尚未就绪，请稍后再试")
+            return
+        peer = ""
+        value_arg = ""
+        if args and args[0].startswith("@"):
+            peer = args[0][1:]
+            if not peer:
+                _err("用法：/ttl [@对端] [day|week|month|year|permanent]")
+                return
+            value_arg = args[1] if len(args) > 1 else ""
+        elif args and args[0] not in TTL_VALUES:
+            _err("用法：/ttl [@对端] [day|week|month|year|permanent]")
+            return
+        elif args:
+            value_arg = args[0]
+
+        if peer:
+            scope_type = "dm"
+            scope_id = self._secure_sessions.dm_scope_id(self._username or "", peer)
+            payload = {"scope_type": scope_type, "scope_id": scope_id, "to": peer}
+        else:
+            if not self._room_id:
+                _err("当前没有房间；单聊请使用 /ttl @对端 [档位]")
+                return
+            payload = {"scope_type": "room", "scope_id": self._room_id}
+
+        if value_arg:
+            await self._send(T.SET_MESSAGE_TTL, **payload, ttl_seconds=TTL_VALUES[value_arg])
+        else:
+            await self._send(T.GET_MESSAGE_TTL, **payload)
 
     # ── send ─────────────────────────────────────────────────────────────────
 
@@ -446,6 +494,11 @@ class ChatClient:
                         except SecureSessionError:
                             _err("加密私聊密钥不可用")
 
+            elif mtype == T.MESSAGE_TTL_UPDATED:
+                ttl = int(payload.get("ttl_seconds", 0))
+                scope_label = "房间" if payload.get("scope_type") == "room" else "私聊"
+                _sys(f"{scope_label}消息过期时间：{self._ttl_label(ttl)}")
+
             elif mtype == T.USER_TYPING:
                 uname  = payload.get("username", "")
                 typing = payload.get("typing", False)
@@ -549,6 +602,9 @@ class ChatClient:
             elif cmd == "log":
                 n = int(args[0]) if args and args[0].isdigit() else 30
                 self._show_log(n)
+
+            elif cmd == "ttl":
+                await self._send_ttl_command(args)
 
             elif cmd == "name":
                 if not args:

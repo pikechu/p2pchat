@@ -15,17 +15,16 @@ sounddevice_stub.InputStream = object
 sounddevice_stub.OutputStream = object
 sys.modules.setdefault("sounddevice", sounddevice_stub)
 
-from PyQt6.QtCore import QCoreApplication
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QMenu
 
-from gui.window import MainWindow
-from protocol import T
+from gui.window import MainWindow, TTLMenuButton
+from protocol import T, TTL_VALUES
 from secure_session import SecureSessionError, SessionState
 
 
 @pytest.fixture(scope="module")
 def app():
-    return QCoreApplication.instance() or QCoreApplication(sys.argv)
+    return QApplication.instance() or QApplication(sys.argv)
 
 
 def _make_window_stub():
@@ -44,6 +43,10 @@ def _make_window_stub():
     window._chat = MagicMock()
     window._files_panel = MagicMock()
     window._send_avatar = MagicMock()
+    window._save_message_offsets = MagicMock()
+    window._update_message_offset = MagicMock()
+    window.isActiveWindow = MagicMock(return_value=True)
+    window.isVisible = MagicMock(return_value=True)
     window._webrtc_file_pending = {}
     window._webrtc_transfer = MagicMock()
     window._webrtc_transfer.handle_offer = AsyncMock()
@@ -107,6 +110,33 @@ def test_encrypted_dm_decrypt_failure_shows_key_unavailable(app):
     warning.assert_called_once_with(window, "加密私聊", "加密私聊密钥不可用")
 
 
+def test_encrypted_dm_uses_dm_decrypt_path_without_room_fallback(app):
+    window = _make_window_stub()
+    window._username = "bob"
+    window._dms = {"@alice": "alice"}
+    window._dm_peers = set()
+    window._chat.current_room_id = "@alice"
+    window._secure_sessions = MagicMock()
+    window._secure_sessions.decrypt_dm.return_value = "私聊明文"
+
+    MainWindow._show_decrypted_dm(
+        window,
+        {
+            "scope_type": "dm",
+            "scope_id": "dm-scope",
+            "sender_name": "alice",
+            "recipient_name": "bob",
+            "message_id": 9,
+            "created_at": 1234,
+        },
+        1234,
+    )
+
+    window._secure_sessions.decrypt_dm.assert_called_once()
+    window._chat.add_message.assert_called_once_with("alice", "私聊明文", 1234.0, outgoing=False)
+    assert "alice" in window._dm_peers
+
+
 def test_gui_syncs_known_dm_peers(app):
     window = _make_window_stub()
     window._dm_peers = {"bob"}
@@ -154,6 +184,24 @@ def test_message_ttl_button_sends_dm_setting(app):
         to="bob",
         ttl_seconds=0,
     )
+
+
+def test_ttl_menu_button_values_and_current_item(app, monkeypatch):
+    button = TTLMenuButton()
+    button.set_policy("room", "ROOM01", TTL_VALUES["month"], True)
+    captured = {}
+
+    def fake_exec(menu, *_args, **_kwargs):
+        captured["actions"] = menu.actions()
+        return None
+
+    monkeypatch.setattr(QMenu, "exec", fake_exec)
+    button._open_menu()
+
+    actions = captured["actions"]
+    assert [action.text() for action in actions] == ["一天", "一周", "一个月", "一年", "永久"]
+    assert [action.isChecked() for action in actions] == [False, False, True, False, False]
+    assert "一个月" in button.toolTip()
 
 
 def test_start_file_send_rejects_files_larger_than_50mb(app, tmp_path):

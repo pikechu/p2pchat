@@ -13,12 +13,13 @@ import json
 import time
 import uuid
 
-PROTOCOL_VERSION = 3
-CLIENT_VERSION = "1.1.4"
+PROTOCOL_VERSION = 4
+CLIENT_VERSION = "1.2.0"
 BASE_CAPABILITIES = [
     "authenticated_key_exchange",
     "encrypted_files",
     "encrypted_voice",
+    "voice_aead_v1",
     "ttl_policy",
     "encrypted_message_persistence",
     "room_message_ttl",
@@ -31,6 +32,7 @@ REQUIRED_CAPABILITIES = [
     "authenticated_key_exchange",
     "encrypted_files",
     "encrypted_voice",
+    "voice_aead_v1",
     "ttl_policy",
 ]
 CLIENT_CAPABILITIES = list(BASE_CAPABILITIES)
@@ -38,12 +40,21 @@ SERVER_CAPABILITIES = [
     "authenticated_key_exchange",
     "encrypted_files",
     "encrypted_voice",
+    "voice_aead_v1",
     "ttl_policy",
     "encrypted_message_persistence",
     "room_message_ttl",
     "dm_message_ttl",
     "offline_message_sync",
 ]
+
+TTL_VALUES = {
+    "day": 24 * 60 * 60,
+    "week": 7 * 24 * 60 * 60,
+    "month": 30 * 24 * 60 * 60,
+    "year": 365 * 24 * 60 * 60,
+    "permanent": 0,
+}
 
 
 class T(str, Enum):
@@ -63,6 +74,7 @@ class T(str, Enum):
     SEND_ENCRYPTED_MSG = "SEND_ENCRYPTED_MSG"  # {scope_type, scope_id, ciphertext, crypto_meta, ...}
     SYNC_MESSAGES = "SYNC_MESSAGES"  # {scopes: [{scope_type, scope_id, after_message_id}], limit}
     SET_MESSAGE_TTL = "SET_MESSAGE_TTL"  # {scope_type, scope_id, ttl_seconds, to?}; ttl_seconds=0 表示永久
+    GET_MESSAGE_TTL = "GET_MESSAGE_TTL"  # {scope_type, scope_id, to?}
     DELETE_ROOM    = "DELETE_ROOM"    # {room_id} — creator only
     SET_ROOM_NAME  = "SET_ROOM_NAME"  # {room_id, name} — creator only
     SET_ROOM_ICON  = "SET_ROOM_ICON"  # {room_id, icon} — creator only
@@ -74,7 +86,7 @@ class T(str, Enum):
     CALL_REJECT  = "CALL_REJECT"  # {to, reason?}
     CALL_HANGUP  = "CALL_HANGUP"  # {to}
     CALL_ICE     = "CALL_ICE"     # {to, candidate: {ip, port}}
-    VOICE_CHUNK  = "VOICE_CHUNK"  # {to, data: base64 PCM int16}
+    VOICE_CHUNK  = "VOICE_CHUNK"  # {to, voice: VOICE-AEAD-v1 payload}
 
     # WebRTC signaling (client↔server, user-to-user relay only)
     WEBRTC_OFFER = "WEBRTC_OFFER"  # {to, session_id, sdp}

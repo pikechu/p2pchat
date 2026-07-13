@@ -146,6 +146,17 @@ class SecureSessionManager:
         root_key = derive_x25519_root(self._identity.prekey_private, peer_prekey, b"BeamChat/dm/file/v1")
         return derive_scope_keys(root_key, "dm", scope_id).file_key, scope_id
 
+    def voice_key(self, peer: str) -> tuple[bytes, str]:
+        """返回与指定私聊对端绑定的语音 AEAD 密钥和 scope_id。"""
+        peer = self._require_peer(peer)
+        if self.ensure_peer(peer) is not SessionState.READY:
+            raise SecureSessionError(self.ensure_peer(peer), "加密语音密钥不可用")
+        bundle = self._bundles[peer]
+        peer_prekey = self._decode_public(bundle, "prekey_public")
+        scope_id = self.dm_scope_id(self._own_name, peer)
+        root_key = derive_x25519_root(self._identity.prekey_private, peer_prekey, b"BeamChat/dm/voice/v1")
+        return derive_scope_keys(root_key, "dm", scope_id).voice_key, scope_id
+
     def decrypt_dm(self, message: dict) -> str:
         """验证并解密本人参与的私聊密文，失败时不返回未经认证内容。"""
         try:

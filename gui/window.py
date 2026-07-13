@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QStackedWidget, QListWidget, QListWidgetItem,
 )
 
-from protocol import T, pack, unpack
+from protocol import T, TTL_VALUES, pack, unpack
 from crypto import (
     create_room_access_metadata,
     decode_room_envelope,
@@ -706,6 +706,49 @@ class MessagesArea(QScrollArea):
 
 # ── Composer ──────────────────────────────────────────────────────────────────
 
+class TTLMenuButton(QPushButton):
+    ttl_selected = pyqtSignal(object)
+
+    _LABELS = [
+        ("一天", TTL_VALUES["day"]),
+        ("一周", TTL_VALUES["week"]),
+        ("一个月", TTL_VALUES["month"]),
+        ("一年", TTL_VALUES["year"]),
+        ("永久", TTL_VALUES["permanent"]),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__("⏱", parent)
+        self.setObjectName("ComposerIconBtn")
+        self.setToolTip("设置消息过期时间")
+        self._scope_type = ""
+        self._scope_id = ""
+        self._ttl_seconds = TTL_VALUES["week"]
+        self.clicked.connect(self._open_menu)
+
+    def set_policy(self, scope_type: str, scope_id: str, ttl_seconds: int, enabled: bool = True):
+        self._scope_type = scope_type
+        self._scope_id = scope_id
+        self._ttl_seconds = int(ttl_seconds)
+        self.setEnabled(enabled)
+        self.setToolTip(f"消息过期时间：{self.label_for(self._ttl_seconds)}")
+
+    def _open_menu(self):
+        menu = QMenu(self)
+        for label, ttl_seconds in self._LABELS:
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.setChecked(ttl_seconds == self._ttl_seconds)
+            action.triggered.connect(lambda _checked=False, ttl=ttl_seconds: self.ttl_selected.emit(ttl))
+            menu.addAction(action)
+        menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+
+    @classmethod
+    def label_for(cls, ttl_seconds: int) -> str:
+        labels = {ttl: label for label, ttl in cls._LABELS}
+        return labels.get(int(ttl_seconds), f"{int(ttl_seconds)} 秒")
+
+
 class Composer(QWidget):
     send_message   = pyqtSignal(str)
     typing_started = pyqtSignal()
@@ -761,11 +804,9 @@ class Composer(QWidget):
         vid_btn.clicked.connect(self._pick_video)
         inner_lay.addWidget(vid_btn)
 
-        ttl_btn = QPushButton("⏱")
-        ttl_btn.setObjectName("ComposerIconBtn")
-        ttl_btn.setToolTip("设置消息过期时间")
-        ttl_btn.clicked.connect(lambda: self._open_ttl_menu(ttl_btn))
-        inner_lay.addWidget(ttl_btn)
+        self._ttl_btn = TTLMenuButton()
+        self._ttl_btn.ttl_selected.connect(self.ttl_requested)
+        inner_lay.addWidget(self._ttl_btn)
 
         self._input = QLineEdit()
         self._input.setObjectName("ComposerInput")
@@ -804,22 +845,12 @@ class Composer(QWidget):
             self._input.clear()
             self._was_typing = False
 
-    def _open_ttl_menu(self, anchor):
-        menu = QMenu(self)
-        options = [
-            ("一天", 24 * 60 * 60),
-            ("一周", 7 * 24 * 60 * 60),
-            ("一个月", 30 * 24 * 60 * 60),
-            ("一年", 365 * 24 * 60 * 60),
-            ("永久", 0),
-        ]
-        for label, ttl_seconds in options:
-            action = menu.addAction(label)
-            action.triggered.connect(lambda _checked=False, ttl=ttl_seconds: self.ttl_requested.emit(ttl))
-        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+    def set_ttl_policy(self, scope_type: str, scope_id: str, ttl_seconds: int, enabled: bool = True):
+        self._ttl_btn.set_policy(scope_type, scope_id, ttl_seconds, enabled)
 
     def set_enabled(self, enabled: bool):
         self._input.setEnabled(enabled)
+        self._ttl_btn.setEnabled(enabled)
         self._input.setPlaceholderText(
             "Message…" if enabled else "Join a room to start chatting"
         )
@@ -1689,7 +1720,12 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_connected(self):
         if self._voice_call is None:
-            self._voice_call = VoiceCall(self._bridge, self._username, self)
+            self._voice_call = VoiceCall(
+                self._bridge,
+                self._username,
+                self,
+                voice_key_provider=self._voice_key,
+            )
             self._voice_call.incoming_call.connect(self._on_incoming_call)
             self._voice_call.call_ended.connect(self._on_call_ended)
             self._voice_call.state_changed.connect(self._on_call_state_changed)
@@ -1816,6 +1852,8 @@ class MainWindow(QMainWindow):
             self._chat.open_room(rid, name, [self._username], locked,
                                  creator=self._username, created_at=created_at,
                                  icon="", is_creator=True)
+            self._refresh_ttl_policy(rid)
+            self._request_current_ttl(rid)
             self._sync_room_messages(rid)
 
         elif mtype == T.ROOM_JOINED:
@@ -1840,6 +1878,8 @@ class MainWindow(QMainWindow):
             self._chat.open_room(rid, name, members, locked,
                                  creator=creator, created_at=created_at, icon=icon,
                                  is_creator=(creator == self._username))
+            self._refresh_ttl_policy(rid)
+            self._request_current_ttl(rid)
             # Track first non-self member as file transfer peer
             others = [m for m in members if m != self._username]
             self._current_peer = others[0] if others else ""
@@ -2134,8 +2174,9 @@ class MainWindow(QMainWindow):
         elif mtype == T.CALL_OFFER:
             peer    = payload.get("from", "")
             room_id = payload.get("room_id", "")
+            call_id = payload.get("call_id", "")
             if self._voice_call:
-                self._voice_call.on_call_offer(peer, room_id)
+                self._voice_call.on_call_offer(peer, room_id, call_id)
 
         elif mtype == T.CALL_ANSWER:
             if self._voice_call:
@@ -2156,7 +2197,7 @@ class MainWindow(QMainWindow):
                 self._voice_call.on_call_ice(candidate)
 
         elif mtype == T.VOICE_CHUNK:
-            data = payload.get("data", "")
+            data = payload.get("voice", {})
             if self._voice_call:
                 self._voice_call.on_voice_chunk(data)
 
@@ -2467,6 +2508,8 @@ class MainWindow(QMainWindow):
         self._conv.set_active(dm_id)
         self._current_peer = peer
         self._chat.open_room(dm_id, f"@ {peer}", [peer, self._username], False)
+        self._refresh_ttl_policy(dm_id)
+        self._request_current_ttl(dm_id)
         self._rail.set_active("chats")
 
     def _show_peers_dialog(self, users: list[str]):
@@ -2539,6 +2582,17 @@ class MainWindow(QMainWindow):
             raise CryptoError("房间文件密钥缺少 salt")
         root_key = derive_room_root(room_id, password, base64.b64decode(salt.encode("ascii"), validate=True))
         return derive_scope_keys(root_key, "room", room_id).file_key, room_id
+
+    def _voice_key(self, peer: str, call_id: str, room_id: str = "") -> bytes | None:
+        room = self._rooms.get(room_id, {})
+        if room.get("salt"):
+            root_key = derive_room_root(
+                room_id,
+                room.get("password", ""),
+                base64.b64decode(room["salt"].encode("ascii"), validate=True),
+            )
+            return derive_scope_keys(root_key, "room", room_id).voice_key
+        return self._secure_sessions.voice_key(peer)[0]
 
     def _start_file_send(self, path: str):
         rid = self._chat.current_room_id
@@ -3077,6 +3131,8 @@ class MainWindow(QMainWindow):
             peer = self._dms.get(room_id, room_id[1:])
             self._current_peer = peer
             self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
+            self._refresh_ttl_policy(room_id)
+            self._request_current_ttl(room_id)
             return
         room = self._rooms.get(room_id, {})
         pw = room.get("password", "")
@@ -3162,6 +3218,28 @@ class MainWindow(QMainWindow):
         if self._bridge:
             self._bridge.send_frame(T.SET_ROOM_ICON, room_id=room_id, icon=icon)
 
+    def _scope_for_chat_id(self, chat_id: str) -> tuple[str, str, str]:
+        if chat_id.startswith("@"):
+            peer = self._dms.get(chat_id, chat_id[1:])
+            return "dm", self._secure_sessions.dm_scope_id(self._username, peer), peer
+        return "room", chat_id, ""
+
+    def _refresh_ttl_policy(self, chat_id: str):
+        if not chat_id:
+            return
+        scope_type, scope_id, _peer = self._scope_for_chat_id(chat_id)
+        ttl = int(self._rooms.get(chat_id, {}).get("message_ttl_seconds", TTL_VALUES["week"]))
+        self._chat.composer.set_ttl_policy(scope_type, scope_id, ttl, True)
+
+    def _request_current_ttl(self, chat_id: str):
+        if not chat_id or not self._bridge:
+            return
+        scope_type, scope_id, peer = self._scope_for_chat_id(chat_id)
+        payload = {"scope_type": scope_type, "scope_id": scope_id}
+        if peer:
+            payload["to"] = peer
+        self._bridge.send_frame(T.GET_MESSAGE_TTL, **payload)
+
     @pyqtSlot(object)
     def _on_message_ttl_requested(self, ttl_seconds):
         rid = self._chat.current_room_id
@@ -3193,28 +3271,27 @@ class MainWindow(QMainWindow):
         if scope_type == "room" and scope_id:
             self._rooms.setdefault(scope_id, {})["message_ttl_seconds"] = ttl
             active = self._chat.current_room_id == scope_id
+            active_chat_id = scope_id
         elif scope_type == "dm" and scope_id:
             active = False
+            active_chat_id = ""
             for dm_id, peer in self._dms.items():
                 if self._secure_sessions.dm_scope_id(self._username, peer) == scope_id:
                     self._rooms.setdefault(dm_id, {})["message_ttl_seconds"] = ttl
                     active = self._chat.current_room_id == dm_id
+                    active_chat_id = dm_id
                     break
         else:
             active = False
+            active_chat_id = ""
         if active:
-            self._chat.add_sys(f"消息过期时间已设置为{self._ttl_label(ttl)}")
+            self._refresh_ttl_policy(active_chat_id)
+            if "requested_ttl_seconds" in payload:
+                self._chat.add_sys(f"消息过期时间已设置为{self._ttl_label(ttl)}")
 
     @staticmethod
     def _ttl_label(ttl_seconds: int) -> str:
-        labels = {
-            24 * 60 * 60: "一天",
-            7 * 24 * 60 * 60: "一周",
-            30 * 24 * 60 * 60: "一个月",
-            365 * 24 * 60 * 60: "一年",
-            0: "永久",
-        }
-        return labels.get(int(ttl_seconds), f"{int(ttl_seconds)} 秒")
+        return TTLMenuButton.label_for(ttl_seconds)
 
     @pyqtSlot(str)
     def _on_send_message(self, text: str):

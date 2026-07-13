@@ -10,22 +10,23 @@ State machine:
   any → IDLE      (hangup / on_call_hangup / on_call_reject)
 
 Audio:
-  sounddevice InputStream → PCM int16 → UDP direct or VOICE_CHUNK relay
-  incoming PCM → jitter deque → sounddevice OutputStream
+  sounddevice InputStream → PCM int16 → encrypted UDP direct or VOICE_CHUNK relay
+  incoming encrypted voice packet → PCM → jitter deque → sounddevice OutputStream
 """
-import base64
 import collections
 import socket
 import threading
 import time
+import uuid
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from protocol import T
+from voice_crypto import VoiceCipher, VoiceCryptoError, encode_voice_packet
 
 SAMPLE_RATE    = 16000
 FRAME_MS       = 20
@@ -56,16 +57,27 @@ class VoiceCall(QObject):
     call_ended    = pyqtSignal(str, int)  # reason, duration_seconds
     incoming_call = pyqtSignal(str)    # peer username
 
-    def __init__(self, bridge, username: str, parent=None):
+    def __init__(
+        self,
+        bridge,
+        username: str,
+        parent=None,
+        *,
+        voice_key_provider: Optional[Callable[[str, str, str], bytes | None]] = None,
+    ):
         super().__init__(parent)
         self._bridge   = bridge
         self._username = username
         self._state    = CallState.IDLE
         self._peer     = ""
         self._room_id  = ""
+        self._call_id  = ""
         self._mode     = _Mode.RELAY
         self._start_ts = 0.0
         self._muted    = False
+        self._voice_key_provider = voice_key_provider
+        self._tx_voice_cipher: Optional[VoiceCipher] = None
+        self._rx_voice_cipher: Optional[VoiceCipher] = None
 
         self._udp_sock:  Optional[socket.socket] = None
         self._peer_addr: Optional[Tuple[str, int]] = None
@@ -99,8 +111,10 @@ class VoiceCall(QObject):
             return
         self._peer    = peer
         self._room_id = room_id
+        self._call_id = uuid.uuid4().hex
+        self._reset_voice_ciphers()
         self._set_state(CallState.CALLING)
-        self._bridge.send_frame(T.CALL_OFFER, to=peer, room_id=room_id)
+        self._bridge.send_frame(T.CALL_OFFER, to=peer, room_id=room_id, call_id=self._call_id)
 
     def accept_call(self) -> None:
         if self._state != CallState.RINGING:
@@ -126,12 +140,14 @@ class VoiceCall(QObject):
 
     # ── Incoming frame handlers (called from GUI thread via signal) ───────────
 
-    def on_call_offer(self, peer: str, room_id: str = "") -> None:
+    def on_call_offer(self, peer: str, room_id: str = "", call_id: str = "") -> None:
         if self._state != CallState.IDLE:
             self._bridge.send_frame(T.CALL_REJECT, to=peer, reason="busy")
             return
         self._peer    = peer
         self._room_id = room_id
+        self._call_id = call_id or uuid.uuid4().hex
+        self._reset_voice_ciphers()
         self._set_state(CallState.RINGING)
         self.incoming_call.emit(peer)
 
@@ -154,14 +170,17 @@ class VoiceCall(QObject):
             self._peer_addr = (ip, port)
             threading.Thread(target=self._send_punch_probes, daemon=True).start()
 
-    def on_voice_chunk(self, data_b64: str) -> None:
+    def on_voice_chunk(self, voice_packet) -> None:
         if self._state != CallState.CONNECTED or self._mode == _Mode.DIRECT:
             return
         try:
-            pcm = base64.b64decode(data_b64)
+            cipher = self._voice_cipher(transmit=False)
+            if cipher is None:
+                return
+            pcm = cipher.decrypt(voice_packet)
             arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
             self._jitter.append(arr)
-        except Exception:
+        except (VoiceCryptoError, ValueError):
             pass
 
     # ── ICE / UDP ──────────────────────────────────────────────────────────────
@@ -215,14 +234,18 @@ class VoiceCall(QObject):
                 self._ensure_connected()
                 last_recv = time.time()
             else:
-                # Audio PCM data
+                # 加密语音包；PING/PONG 仍保持明文控制帧。
                 if self._state == CallState.CONNECTED and self._mode == _Mode.DIRECT:
                     try:
-                        arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                        cipher = self._voice_cipher(transmit=False)
+                        if cipher is None:
+                            continue
+                        pcm = cipher.decrypt(data)
+                        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
                         self._jitter.append(arr)
-                    except Exception:
+                        last_recv = time.time()
+                    except (VoiceCryptoError, ValueError):
                         pass
-                    last_recv = time.time()
 
     def _ensure_connected(self) -> None:
         if self._state in (CallState.ICE, CallState.CALLING):
@@ -237,15 +260,22 @@ class VoiceCall(QObject):
             if self._muted or self._state != CallState.CONNECTED:
                 return
             pcm = (indata[:, 0] * 32768).astype(np.int16)
+            cipher = self._voice_cipher(transmit=True)
+            if cipher is None:
+                return
+            try:
+                packet = cipher.encrypt(pcm.tobytes())
+            except VoiceCryptoError:
+                return
             if self._mode == _Mode.DIRECT and self._peer_addr and self._udp_sock:
                 try:
-                    self._udp_sock.sendto(pcm.tobytes(), self._peer_addr)
+                    self._udp_sock.sendto(encode_voice_packet(packet), self._peer_addr)
                 except Exception:
                     pass
             else:
                 self._bridge.send_frame(
                     T.VOICE_CHUNK, to=self._peer,
-                    data=base64.b64encode(pcm.tobytes()).decode(),
+                    voice=packet,
                 )
 
         def _playback(outdata, frames, time_info, status):
@@ -302,6 +332,8 @@ class VoiceCall(QObject):
         self._mode = _Mode.RELAY
         self._peer = ""
         self._room_id = ""
+        self._call_id = ""
+        self._reset_voice_ciphers()
         self._start_ts = 0.0
         self._set_state(CallState.IDLE)
         self.call_ended.emit(reason, duration)
@@ -309,3 +341,41 @@ class VoiceCall(QObject):
     def _set_state(self, state: CallState) -> None:
         self._state = state
         self.state_changed.emit(state.name)
+
+    def _voice_cipher(self, *, transmit: bool) -> Optional[VoiceCipher]:
+        if not self._peer:
+            return None
+        if self._voice_key_provider is None:
+            return None
+        if not self._call_id:
+            self._call_id = uuid.uuid4().hex
+        call_id = self._call_id
+        try:
+            key = self._voice_key_provider(self._peer, call_id, self._room_id)
+        except Exception:
+            return None
+        if not isinstance(key, bytes) or len(key) != 32:
+            return None
+        if transmit:
+            if self._tx_voice_cipher is None:
+                self._tx_voice_cipher = VoiceCipher(
+                    key,
+                    call_id=call_id,
+                    sender=self._username,
+                    recipient=self._peer,
+                    direction=f"{self._username}->{self._peer}",
+                )
+            return self._tx_voice_cipher
+        if self._rx_voice_cipher is None:
+            self._rx_voice_cipher = VoiceCipher(
+                key,
+                call_id=call_id,
+                sender=self._peer,
+                recipient=self._username,
+                direction=f"{self._peer}->{self._username}",
+            )
+        return self._rx_voice_cipher
+
+    def _reset_voice_ciphers(self) -> None:
+        self._tx_voice_cipher = None
+        self._rx_voice_cipher = None

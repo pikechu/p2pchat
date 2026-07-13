@@ -97,14 +97,65 @@ def test_call_ice_routed(server_port, event_loop):
     event_loop.run_until_complete(run())
 
 
-def test_voice_chunk_routed(server_port, event_loop):
+def test_voice_chunk_rejects_legacy_plaintext_payload(server_port, event_loop):
     async def run():
         alice = await _connect(server_port, "calice4")
         bob   = await _connect(server_port, "cbob4")
         await alice.send(pack(T.VOICE_CHUNK, to="cbob4", data="AAAA"))
+        frame = json.loads(await asyncio.wait_for(alice.recv(), timeout=3))
+        assert frame["type"] == T.ERROR
+        assert frame["payload"]["code"] == "PLAINTEXT_FORBIDDEN"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bob.recv(), timeout=0.2)
+        await alice.close(); await bob.close()
+    event_loop.run_until_complete(run())
+
+
+def test_encrypted_voice_chunk_routed(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "calice4enc")
+        bob   = await _connect(server_port, "cbob4enc")
+        voice = {
+            "version": 1,
+            "alg": "VOICE-AEAD-v1",
+            "call_id": "call-1",
+            "sender": "calice4enc",
+            "recipient": "cbob4enc",
+            "direction": "calice4enc->cbob4enc",
+            "seq": 0,
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "ciphertext": "ZW5jcnlwdGVk",
+        }
+        await alice.send(pack(T.VOICE_CHUNK, to="cbob4enc", voice=voice))
         frame = json.loads(await asyncio.wait_for(bob.recv(), timeout=3))
         assert frame["type"] == T.VOICE_CHUNK
-        assert frame["payload"]["data"] == "AAAA"
+        assert frame["payload"]["voice"] == voice
+        assert frame["payload"]["from"] == "calice4enc"
+        await alice.close(); await bob.close()
+    event_loop.run_until_complete(run())
+
+
+def test_voice_chunk_rejects_sender_recipient_context_mismatch(server_port, event_loop):
+    async def run():
+        alice = await _connect(server_port, "calice_ctx")
+        bob   = await _connect(server_port, "cbob_ctx")
+        voice = {
+            "version": 1,
+            "alg": "VOICE-AEAD-v1",
+            "call_id": "call-ctx",
+            "sender": "mallory",
+            "recipient": "cbob_ctx",
+            "direction": "mallory->cbob_ctx",
+            "seq": 0,
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "ciphertext": "ZW5jcnlwdGVk",
+        }
+        await alice.send(pack(T.VOICE_CHUNK, to="cbob_ctx", voice=voice))
+        frame = json.loads(await asyncio.wait_for(alice.recv(), timeout=3))
+        assert frame["type"] == T.ERROR
+        assert frame["payload"]["code"] == "VOICE_CONTEXT_MISMATCH"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bob.recv(), timeout=0.2)
         await alice.close(); await bob.close()
     event_loop.run_until_complete(run())
 

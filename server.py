@@ -32,8 +32,9 @@ from typing import Dict, Optional
 import websockets
 import websockets.exceptions
 
-from protocol import CLIENT_VERSION, PROTOCOL_VERSION, REQUIRED_CAPABILITIES, SERVER_CAPABILITIES, T, pack, unpack
+from protocol import CLIENT_VERSION, PROTOCOL_VERSION, REQUIRED_CAPABILITIES, SERVER_CAPABILITIES, T, TTL_VALUES, pack, unpack
 from file_transfer import CHUNK_SIZE
+from voice_crypto import is_encrypted_voice_payload
 
 logging.basicConfig(
     level=logging.INFO,
@@ -181,6 +182,15 @@ class ChatServer:
                   updated_at INTEGER NOT NULL
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS dm_ttl_requests (
+                  dm_id TEXT NOT NULL,
+                  username TEXT NOT NULL,
+                  ttl_seconds INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  PRIMARY KEY (dm_id, username)
+                )
+            """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(messages)").fetchall()}
             if "recipient_name" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN recipient_name TEXT")
@@ -216,30 +226,133 @@ class ChatServer:
         ttl = row[0] if row is not None and row[0] is not None else default
         return self._clamp_ttl(ttl)
 
-    def _set_scope_ttl(self, scope_type: str, scope_id: str, ttl_seconds: int) -> int:
+    @staticmethod
+    def _validate_message_ttl(ttl_seconds: int) -> int:
+        ttl = int(ttl_seconds)
+        if ttl not in set(TTL_VALUES.values()):
+            raise ValueError("INVALID_TTL")
+        return ttl
+
+    def _default_ttl_value(self, scope_type: str) -> int:
+        default = (
+            self._default_room_message_ttl_seconds
+            if scope_type == "room"
+            else self._default_dm_message_ttl_seconds
+        )
+        if default is None:
+            return 0
+        return self._validate_message_ttl(int(default))
+
+    def _effective_dm_ttl(self, dm_id: str) -> int:
+        default = self._default_ttl_value("dm")
+        with sqlite3.connect(self._message_db_path) as db:
+            rows = db.execute(
+                "SELECT ttl_seconds FROM dm_ttl_requests WHERE dm_id = ?",
+                (dm_id,),
+            ).fetchall()
+        requested = [int(row[0]) for row in rows]
+        if len(requested) >= 2 and all(ttl == 0 for ttl in requested):
+            return 0
+        finite = [ttl for ttl in requested if ttl > 0]
+        if len(requested) < 2 and default > 0:
+            finite.append(default)
+        if finite:
+            return min(finite)
+        return default
+
+    def _delete_messages_expired_by_ttl(
+        self,
+        scope_type: str,
+        scope_id: str,
+        ttl_seconds: int,
+        *,
+        now: int | float | None = None,
+    ) -> int:
+        if not self._enable_message_persistence or ttl_seconds <= 0:
+            return 0
+        now_i = int(time.time() if now is None else now)
+        cutoff = now_i - int(ttl_seconds)
+        with sqlite3.connect(self._message_db_path) as db:
+            cur = db.execute(
+                """
+                UPDATE messages
+                SET deleted_at = ?
+                WHERE scope_type = ?
+                  AND scope_id = ?
+                  AND deleted_at IS NULL
+                  AND created_at <= ?
+                """,
+                (now_i, scope_type, scope_id, cutoff),
+            )
+            return int(cur.rowcount or 0)
+
+    def _set_scope_ttl(
+        self,
+        scope_type: str,
+        scope_id: str,
+        ttl_seconds: int,
+        *,
+        username: str | None = None,
+        now: int | float | None = None,
+    ) -> int:
         if scope_type not in {"room", "dm"}:
             raise ValueError("scope_type must be room or dm")
-        ttl = int(ttl_seconds)
-        if ttl < 0:
-            raise ValueError("ttl_seconds must be >= 0")
-        stored_ttl = 0 if ttl == 0 else self._clamp_ttl(ttl)
-        table = "room_settings" if scope_type == "room" else "dm_settings"
-        key_col = "room_id" if scope_type == "room" else "dm_id"
-        now = int(time.time())
+        ttl = self._validate_message_ttl(ttl_seconds)
+        now_i = int(time.time() if now is None else now)
         self._init_message_db()
         with sqlite3.connect(self._message_db_path) as db:
-            db.execute(
-                f"""
-                INSERT INTO {table} ({key_col}, message_ttl_seconds, persist_messages, updated_at)
-                VALUES (?, ?, 1, ?)
-                ON CONFLICT({key_col}) DO UPDATE SET
-                  message_ttl_seconds = excluded.message_ttl_seconds,
-                  persist_messages = 1,
-                  updated_at = excluded.updated_at
-                """,
-                (scope_id, stored_ttl, now),
-            )
-        return int(stored_ttl or 0)
+            if scope_type == "room":
+                db.execute(
+                    """
+                    INSERT INTO room_settings (room_id, message_ttl_seconds, persist_messages, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(room_id) DO UPDATE SET
+                      message_ttl_seconds = excluded.message_ttl_seconds,
+                      persist_messages = 1,
+                      updated_at = excluded.updated_at
+                    """,
+                    (scope_id, ttl, now_i),
+                )
+                effective_ttl = ttl
+            else:
+                if not username:
+                    raise ValueError("username is required for dm TTL")
+                db.execute(
+                    """
+                    INSERT INTO dm_ttl_requests (dm_id, username, ttl_seconds, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(dm_id, username) DO UPDATE SET
+                      ttl_seconds = excluded.ttl_seconds,
+                      updated_at = excluded.updated_at
+                    """,
+                    (scope_id, username, ttl, now_i),
+                )
+                rows = db.execute(
+                    "SELECT ttl_seconds FROM dm_ttl_requests WHERE dm_id = ?",
+                    (scope_id,),
+                ).fetchall()
+                requested = [int(row[0]) for row in rows]
+                default = self._default_ttl_value("dm")
+                if len(requested) >= 2 and all(item == 0 for item in requested):
+                    effective_ttl = 0
+                else:
+                    finite = [item for item in requested if item > 0]
+                    if len(requested) < 2 and default > 0:
+                        finite.append(default)
+                    effective_ttl = min(finite) if finite else default
+                db.execute(
+                    """
+                    INSERT INTO dm_settings (dm_id, message_ttl_seconds, persist_messages, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(dm_id) DO UPDATE SET
+                      message_ttl_seconds = excluded.message_ttl_seconds,
+                      persist_messages = 1,
+                      updated_at = excluded.updated_at
+                    """,
+                    (scope_id, effective_ttl, now_i),
+                )
+        self._delete_messages_expired_by_ttl(scope_type, scope_id, effective_ttl, now=now_i)
+        return int(effective_ttl)
 
     def _store_encrypted_message(
         self,
@@ -1139,44 +1252,76 @@ class ChatServer:
                         has_more=False,
                     )
 
-                # ── SET_MESSAGE_TTL ────────────────────────────────────────
-                elif mtype == T.SET_MESSAGE_TTL:
+                # ── SET_MESSAGE_TTL / GET_MESSAGE_TTL ─────────────────────
+                elif mtype in (T.SET_MESSAGE_TTL, T.GET_MESSAGE_TTL):
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
+                    if not self._enable_message_persistence:
+                        await self._send(
+                            ws,
+                            T.ERROR,
+                            code="PERSISTENCE_DISABLED",
+                            message="PERSISTENCE_DISABLED",
+                        )
+                        continue
                     scope_type = str(payload.get("scope_type", ""))
                     scope_id = str(payload.get("scope_id", ""))
-                    ttl_seconds = self._safe_int(payload.get("ttl_seconds", -1))
-                    if scope_type not in {"room", "dm"} or not scope_id or ttl_seconds is None or ttl_seconds < 0:
-                        await self._send(ws, T.ERROR, message="Invalid TTL settings")
+                    if scope_type not in {"room", "dm"} or not scope_id:
+                        await self._send(ws, T.ERROR, message="Invalid TTL scope")
                         continue
                     peer_name = str(payload.get("to", "")).strip()[:32]
                     if scope_type == "room":
-                        if self._user_room.get(username) != scope_id:
+                        room = self._rooms.get(scope_id)
+                        if room is None or username not in room.members:
                             await self._send(ws, T.ERROR, message="Not in requested room")
+                            continue
+                        if mtype == T.SET_MESSAGE_TTL and room.creator != username:
+                            await self._send(ws, T.ERROR, code="FORBIDDEN", message="Only room creator can update TTL")
                             continue
                     else:
                         if not peer_name or self._dm_scope_id(username, peer_name) != scope_id:
                             await self._send(ws, T.ERROR, message="DM scope_id does not match sender/recipient")
                             continue
-                    try:
-                        stored_ttl = self._set_scope_ttl(scope_type, scope_id, ttl_seconds)
-                    except (ValueError, sqlite3.Error):
-                        await self._send(ws, T.ERROR, message="Failed to update TTL settings")
-                        continue
+                    requested_ttl = None
+                    if mtype == T.SET_MESSAGE_TTL:
+                        ttl_seconds = self._safe_int(payload.get("ttl_seconds", -1))
+                        if ttl_seconds is None:
+                            await self._send(ws, T.ERROR, code="INVALID_TTL", message="INVALID_TTL")
+                            continue
+                        try:
+                            requested_ttl = self._validate_message_ttl(ttl_seconds)
+                            stored_ttl = self._set_scope_ttl(
+                                scope_type,
+                                scope_id,
+                                requested_ttl,
+                                username=username if scope_type == "dm" else None,
+                            )
+                        except ValueError:
+                            await self._send(ws, T.ERROR, code="INVALID_TTL", message="INVALID_TTL")
+                            continue
+                        except sqlite3.Error:
+                            await self._send(ws, T.ERROR, message="Failed to update TTL settings")
+                            continue
+                    else:
+                        stored_ttl = self._scope_ttl(scope_type, scope_id)
+                        if stored_ttl is None:
+                            stored_ttl = 0
                     event = {
                         "scope_type": scope_type,
                         "scope_id": scope_id,
                         "ttl_seconds": stored_ttl,
                         "updated_by": username,
                     }
+                    if requested_ttl is not None:
+                        event["requested_ttl_seconds"] = requested_ttl
                     await self._send(ws, T.MESSAGE_TTL_UPDATED, **event)
-                    if scope_type == "room":
+                    if mtype == T.SET_MESSAGE_TTL and scope_type == "room":
                         room = self._rooms.get(scope_id)
                         if room is not None:
                             await self._broadcast(room, T.MESSAGE_TTL_UPDATED,
                                                   exclude=username, **event)
-                    elif peer_name:
+                    elif mtype == T.SET_MESSAGE_TTL and peer_name:
                         target_ws = self._name_to_ws.get(peer_name)
                         if target_ws is not None:
                             try:
@@ -1230,6 +1375,30 @@ class ChatServer:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
                     to_user = str(payload.get("to", ""))
+                    if mtype == T.VOICE_CHUNK and not is_encrypted_voice_payload(payload.get("voice")):
+                        await self._send(
+                            ws,
+                            T.ERROR,
+                            code="PLAINTEXT_FORBIDDEN",
+                            message="语音帧必须使用 AEAD 加密",
+                            recoverable=False,
+                        )
+                        continue
+                    if mtype == T.VOICE_CHUNK:
+                        voice = payload.get("voice", {})
+                        if (
+                            voice.get("sender") != username
+                            or voice.get("recipient") != to_user
+                            or voice.get("direction") != f"{username}->{to_user}"
+                        ):
+                            await self._send(
+                                ws,
+                                T.ERROR,
+                                code="VOICE_CONTEXT_MISMATCH",
+                                message="语音帧身份上下文不匹配",
+                                recoverable=False,
+                            )
+                            continue
                     await self._forward_to_user(ws, username, to_user, T(mtype), **payload)
 
                 # ── FILE_ROOM_* (room-broadcast file sharing) ────────────

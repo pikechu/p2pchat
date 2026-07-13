@@ -59,6 +59,21 @@ def test_sender_can_decrypt_own_synced_dm(tmp_path):
     assert alice_manager.decrypt_dm(stored) == "自己同步也能解密"
 
 
+def test_file_and_voice_keys_are_ready_and_separated(tmp_path):
+    alice = _identity()
+    bob = _identity()
+    manager = SecureSessionManager(alice, TrustStore(tmp_path / "trust.json"), "alice")
+    manager.cache_peer_bundle("bob", _bundle(bob))
+
+    file_key, file_scope = manager.file_key("bob")
+    voice_key, voice_scope = manager.voice_key("bob")
+
+    assert file_scope == voice_scope
+    assert len(file_key) == 32
+    assert len(voice_key) == 32
+    assert file_key != voice_key
+
+
 def test_inbound_dm_rejects_sender_bundle_mismatch(tmp_path):
     alice = _identity()
     bob = _identity()

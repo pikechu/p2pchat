@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
+from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, TTL_VALUES, pack, unpack
 from identity import DeviceIdentity, sign_key_bundle
 from server import ChatServer
 from crypto import create_room_access_metadata, encode_room_envelope, encrypt_room_message
@@ -110,27 +110,74 @@ def test_store_encrypted_message_assigns_id_and_honors_ttl(tmp_path):
 
 def test_scope_ttl_settings_support_year_and_permanent(tmp_path):
     server = ChatServer(message_db_path=tmp_path / "beam.db", min_message_ttl_seconds=1)
-    year = 365 * 24 * 60 * 60
+    year = TTL_VALUES["year"]
 
     assert server._set_scope_ttl("room", "ROOM01", year) == year
     assert server._scope_ttl("room", "ROOM01") == year
 
-    assert server._set_scope_ttl("dm", server._dm_scope_id("alice", "bob"), 0) == 0
-    assert server._scope_ttl("dm", server._dm_scope_id("alice", "bob")) == 0
+    dm_id = server._dm_scope_id("alice", "bob")
+    assert server._set_scope_ttl("dm", dm_id, 0, username="alice") == TTL_VALUES["week"]
+    assert server._set_scope_ttl("dm", dm_id, 0, username="bob") == 0
+    assert server._scope_ttl("dm", dm_id) == 0
 
     permanent = server._store_encrypted_message(
         scope_type="dm",
-        scope_id=server._dm_scope_id("alice", "bob"),
+        scope_id=dm_id,
         sender_name="alice",
         recipient_name="bob",
         client_msg_id="forever",
         msg_type="text",
         ciphertext="ciphertext-only",
         crypto_meta={},
-        ttl_seconds=server._scope_ttl("dm", server._dm_scope_id("alice", "bob")),
+        ttl_seconds=server._scope_ttl("dm", dm_id),
         now=1000,
     )
     assert permanent["expires_at"] is None
+
+
+def test_ttl_policy_accepts_only_five_values(tmp_path):
+    server = ChatServer(message_db_path=tmp_path / "beam.db", min_message_ttl_seconds=1)
+    for ttl in TTL_VALUES.values():
+        assert server._set_scope_ttl("room", "ROOM01", ttl) == ttl
+
+    with pytest.raises(ValueError):
+        server._set_scope_ttl("room", "ROOM01", 123)
+
+
+def test_dm_ttl_uses_shorter_request_and_permanent_requires_both(tmp_path):
+    server = ChatServer(message_db_path=tmp_path / "beam.db", min_message_ttl_seconds=1)
+    dm_id = server._dm_scope_id("alice", "bob")
+
+    assert server._set_scope_ttl("dm", dm_id, TTL_VALUES["year"], username="alice") == TTL_VALUES["week"]
+    assert server._set_scope_ttl("dm", dm_id, TTL_VALUES["month"], username="bob") == TTL_VALUES["month"]
+    assert server._set_scope_ttl("dm", dm_id, TTL_VALUES["day"], username="alice") == TTL_VALUES["day"]
+    assert server._set_scope_ttl("dm", dm_id, TTL_VALUES["permanent"], username="alice") == TTL_VALUES["month"]
+    assert server._set_scope_ttl("dm", dm_id, TTL_VALUES["permanent"], username="bob") == TTL_VALUES["permanent"]
+
+
+def test_shrinking_ttl_marks_old_messages_deleted(tmp_path):
+    server = ChatServer(message_db_path=tmp_path / "beam.db", min_message_ttl_seconds=1)
+    server._store_encrypted_message(
+        scope_type="room",
+        scope_id="ROOM01",
+        sender_name="alice",
+        client_msg_id="old",
+        msg_type="text",
+        ciphertext="old-cipher",
+        crypto_meta={},
+        ttl_seconds=TTL_VALUES["year"],
+        now=1000,
+    )
+
+    server._set_scope_ttl("room", "ROOM01", TTL_VALUES["day"], now=1000 + 2 * TTL_VALUES["day"])
+
+    assert server._load_messages_for_sync(
+        [{"scope_type": "room", "scope_id": "ROOM01", "after_message_id": 0}],
+        now=1000 + 2 * TTL_VALUES["day"],
+    ) == []
+    with sqlite3.connect(tmp_path / "beam.db") as db:
+        deleted_at = db.execute("SELECT deleted_at FROM messages WHERE client_msg_id = 'old'").fetchone()[0]
+    assert deleted_at == 1000 + 2 * TTL_VALUES["day"]
 
 
 def test_unencrypted_messages_are_not_persisted(tmp_path):
@@ -239,6 +286,99 @@ def test_encrypted_dm_rejects_mismatched_scope(tmp_path, event_loop):
         finally:
             if ws is not None:
                 await ws.close()
+            proc.terminate()
+            proc.wait()
+
+    event_loop.run_until_complete(run())
+
+
+def test_room_ttl_only_creator_can_update_and_invalid_is_rejected(tmp_path, event_loop):
+    async def run():
+        port = _free_port()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "server.py",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--message-db",
+                str(tmp_path / "beam.db"),
+            ],
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        alice = bob = None
+        try:
+            time.sleep(0.8)
+            alice = await _connect(port, "ttl_alice")
+            bob = await _connect(port, "ttl_bob")
+            room_id, metadata = await _create_room(alice, "ttl-room")
+            await _join_room(bob, room_id, metadata)
+            assert (await _recv(bob))["type"] == T.ROOM_JOINED
+            assert (await _recv(alice))["type"] == T.USER_JOINED
+
+            await bob.send(pack(T.SET_MESSAGE_TTL, scope_type="room", scope_id=room_id,
+                                ttl_seconds=TTL_VALUES["day"]))
+            frame = await _recv(bob)
+            assert frame["type"] == T.ERROR
+            assert frame["payload"]["code"] == "FORBIDDEN"
+
+            await alice.send(pack(T.SET_MESSAGE_TTL, scope_type="room", scope_id=room_id,
+                                  ttl_seconds=123))
+            frame = await _recv(alice)
+            assert frame["type"] == T.ERROR
+            assert frame["payload"]["code"] == "INVALID_TTL"
+
+            await alice.send(pack(T.SET_MESSAGE_TTL, scope_type="room", scope_id=room_id,
+                                  ttl_seconds=TTL_VALUES["day"]))
+            frame = await _recv(alice)
+            assert frame["type"] == T.MESSAGE_TTL_UPDATED
+            assert frame["payload"]["ttl_seconds"] == TTL_VALUES["day"]
+            frame = await _recv(bob)
+            assert frame["type"] == T.MESSAGE_TTL_UPDATED
+            assert frame["payload"]["ttl_seconds"] == TTL_VALUES["day"]
+        finally:
+            for ws in (alice, bob):
+                if ws is not None:
+                    await ws.close()
+            proc.terminate()
+            proc.wait()
+
+    event_loop.run_until_complete(run())
+
+
+def test_ttl_setting_reports_persistence_disabled(tmp_path, event_loop):
+    async def run():
+        port = _free_port()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "server.py",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--no-message-persistence",
+            ],
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        alice = None
+        try:
+            time.sleep(0.8)
+            alice = await _connect(port, "ttl_disabled")
+            room_id, _metadata = await _create_room(alice, "ttl-disabled")
+            await alice.send(pack(T.GET_MESSAGE_TTL, scope_type="room", scope_id=room_id))
+            frame = await _recv(alice)
+            assert frame["type"] == T.ERROR
+            assert frame["payload"]["code"] == "PERSISTENCE_DISABLED"
+        finally:
+            if alice is not None:
+                await alice.close()
             proc.terminate()
             proc.wait()
 
