@@ -24,6 +24,7 @@ import logging
 import pathlib
 import random
 import sqlite3
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,7 @@ class Room:
     id: str
     name: str
     creator: str
+    creator_identity: str = ""
     locked: bool = True
     salt: str = ""
     encrypted_access_token: dict | None = None
@@ -84,6 +86,8 @@ class Room:
 # ── Server ───────────────────────────────────────────────────────────────────
 
 MAX_FILE_BYTES = 50 * 1024 * 1024   # 50 MB per room-shared file
+MAX_AVATAR_BYTES = 256 * 1024
+MAX_AVATAR_DIMENSION = 512
 AEAD_TAG_BYTES = 16
 TRANSFER_TTL_SECONDS = 10 * 60
 DEFAULT_ROOM_MESSAGE_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -880,6 +884,7 @@ class ChatServer:
             for r in data.get("rooms", []):
                 room = Room(
                     id=r["id"], name=r["name"], creator=r["creator"],
+                    creator_identity=r.get("creator_identity", ""),
                     locked=r.get("locked", False),
                     salt=r.get("salt", ""),
                     encrypted_access_token=r.get("encrypted_access_token") or {},
@@ -896,6 +901,7 @@ class ChatServer:
         try:
             data = {"rooms": [
                 {"id": r.id, "name": r.name, "creator": r.creator,
+                 "creator_identity": r.creator_identity,
                  "locked": r.locked, "salt": r.salt,
                  "encrypted_access_token": r.encrypted_access_token or {},
                  "access_token_hash": r.access_token_hash,
@@ -1059,6 +1065,53 @@ class ChatServer:
         except (binascii.Error, ValueError, TypeError):
             return False
 
+    @staticmethod
+    def _same_identity(first: dict | None, second: dict | None) -> bool:
+        """只比较长期 Ed25519 身份公钥，允许临时握手密钥轮换。"""
+        try:
+            return hmac.compare_digest(
+                base64.b64decode(first["identity_public"], validate=True),
+                base64.b64decode(second["identity_public"], validate=True),
+            )
+        except (KeyError, TypeError, ValueError, binascii.Error):
+            return False
+
+    def _is_room_creator(self, room: Room, username: str, key_bundle: dict | None) -> bool:
+        """同时绑定创建者显示名和设备身份，避免同名设备取得管理权限。"""
+        if room.creator != username or not key_bundle:
+            return False
+        identity_public = str(key_bundle.get("identity_public", ""))
+        if not identity_public:
+            return False
+        if not room.creator_identity:
+            # 兼容旧持久化数据：创建者首次执行管理操作时完成身份迁移。
+            room.creator_identity = identity_public
+            self._save_rooms()
+            return True
+        try:
+            return hmac.compare_digest(
+                base64.b64decode(room.creator_identity, validate=True),
+                base64.b64decode(identity_public, validate=True),
+            )
+        except (ValueError, TypeError, binascii.Error):
+            return False
+
+    @staticmethod
+    def _valid_avatar_data(encoded: str) -> bool:
+        """头像协议仅接受尺寸受限的 PNG，避免 Base64 与解码资源滥用。"""
+        if not isinstance(encoded, str) or len(encoded) > ((MAX_AVATAR_BYTES + 2) // 3) * 4:
+            return False
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError, binascii.Error):
+            return False
+        if not 24 <= len(raw) <= MAX_AVATAR_BYTES or raw[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        if raw[12:16] != b"IHDR":
+            return False
+        width, height = struct.unpack(">II", raw[16:24])
+        return 0 < width <= MAX_AVATAR_DIMENSION and 0 < height <= MAX_AVATAR_DIMENSION
+
     async def _handshake_error(self, ws, code: str, message: str, *, recoverable: bool = False):
         await self._send(ws, T.ERROR, code=code, message=message, recoverable=recoverable)
 
@@ -1121,6 +1174,14 @@ class ChatServer:
                         continue
                     if name in self._name_to_ws and self._name_to_ws[name] is not ws:
                         old_ws = self._name_to_ws[name]
+                        if not self._same_identity(self._public_key_directory.get(name), key_bundle):
+                            await self._handshake_error(
+                                ws,
+                                "USERNAME_IDENTITY_MISMATCH",
+                                "该用户名已绑定到另一设备身份",
+                                recoverable=True,
+                            )
+                            continue
                         log.info("user '%s' reconnect takeover: closing old websocket", name)
                         try:
                             await old_ws.close(code=4000, reason="replaced by new connection")
@@ -1188,6 +1249,7 @@ class ChatServer:
                         await self._leave(username, ws)
                     rid = requested_id
                     room = Room(id=rid, name=room_name, creator=username,
+                                creator_identity=str(key_bundle.get("identity_public", "")),
                                 locked=locked, salt=salt,
                                 encrypted_access_token=encrypted_access_token,
                                 access_token_hash=access_token_hash)
@@ -1390,7 +1452,7 @@ class ChatServer:
                         if room is None or username not in room.members:
                             await self._send(ws, T.ERROR, message="Not in requested room")
                             continue
-                        if mtype == T.SET_MESSAGE_TTL and room.creator != username:
+                        if mtype == T.SET_MESSAGE_TTL and not self._is_room_creator(room, username, key_bundle):
                             await self._send(ws, T.ERROR, code="FORBIDDEN", message="Only room creator can update TTL")
                             continue
                     else:
@@ -1734,6 +1796,14 @@ class ChatServer:
                         continue
                     data = str(payload.get("data", ""))
                     if data:
+                        if not self._valid_avatar_data(data):
+                            await self._send(
+                                ws,
+                                T.ERROR,
+                                code="INVALID_AVATAR",
+                                message="头像必须是尺寸不超过 512×512、文件不超过 256 KB 的 PNG",
+                            )
+                            continue
                         self._user_avatar[username] = data
                         # Broadcast to everyone in the user's current room
                         rid = self._user_room.get(username)
@@ -1753,7 +1823,7 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message=f"Room '{rid}' does not exist")
                         continue
-                    if room.creator != username:
+                    if not self._is_room_creator(room, username, key_bundle):
                         await self._send(ws, T.ERROR,
                                          message="Only the creator can delete this room")
                         continue
@@ -1779,7 +1849,7 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message=f"Room '{rid}' does not exist")
                         continue
-                    if room.creator != username:
+                    if not self._is_room_creator(room, username, key_bundle):
                         await self._send(ws, T.ERROR,
                                          message="Only the creator can rename this room")
                         continue
@@ -1804,7 +1874,7 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message=f"Room '{rid}' does not exist")
                         continue
-                    if room.creator != username:
+                    if not self._is_room_creator(room, username, key_bundle):
                         await self._send(ws, T.ERROR,
                                          message="Only the creator can change this room's icon")
                         continue

@@ -15,6 +15,7 @@ import sys
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
+from transport_security import validate_server_url
 
 
 def _resource(relative: str) -> str:
@@ -37,7 +38,7 @@ def load_client_config() -> dict:
 
 def load_default_server_url() -> str:
     config = load_client_config()
-    return str(config.get("server_url") or "ws://106.55.8.122:8765")
+    return validate_server_url(config.get("server_url") or "wss://106.55.8.122:8765")
 
 # Windows: force UTF-8 so chat messages with any charset render correctly
 # sys.stdout/stderr are None in --windowed (no console) packaged builds
@@ -58,6 +59,10 @@ def main():
     parser.add_argument("--theme",  default="light", choices=["light", "dark"],
                         help="UI theme")
     args = parser.parse_args()
+    try:
+        args.server = validate_server_url(args.server)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")   # ensures QSS fully applies on all platforms incl. Windows

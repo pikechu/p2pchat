@@ -100,6 +100,10 @@ class StatusDot(QWidget):
         self._state = state
         self.update()
 
+    def set_theme(self, theme: str):
+        self._theme = theme
+        self.update()
+
     def paintEvent(self, _):
         key = f"{'dark_' if self._theme == 'dark' else ''}{self._state}"
         color = QColor(self._COLORS.get(key, self._COLORS["offline"]))
@@ -269,6 +273,12 @@ class BubbleWidget(QFrame):
             self._tick.setStyleSheet(f"color: {t['accent']};")
         self._tick.style().unpolish(self._tick)
         self._tick.style().polish(self._tick)
+
+    def set_theme(self, theme: str):
+        self._theme = theme
+        if hasattr(self, "_tick") and self._tick.objectName() == "TickRead":
+            self._tick.setStyleSheet(f"color: {TOKENS[theme]['accent']};")
+        self.update()
 
     def hasHeightForWidth(self) -> bool:
         return True
@@ -514,6 +524,22 @@ class ConvRowWidget(QWidget):
 
 import os as _os
 
+
+class ElidedLabel(QLabel):
+    """保留完整 tooltip，并按可用宽度省略过长文件名。"""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+
+    def resizeEvent(self, event):
+        self.setText(self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, max(0, self.width())
+        ))
+        super().resizeEvent(event)
+
 class FileCard(QFrame):
     """Shows a file transfer in progress or completed, inside a bubble row."""
 
@@ -530,7 +556,9 @@ class FileCard(QFrame):
         self._theme     = theme
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(360)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
@@ -558,7 +586,7 @@ class FileCard(QFrame):
 
         info = QVBoxLayout()
         info.setSpacing(0)
-        self._name_lbl = QLabel(filename)
+        self._name_lbl = ElidedLabel(filename)
         self._name_lbl.setObjectName("FileCardName")
         self._size_lbl = QLabel(_fmt_size(size))
         self._size_lbl.setObjectName("FileCardSize")
@@ -620,6 +648,10 @@ class FileCard(QFrame):
         self._status_lbl.style().unpolish(self._status_lbl)
         self._status_lbl.style().polish(self._status_lbl)
 
+    def set_theme(self, theme: str):
+        self._theme = theme
+        self.update()
+
     def show_thumbnail(self, data: bytes):
         """Insert an image thumbnail at the top of the card (for images sent by self)."""
         from PyQt6.QtGui import QPixmap
@@ -665,7 +697,8 @@ class ImageCard(QFrame):
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(360)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
@@ -684,16 +717,24 @@ class ImageCard(QFrame):
         cap_row = QHBoxLayout()
         cap_row.setSpacing(4)
         cap_row.addWidget(QLabel("🖼"))
-        name_lbl = QLabel(filename)
+        name_lbl = ElidedLabel(filename)
         name_lbl.setObjectName("FileCardName")
         cap_row.addWidget(name_lbl, 1)
         lay.addLayout(cap_row)
+        self._status_lbl = QLabel("")
+        self._status_lbl.setObjectName("FileCardStatus")
+        self._status_lbl.hide()
+        lay.addWidget(self._status_lbl)
 
     def set_progress(self, pct: int):
         pass  # image is shown immediately; no progress indicator needed
 
     def set_error(self, message: str):
-        pass
+        self._status_lbl.setText(f"Failed: {message}")
+        self._status_lbl.setObjectName("FileCardError")
+        self._status_lbl.show()
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
 
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
@@ -718,7 +759,8 @@ class VideoCard(QFrame):
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(360)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
@@ -732,7 +774,7 @@ class VideoCard(QFrame):
 
         info = QVBoxLayout()
         info.setSpacing(0)
-        name_lbl = QLabel(filename)
+        name_lbl = ElidedLabel(filename)
         name_lbl.setObjectName("FileCardName")
         size_lbl = QLabel(_fmt_size(size))
         size_lbl.setObjectName("FileCardSize")

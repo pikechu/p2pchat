@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import time
+from transport_security import validate_server_url
 
 ROOT     = pathlib.Path(__file__).resolve().parent
 DIST     = ROOT / "dist"
@@ -30,7 +31,7 @@ python "$(git rev-parse --show-toplevel)/build.py"
 """
 
 DEFAULT_CLIENT_CONFIG = {
-    "server_url": "ws://106.55.8.122:8765",
+    "server_url": "wss://106.55.8.122:8765",
     "anonymous_mode": True,
     "allow_custom_server": True,
     "enable_room_password": True,
@@ -146,8 +147,7 @@ def load_build_config(path: pathlib.Path | str | None = None, **overrides) -> di
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
-    if not str(config.get("server_url", "")).strip():
-        raise ValueError("server_url cannot be empty")
+    config["server_url"] = validate_server_url(config.get("server_url", ""))
     return config
 
 

@@ -54,6 +54,13 @@ class SecureSessionManager:
         self._states: dict[str, SessionState] = {}
         self._changes: dict[str, PeerIdentityChange] = {}
 
+    def set_own_name(self, own_name: str) -> None:
+        """显示名修改后立即更新后续 DM scope 与参与者身份。"""
+        value = str(own_name).strip()
+        if not value:
+            raise ValueError("用户名不能为空")
+        self._own_name = value
+
     def cache_peer_bundle(self, peer: str, key_bundle: dict) -> SessionState:
         """缓存已签名的对端公开密钥包并更新 TOFU 状态。"""
         peer = self._require_peer(peer)

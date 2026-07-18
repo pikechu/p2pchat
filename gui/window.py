@@ -32,7 +32,7 @@ from file_transfer import (
 from ice_config import load_ice_servers
 from webrtc_transfer import WebRTCTransfer
 
-from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, pyqtSlot, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, QTemporaryDir, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QLinearGradient, QBrush,
     QAction, QPixmap,
@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QSizePolicy,
     QFrame, QMessageBox, QMenu, QToolButton, QApplication,
     QCheckBox, QComboBox, QStackedWidget, QListWidget, QListWidgetItem,
+    QSplitter,
 )
 
 from protocol import T, TTL_VALUES, pack, unpack
@@ -58,6 +59,7 @@ from crypto import (
 from e2e_crypto import CryptoError, derive_room_root, derive_scope_keys
 from identity import IdentityStore, TrustStore
 from secure_session import SecureSessionError, SecureSessionManager, SessionState
+from transport_security import validate_server_url
 from .bridge import WSBridge
 from .theme import make_qss, TOKENS
 from .widgets import (
@@ -361,7 +363,7 @@ class ConvPanel(QWidget):
         super().__init__(parent)
         self._theme = theme
         self.setObjectName("ConvPanel")
-        self.setFixedWidth(300)
+        self.setMinimumWidth(220)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -696,10 +698,22 @@ class MessagesArea(QScrollArea):
     def add_file_card(self, card):
         wrapper = QWidget()
         lay = QHBoxLayout(wrapper)
-        lay.setContentsMargins(16, 2, 16, 2)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(6)
+        sender = getattr(card, "_sender", "") or (self._own_name if card._outgoing else "")
         if card._outgoing:
             lay.addStretch()
         lay.addWidget(card)
+        if sender:
+            avatar = Avatar(sender, 32)
+            if card._outgoing and self._own_pixmap:
+                avatar.set_pixmap(self._own_pixmap)
+            elif not card._outgoing and sender in self._peer_pixmaps:
+                avatar.set_pixmap(self._peer_pixmaps[sender])
+            if card._outgoing:
+                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+            else:
+                lay.insertWidget(0, avatar, 0, Qt.AlignmentFlag.AlignTop)
         if not card._outgoing:
             lay.addStretch()
         self._lay.insertWidget(self._lay.count() - 1, wrapper)
@@ -774,6 +788,7 @@ class Composer(QWidget):
         self.setObjectName("ComposerBar")
         self._reply_data: dict | None = None
         self._was_typing = False
+        self._clipboard_temp_dir = QTemporaryDir("BeamChat-clipboard-XXXXXX")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -798,23 +813,23 @@ class Composer(QWidget):
         inner_lay.setContentsMargins(8, 4, 4, 4)
         inner_lay.setSpacing(4)
 
-        attach = QPushButton("📎")
-        attach.setObjectName("ComposerIconBtn")
-        attach.setToolTip("发送文件")
-        attach.clicked.connect(self._pick_file)
-        inner_lay.addWidget(attach)
+        self._attach_btn = QPushButton("📎")
+        self._attach_btn.setObjectName("ComposerIconBtn")
+        self._attach_btn.setToolTip("发送文件")
+        self._attach_btn.clicked.connect(self._pick_file)
+        inner_lay.addWidget(self._attach_btn)
 
-        img_btn = QPushButton("🖼")
-        img_btn.setObjectName("ComposerIconBtn")
-        img_btn.setToolTip("发送图片")
-        img_btn.clicked.connect(self._pick_image)
-        inner_lay.addWidget(img_btn)
+        self._image_btn = QPushButton("🖼")
+        self._image_btn.setObjectName("ComposerIconBtn")
+        self._image_btn.setToolTip("发送图片")
+        self._image_btn.clicked.connect(self._pick_image)
+        inner_lay.addWidget(self._image_btn)
 
-        vid_btn = QPushButton("🎬")
-        vid_btn.setObjectName("ComposerIconBtn")
-        vid_btn.setToolTip("发送视频")
-        vid_btn.clicked.connect(self._pick_video)
-        inner_lay.addWidget(vid_btn)
+        self._video_btn = QPushButton("🎬")
+        self._video_btn.setObjectName("ComposerIconBtn")
+        self._video_btn.setToolTip("发送视频")
+        self._video_btn.clicked.connect(self._pick_video)
+        inner_lay.addWidget(self._video_btn)
 
         self._ttl_btn = TTLMenuButton()
         self._ttl_btn.ttl_selected.connect(self.ttl_requested)
@@ -841,10 +856,10 @@ class Composer(QWidget):
         self._emoji_btn.clicked.connect(self.emoji_toggled)
         inner_lay.addWidget(self._emoji_btn)
 
-        send = QPushButton("↑")
-        send.setObjectName("SendBtn")
-        send.clicked.connect(self._on_send)
-        inner_lay.addWidget(send)
+        self._send_btn = QPushButton("↑")
+        self._send_btn.setObjectName("SendBtn")
+        self._send_btn.clicked.connect(self._on_send)
+        inner_lay.addWidget(self._send_btn)
 
         wrap_lay.addWidget(inner_frame)
         outer.addWidget(inner_wrap)
@@ -868,8 +883,14 @@ class Composer(QWidget):
         self._ttl_btn.set_policy(scope_type, scope_id, ttl_seconds, enabled)
 
     def set_enabled(self, enabled: bool):
-        self._input.setEnabled(enabled)
-        self._ttl_btn.setEnabled(enabled)
+        for control in (
+            self._input, self._attach_btn, self._image_btn, self._video_btn,
+            self._ttl_btn, self._emoji_btn, self._send_btn,
+        ):
+            control.setEnabled(enabled)
+        if not enabled:
+            self.clear_reply()
+            self._was_typing = False
         self._input.setPlaceholderText(
             "Message…" if enabled else "Join a room to start chatting"
         )
@@ -906,8 +927,9 @@ class Composer(QWidget):
                 cb = QApplication.clipboard()
                 img = cb.image()
                 if not img.isNull():
-                    import tempfile
-                    tmp = pathlib.Path(tempfile.mktemp(suffix=".png"))
+                    if not self._clipboard_temp_dir.isValid():
+                        return True
+                    tmp = pathlib.Path(self._clipboard_temp_dir.path()) / f"{uuid.uuid4().hex}.png"
                     img.save(str(tmp))
                     self.file_selected.emit(str(tmp))
                     return True
@@ -1530,7 +1552,7 @@ class FilesPanel(QWidget):
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
         self.setObjectName("ConvPanel")
-        self.setFixedWidth(300)
+        self.setMinimumWidth(220)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
@@ -1690,7 +1712,8 @@ class MainWindow(QMainWindow):
 
         # Side panel: update banner + stacked pages
         side_col = QWidget()
-        side_col.setFixedWidth(300)
+        side_col.setMinimumWidth(220)
+        side_col.setMaximumWidth(380)
         side_col_lay = QVBoxLayout(side_col)
         side_col_lay.setContentsMargins(0, 0, 0, 0)
         side_col_lay.setSpacing(0)
@@ -1723,7 +1746,9 @@ class MainWindow(QMainWindow):
         self._side_stack.addWidget(self._files_panel)    # index 1: files
 
         side_col_lay.addWidget(self._side_stack)
-        root.addWidget(side_col)
+        self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._content_splitter.setChildrenCollapsible(False)
+        self._content_splitter.addWidget(side_col)
 
         self._chat = ChatPanel(self._theme)
         self._chat.send_message.connect(self._on_send_message)
@@ -1736,10 +1761,21 @@ class MainWindow(QMainWindow):
         )
         self._chat._info_panel.rename_requested.connect(self._on_room_rename)
         self._chat._info_panel.icon_change_requested.connect(self._on_room_icon_change)
-        root.addWidget(self._chat)
+        self._content_splitter.addWidget(self._chat)
+        self._content_splitter.setStretchFactor(0, 0)
+        self._content_splitter.setStretchFactor(1, 1)
+        self._content_splitter.setSizes([300, 744])
+        root.addWidget(self._content_splitter, 1)
 
     def _apply_theme(self):
         self.setStyleSheet(make_qss(self._theme))
+        # QSS 之外仍有自绘控件和缓存颜色，统一同步主题状态。
+        for widget in self.findChildren(QWidget):
+            setter = getattr(widget, "set_theme", None)
+            if callable(setter):
+                setter(self._theme)
+            elif hasattr(widget, "_theme"):
+                widget._theme = self._theme
 
     # ── WebSocket connection ──────────────────────────────────────────────────
 
@@ -1784,6 +1820,10 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_disconnected(self, reason: str):
+        pending_username = self.__dict__.get("_pending_username_rollback")
+        if "用户名已绑定" in reason and pending_username:
+            self._apply_local_username(pending_username)
+            self.__dict__.pop("_pending_username_rollback", None)
         if self._voice_call and self._voice_call.state.name != "IDLE":
             self._voice_call.hangup()
         _log.error("bridge disconnected: %s", reason)
@@ -1806,6 +1846,14 @@ class MainWindow(QMainWindow):
         for _tid, _card in list(self._ft_cards.items()):
             _card.set_error("连接断开")
             self._ft_manager.cancel(_tid)
+        for sender_info in self._room_file_senders.values():
+            close = getattr(sender_info.get("sender"), "close", None)
+            if callable(close):
+                close()
+        for sender in self._direct_file_senders.values():
+            close = getattr(sender, "close", None)
+            if callable(close):
+                close()
         self._ft_cards.clear()
         self._room_file_senders.clear()
         self._direct_file_senders.clear()
@@ -1838,6 +1886,7 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.READY:
             if payload.get("name") == self._username:
+                self.__dict__.pop("_pending_username_rollback", None)
                 self._identified = True
                 self._send_avatar()
                 self._bridge.send_frame(T.LIST_ROOMS)
@@ -1855,6 +1904,13 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
+            if payload.get("code") == "USERNAME_IDENTITY_MISMATCH":
+                pending_username = self.__dict__.get("_pending_username_rollback")
+                if pending_username:
+                    self._apply_local_username(pending_username)
+                    self.__dict__.pop("_pending_username_rollback", None)
+                QMessageBox.warning(self, "用户名不可用", msg)
+                return
             voice_call = self.__dict__.get("_voice_call")
             if (
                 voice_call
@@ -1872,8 +1928,8 @@ class MainWindow(QMainWindow):
                 voice_call.force_end("unreachable")
                 QMessageBox.warning(self, "无法呼叫", "对方不在线或连接已断开。")
                 return
-            # Silently swallow avatar errors — old servers don't know SET_AVATAR/USER_AVATAR
-            if "AVATAR" in msg.upper():
+            # 仅兼容旧服务端缺少头像协议；输入校验失败必须反馈给用户。
+            if "AVATAR" in msg.upper() and payload.get("code") != "INVALID_AVATAR":
                 _log.warning("server avatar error (suppressed): %s", msg)
                 return
             if msg == "SET_NAME first":
@@ -2453,6 +2509,7 @@ class MainWindow(QMainWindow):
         return dm_id
 
     def _add_dm_file_card(self, peer: str, card):
+        card._sender = self._username if card._outgoing else peer
         dm_id = self._ensure_dm_conversation(peer)
         chat = self.__dict__.get("_chat")
         if chat is not None:
@@ -3051,6 +3108,15 @@ class MainWindow(QMainWindow):
                                         to=rec["from"], transfer_id=tid,
                                         reason="Cancelled by receiver")
         self._ft_manager.cancel(tid)
+        room_sender = self._room_file_senders.pop(tid, None)
+        if room_sender is not None:
+            close = getattr(room_sender.get("sender"), "close", None)
+            if callable(close):
+                close()
+        direct_sender = self._direct_file_senders.get(tid)
+        close = getattr(direct_sender, "close", None)
+        if callable(close):
+            close()
         self._ft_cards.pop(tid, None)
         self._direct_file_senders.pop(tid, None)
         self._encrypted_file_receivers.pop(tid, None)
@@ -3081,6 +3147,7 @@ class MainWindow(QMainWindow):
         if room_id != self._chat.current_room_id:
             return
         card = FileCard(tid, filename, size, outgoing=False, theme=self._theme)
+        card._sender = from_user
         self._ft_cards[tid] = card
         self._chat.add_file_card(card)
 
@@ -3595,9 +3662,15 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         v = dlg.values()
+        try:
+            v["server_url"] = validate_server_url(v["server_url"])
+        except ValueError as exc:
+            QMessageBox.warning(self, "连接不安全", str(exc))
+            return
         changed_server = v["server_url"] != self._server_url
+        old_username = self._username
         self._server_url = v["server_url"]
-        self._username   = v["username"] or self._username
+        new_username = v["username"] or self._username
         self._theme      = v["theme"]
 
         new_dl = pathlib.Path(v["download_dir"]) if v.get("download_dir") else None
@@ -3617,13 +3690,28 @@ class MainWindow(QMainWindow):
             self._webrtc_transfer = self._new_webrtc_transfer(self._ft_manager._dir,
                                                               self._ice_servers)
 
-        self._rail.set_username(self._username)
+        if new_username != old_username:
+            self._pending_username_rollback = old_username
+        self._apply_local_username(new_username)
         self._apply_theme()
 
         if changed_server:
             self._connect()
-        else:
+        elif self._username != old_username:
             self._bridge.send_frame(T.SET_NAME, name=self._username)
+
+    def _apply_local_username(self, username: str) -> None:
+        """原子同步所有持有本机显示名的连接、加密、语音和界面状态。"""
+        self._username = str(username).strip() or self._username
+        self._rail.set_username(self._username)
+        self._chat.set_own_avatar(self._username, self._chat._own_pixmap)
+        self._secure_sessions.set_own_name(self._username)
+        if self._bridge:
+            self._bridge._username = self._username
+        if self._voice_call is not None:
+            self._voice_call._username = self._username
+        if self._webrtc_transfer is not None:
+            self._webrtc_transfer._local_user = self._username
 
     # ── System tray ───────────────────────────────────────────────────────────
 

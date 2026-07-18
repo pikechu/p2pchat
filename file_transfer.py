@@ -218,6 +218,11 @@ class EncryptedFileSender:
         payload = self.next_payload()
         return [] if payload is None else [payload]
 
+    def close(self) -> None:
+        """在取消或异常路径幂等关闭源文件句柄。"""
+        if not self._src.closed:
+            self._src.close()
+
     def _context(self, purpose: str, **kwargs) -> dict:
         return encrypted_file_context(
             transfer_id=self.transfer_id,
@@ -433,6 +438,11 @@ class RoomFileSender:
     def ready_to_finish(self) -> bool:
         return self._done_reading and not self._in_flight and self._sent_chunks == self.total_chunks
 
+    def close(self) -> None:
+        """在取消或异常路径幂等关闭源文件句柄。"""
+        if not self._src.closed:
+            self._src.close()
+
 
 class DirectFileSender:
     def __init__(self, path: pathlib.Path):
@@ -475,6 +485,11 @@ class DirectFileSender:
 
     def ready_to_finish(self) -> bool:
         return self._done_reading and self._sent_chunks == self.total_chunks
+
+    def close(self) -> None:
+        """在取消或异常路径幂等关闭源文件句柄。"""
+        if not self._src.closed:
+            self._src.close()
 
 
 class FileTransferManager:
@@ -568,7 +583,11 @@ class FileTransferManager:
         return out
 
     def cancel(self, transfer_id: str):
-        self.outgoing.pop(transfer_id, None)
+        outgoing = self.outgoing.pop(transfer_id, None)
+        if outgoing is not None:
+            close = getattr(outgoing.get("sender"), "close", None)
+            if callable(close):
+                close()
         if rec := self.incoming.pop(transfer_id, None):
             rec["temp_path"].unlink(missing_ok=True)
 

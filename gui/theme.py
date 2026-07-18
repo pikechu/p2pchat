@@ -127,7 +127,7 @@ def make_qss(theme: str = "light") -> str:
 
     /* ── Conversation panel ─────────────────────────────── */
     #ConvPanel {{ background: {t['bg_sidebar']}; border-right: 1px solid {t['line']}; }}
-    #ConvHeader {{ background: {t['bg_sidebar']}; border-bottom: 1px solid {t['line']}; padding: 14px 16px 10px; }}
+    #ConvHeader {{ background: {t['bg_sidebar']}; border-bottom: 1px solid {t['line']}; padding: 0; }}
     #ConvTitle {{ font-size: 16px; font-weight: 600; color: {t['fg']}; }}
     #NewRoomBtn {{
         background: {t['accent']};
@@ -212,7 +212,7 @@ def make_qss(theme: str = "light") -> str:
     }}
 
     /* Composer */
-    #ComposerBar {{ background: {t['bg_chat']}; border-top: 1px solid {t['line']}; padding: 10px 16px 12px; }}
+    #ComposerBar {{ background: {t['bg_chat']}; border-top: 1px solid {t['line']}; padding: 0; }}
     #ComposerInner {{
         background: {t['bg_input']}; border: 1px solid {t['line']};
         border-radius: 10px; min-height: 40px;

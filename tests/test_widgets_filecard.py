@@ -51,3 +51,17 @@ def test_filecard_image_thumbnail_for_png():
                     outgoing=False, thumbnail_data=b"\x89PNG\r\n")
     # thumbnail_data provided but may be invalid image — must not raise
     assert card is not None
+
+
+def test_filecard_long_name_uses_full_tooltip_and_responsive_width():
+    filename = "very-" * 30 + "long-name.txt"
+    card = FileCard("long", filename, 10, outgoing=True)
+
+    assert card._name_lbl.toolTip() == filename
+    assert card.minimumWidth() < card.maximumWidth()
+
+
+def test_filecard_theme_state_can_be_updated():
+    card = FileCard("theme", "theme.txt", 10, outgoing=True, theme="light")
+    card.set_theme("dark")
+    assert card._theme == "dark"
