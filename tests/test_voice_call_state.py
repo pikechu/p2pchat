@@ -87,7 +87,10 @@ def test_reject_sends_reject_frame(mock_bridge):
     vc.reject_call("dave")
     assert vc.state == CallState.IDLE
     from protocol import T
-    mock_bridge.send_frame.assert_called_once_with(T.CALL_REJECT, to="dave", reason="rejected")
+    call_id = mock_bridge.send_frame.call_args.kwargs["call_id"]
+    mock_bridge.send_frame.assert_called_once_with(
+        T.CALL_REJECT, to="dave", call_id=call_id, reason="rejected"
+    )
 
 
 def test_hangup_active_call_sends_hangup(mock_bridge):
@@ -144,11 +147,11 @@ def test_relay_voice_chunk_sends_encrypted_payload_and_receiver_decrypts_to_jitt
         pcm_float = np.ones((320, 1), dtype=np.float32) * 0.25
         alice._in_stream.callback(pcm_float, 320, None, None)
 
-    sent = mock_bridge.send_frame.call_args
-    assert sent[0][0] == T.VOICE_CHUNK
-    payload = sent[1]["voice"]
+    sent = mock_bridge.send_voice_frame.call_args
+    payload = sent.kwargs["voice"]
     legacy_pcm_b64 = "ACAA" * 160
-    assert sent[1].get("data") is None
+    assert sent.kwargs.get("data") is None
+    assert sent.kwargs["call_id"] == "call-relay"
     assert legacy_pcm_b64 not in str(payload)
 
     bob_bridge = MagicMock()
@@ -188,6 +191,7 @@ def test_voice_call_without_key_does_not_send_plaintext_audio(mock_bridge):
         vc._in_stream.callback(pcm_float, 320, None, None)
 
     mock_bridge.send_frame.assert_not_called()
+    mock_bridge.send_voice_frame.assert_not_called()
 
 
 def test_room_call_uses_fresh_call_id_and_provider_receives_room_id(mock_bridge):
@@ -206,3 +210,65 @@ def test_room_call_uses_fresh_call_id_and_provider_receives_room_id(mock_bridge)
     vc.start_call("bob", room_id="ROOM01")
     second_call_id = mock_bridge.send_frame.call_args.kwargs["call_id"]
     assert second_call_id != first_call_id
+
+
+def test_start_call_send_failure_returns_to_idle(mock_bridge):
+    from voice_call import CallState
+
+    mock_bridge.send_frame.return_value = False
+    vc = _make_call(mock_bridge)
+
+    assert vc.start_call("bob", "@bob") is False
+    assert vc.state == CallState.IDLE
+
+
+def test_reconnect_rebinds_bridge(mock_bridge):
+    new_bridge = MagicMock()
+    vc = _make_call(mock_bridge)
+
+    vc.set_bridge(new_bridge)
+    vc.start_call("bob", "@bob")
+
+    new_bridge.send_frame.assert_called_once()
+    mock_bridge.send_frame.assert_not_called()
+
+
+def test_stale_call_id_does_not_end_current_call(mock_bridge):
+    from voice_call import CallState
+
+    vc = _make_call(mock_bridge)
+    vc.start_call("bob", "@bob")
+    current_call_id = vc.call_id
+
+    vc.on_call_reject("rejected", "old-call", "bob")
+
+    assert vc.state == CallState.CALLING
+    assert vc.call_id == current_call_id
+
+
+def test_call_ended_keeps_original_room_context(mock_bridge):
+    ended = []
+    vc = _make_call(mock_bridge)
+    vc.call_ended.connect(lambda *args: ended.append(args))
+    vc.start_call("bob", "@bob")
+
+    vc.force_end("unreachable")
+
+    assert ended == [("unreachable", 0, "@bob", "bob")]
+
+
+def test_connected_requires_both_media_ready_flags(mock_bridge):
+    from voice_call import CallState
+
+    vc = _make_call(mock_bridge)
+    vc.start_call("bob", "@bob")
+    vc._state = CallState.ICE
+    vc._local_media_ready = True
+
+    with patch.object(vc, "_start_timer") as start_timer:
+        vc._maybe_connected()
+        assert vc.state == CallState.ICE
+        vc.on_media_ready(vc.call_id, "bob")
+
+    assert vc.state == CallState.CONNECTED
+    start_timer.assert_called_once()

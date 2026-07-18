@@ -163,8 +163,12 @@ def test_voice_chunk_rejects_sender_recipient_context_mismatch(server_port, even
 def test_call_offer_to_unknown_returns_error(server_port, event_loop):
     async def run():
         alice = await _connect(server_port, "calice5")
-        await alice.send(pack(T.CALL_OFFER, to="nobody_here", room_id=""))
+        await alice.send(pack(
+            T.CALL_OFFER, to="nobody_here", room_id="", call_id="missing-call"
+        ))
         frame = json.loads(await asyncio.wait_for(alice.recv(), timeout=3))
         assert frame["type"] == T.ERROR
+        assert frame["payload"]["code"] == "CALL_UNREACHABLE"
+        assert frame["payload"]["call_id"] == "missing-call"
         await alice.close()
     event_loop.run_until_complete(run())

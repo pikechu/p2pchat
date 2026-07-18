@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 _log = logging.getLogger(__name__)
 
 _RECONNECT_DELAYS = [1, 2, 4, 8, 15, 30]  # seconds between attempts
+VOICE_MAX_QUEUE = 8
 
 
 class ProtocolIncompatibleError(ConnectionError):
@@ -36,6 +37,7 @@ class WSBridge(QThread):
         self._username = username
         self._loop:       asyncio.AbstractEventLoop | None = None
         self._queue:      asyncio.Queue | None = None
+        self._voice_queue: asyncio.Queue | None = None
         self._stop_event: asyncio.Event | None = None
         self._ws    = None
         self._stop  = False
@@ -63,11 +65,31 @@ class WSBridge(QThread):
             return True
         return False
 
+    def send_voice_frame(self, **payload) -> bool:
+        """将可丢弃的实时语音帧放入独立有界队列。"""
+        if not self.is_connected() or self._voice_queue is None:
+            return False
+        if self._voice_queue.qsize() >= VOICE_MAX_QUEUE:
+            return False
+        raw = pack(T.VOICE_CHUNK, **payload)
+
+        def _enqueue() -> None:
+            if self._voice_queue is None:
+                return
+            try:
+                self._voice_queue.put_nowait(raw)
+            except asyncio.QueueFull:
+                pass
+
+        self._loop.call_soon_threadsafe(_enqueue)
+        return True
+
     def is_connected(self) -> bool:
         return bool(
             self._connected
             and self._loop is not None
             and self._queue is not None
+            and self._voice_queue is not None
             and self._ws is not None
         )
 
@@ -123,6 +145,7 @@ class WSBridge(QThread):
             attempt += 1
 
         self._queue = None
+        self._voice_queue = None
         self._ws = None
         self._connected = False
         self._stop_event = None
@@ -135,6 +158,7 @@ class WSBridge(QThread):
             ) as ws:
                 self._ws    = ws
                 self._queue = asyncio.Queue()
+                self._voice_queue = asyncio.Queue(maxsize=VOICE_MAX_QUEUE)
                 self._ephemeral_private = X25519PrivateKey.generate()
                 ephemeral_public = self._ephemeral_private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
                 await ws.send(pack(
@@ -179,6 +203,7 @@ class WSBridge(QThread):
                     t.cancel()
                 self._connected = False
                 self._queue = None
+                self._voice_queue = None
                 self._ws = None
                 for t in done:
                     if exc := t.exception():
@@ -219,7 +244,7 @@ class WSBridge(QThread):
 
     async def _send_loop(self, ws):
         while True:
-            data = await self._queue.get()
+            data = await self._next_outgoing()
             if data is None:
                 await ws.close()
                 return
@@ -231,3 +256,29 @@ class WSBridge(QThread):
             # Yield between every send so ping/pong tasks can run
             # even when many file chunks are queued back-to-back.
             await asyncio.sleep(0)
+
+    async def _next_outgoing(self):
+        """优先发送实时语音，并确保语音与文件/控制帧不共用 FIFO。"""
+        try:
+            return self._voice_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        control_get = asyncio.create_task(self._queue.get())
+        voice_get = asyncio.create_task(self._voice_queue.get())
+        done, pending = await asyncio.wait(
+            [voice_get, control_get], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if voice_get in done:
+            if control_get in done:
+                self._queue.put_nowait(control_get.result())
+            return voice_get.result()
+        return control_get.result()

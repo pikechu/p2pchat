@@ -767,6 +767,7 @@ class Composer(QWidget):
     emoji_toggled  = pyqtSignal()
     file_selected  = pyqtSignal(str)   # file path
     ttl_requested  = pyqtSignal(object)
+    voice_call_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -819,6 +820,13 @@ class Composer(QWidget):
         self._ttl_btn.ttl_selected.connect(self.ttl_requested)
         inner_lay.addWidget(self._ttl_btn)
 
+        self._voice_btn = QPushButton("📞")
+        self._voice_btn.setObjectName("ComposerIconBtn")
+        self._voice_btn.setToolTip("发起语音通话")
+        self._voice_btn.clicked.connect(self.voice_call_requested)
+        self._voice_btn.hide()
+        inner_lay.addWidget(self._voice_btn)
+
         self._input = QLineEdit()
         self._input.setObjectName("ComposerInput")
         self._input.setPlaceholderText("Message…")
@@ -865,6 +873,10 @@ class Composer(QWidget):
         self._input.setPlaceholderText(
             "Message…" if enabled else "Join a room to start chatting"
         )
+
+    def set_voice_context(self, is_dm: bool, enabled: bool = True) -> None:
+        self._voice_btn.setVisible(is_dm)
+        self._voice_btn.setEnabled(is_dm and enabled)
 
     def set_reply(self, sender: str, text: str, seq: int):
         self._reply_bar.set_reply(sender, text, seq)
@@ -1379,6 +1391,7 @@ class ChatPanel(QWidget):
 
         self._msgs_stack.setCurrentWidget(self._msgs_by_room[room_id])
         self._composer.set_enabled(True)
+        self._composer.set_voice_context(room_id.startswith("@"), False)
         self._composer.clear_reply()
         self._typing.hide_typing()
         self._emoji_panel.hide()
@@ -1395,6 +1408,7 @@ class ChatPanel(QWidget):
             msgs.deleteLater()
 
         self._composer.set_enabled(False)
+        self._composer.set_voice_context(False, False)
         self._composer.clear_reply()
         self._typing.hide_typing()
         self._emoji_panel.hide()
@@ -1717,6 +1731,9 @@ class MainWindow(QMainWindow):
         self._chat.set_typing_callbacks(self._on_typing_start, self._on_typing_stop)
         self._chat.composer.file_selected.connect(self._start_file_send)
         self._chat.composer.ttl_requested.connect(self._on_message_ttl_requested)
+        self._chat.composer.voice_call_requested.connect(
+            self._on_private_voice_button_clicked
+        )
         self._chat._info_panel.rename_requested.connect(self._on_room_rename)
         self._chat._info_panel.icon_change_requested.connect(self._on_room_icon_change)
         root.addWidget(self._chat)
@@ -1752,7 +1769,14 @@ class MainWindow(QMainWindow):
             self._voice_call.state_changed.connect(self._on_call_state_changed)
             self._voice_call.mode_changed.connect(self._on_call_mode_changed)
             self._voice_call.duration_tick.connect(self._on_call_duration)
+            self._voice_call.audio_error.connect(self._on_call_audio_error)
+            self._voice_call.remote_mute_changed.connect(
+                self._on_remote_mute_changed
+            )
+        else:
+            self._voice_call.set_bridge(self._bridge)
         self.setWindowTitle("Beam — P2P Chat")
+        self._update_private_voice_button()
 
     @pyqtSlot(int)
     def _on_reconnecting(self, attempt: int):
@@ -1764,6 +1788,7 @@ class MainWindow(QMainWindow):
             self._voice_call.hangup()
         _log.error("bridge disconnected: %s", reason)
         self._identified = False
+        self._update_private_voice_button()
         if "严格握手" in reason or "协议不兼容" in reason or "PROTOCOL_INCOMPATIBLE" in reason:
             self.setWindowTitle("Beam — P2P Chat  [服务器协议不兼容]")
         else:
@@ -1820,6 +1845,7 @@ class MainWindow(QMainWindow):
                 for rid in self._rooms:
                     self._conv.set_conn_state(rid, "ok")
                 self._chat.set_conn_state("ok")
+                self._update_private_voice_button()
                 rejoin = self._reconnect_room_id
                 self._reconnect_room_id = ""
                 if rejoin and rejoin in self._rooms:
@@ -1829,6 +1855,23 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
+            voice_call = self.__dict__.get("_voice_call")
+            if (
+                voice_call
+                and voice_call.state == CallState.CALLING
+                and (
+                    payload.get("code") == "CALL_UNREACHABLE"
+                    or "not connected" in msg
+                    or "disconnected" in msg
+                )
+                and (
+                    not payload.get("call_id")
+                    or payload.get("call_id") == voice_call.call_id
+                )
+            ):
+                voice_call.force_end("unreachable")
+                QMessageBox.warning(self, "无法呼叫", "对方不在线或连接已断开。")
+                return
             # Silently swallow avatar errors — old servers don't know SET_AVATAR/USER_AVATAR
             if "AVATAR" in msg.upper():
                 _log.warning("server avatar error (suppressed): %s", msg)
@@ -2228,26 +2271,50 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.CALL_ANSWER:
             if self._voice_call:
-                self._voice_call.on_call_answer()
+                self._voice_call.on_call_answer(
+                    payload.get("call_id", ""), payload.get("from", "")
+                )
 
         elif mtype == T.CALL_REJECT:
             reason = payload.get("reason", "")
             if self._voice_call:
-                self._voice_call.on_call_reject(reason)
+                self._voice_call.on_call_reject(
+                    reason, payload.get("call_id", ""), payload.get("from", "")
+                )
 
         elif mtype == T.CALL_HANGUP:
             if self._voice_call:
-                self._voice_call.on_call_hangup()
+                self._voice_call.on_call_hangup(
+                    payload.get("call_id", ""), payload.get("from", "")
+                )
 
         elif mtype == T.CALL_ICE:
             candidate = payload.get("candidate", {})
             if self._voice_call:
-                self._voice_call.on_call_ice(candidate)
+                self._voice_call.on_call_ice(
+                    candidate, payload.get("call_id", ""), payload.get("from", "")
+                )
+
+        elif mtype == T.CALL_MEDIA_READY:
+            if self._voice_call:
+                self._voice_call.on_media_ready(
+                    payload.get("call_id", ""), payload.get("from", "")
+                )
+
+        elif mtype == T.CALL_MUTE_STATE:
+            if self._voice_call:
+                self._voice_call.on_mute_state(
+                    bool(payload.get("muted")),
+                    payload.get("call_id", ""),
+                    payload.get("from", ""),
+                )
 
         elif mtype == T.VOICE_CHUNK:
             data = payload.get("voice", {})
             if self._voice_call:
-                self._voice_call.on_voice_chunk(data)
+                self._voice_call.on_voice_chunk(
+                    data, payload.get("call_id", ""), payload.get("from", "")
+                )
 
         elif mtype == T.WEBRTC_OFFER:
             peer = payload.get("from", "")
@@ -2455,28 +2522,32 @@ class MainWindow(QMainWindow):
         self._incoming_dlg.show()
 
     def _on_call_state_changed(self, state_name: str) -> None:
-        if state_name == "CONNECTED":
+        if state_name in ("CALLING", "ICE", "CONNECTED"):
             if self._incoming_dlg:
+                self._incoming_dlg.stop_timer()
                 self._incoming_dlg.close()
                 self._incoming_dlg = None
             peer = self._voice_call.peer if self._voice_call else ""
-            self._call_widget = CallWidget(peer, self._theme)
-            self._call_widget.setStyleSheet(self.styleSheet())
-            self._call_widget.hangup_requested.connect(
-                lambda: self._voice_call.hangup() if self._voice_call else None
-            )
-            self._call_widget.mute_toggled.connect(self._on_call_mute_toggled)
-            geo = self.geometry()
-            self._call_widget.move(
-                geo.right() - self._call_widget.width() - 20,
-                geo.bottom() - self._call_widget.height() - 60,
-            )
-            self._call_widget.show()
+            if self._call_widget is None:
+                self._call_widget = CallWidget(peer, self._theme)
+                self._call_widget.setStyleSheet(self.styleSheet())
+                self._call_widget.hangup_requested.connect(
+                    lambda: self._voice_call.hangup() if self._voice_call else None
+                )
+                self._call_widget.mute_toggled.connect(self._on_call_mute_toggled)
+                geo = self.geometry()
+                self._call_widget.move(
+                    geo.right() - self._call_widget.width() - 20,
+                    geo.bottom() - self._call_widget.height() - 60,
+                )
+                self._call_widget.show()
+            self._call_widget.set_state(state_name)
         elif state_name == "IDLE":
             if self._call_widget:
                 self._call_widget.close()
                 self._call_widget = None
             if self._incoming_dlg:
+                self._incoming_dlg.stop_timer()
                 self._incoming_dlg.close()
                 self._incoming_dlg = None
 
@@ -2494,13 +2565,22 @@ class MainWindow(QMainWindow):
             if self._call_widget:
                 self._call_widget.set_muted(muted)
 
-    def _on_call_ended(self, reason: str, duration: int) -> None:
+    def _on_remote_mute_changed(self, muted: bool) -> None:
+        if self._call_widget:
+            self._call_widget.set_remote_muted(muted)
+
+    def _on_call_audio_error(self, detail: str) -> None:
+        _log.error("audio device error: %s", detail)
+        QMessageBox.warning(
+            self,
+            "音频设备不可用",
+            "无法启动麦克风或扬声器，请检查系统音频设备。",
+        )
+
+    def _on_call_ended(
+        self, reason: str, duration: int, room_id: str, peer: str
+    ) -> None:
         """Write a system message into the room where the call was initiated."""
-        room_id = ""
-        if self._voice_call:
-            room_id = self._voice_call.room_id
-        if not room_id:
-            room_id = self._chat.current_room_id or ""
         if not room_id:
             return
         # Switch to the room's MessagesArea directly
@@ -2511,15 +2591,43 @@ class MainWindow(QMainWindow):
                 msgs.add_sys_msg(f"📞 通话时长 {m:02d}:{s:02d}")
             elif reason == "rejected":
                 msgs.add_sys_msg("📵 通话未接通")
+            elif reason in ("unreachable", "send_error", "audio_error"):
+                msgs.add_sys_msg("📵 通话连接失败")
 
     def _start_voice_call(self, peer: str) -> None:
         if not self._voice_call:
+            QMessageBox.warning(self, "未连接", "尚未连接，无法发起语音通话。")
+            return
+        if not self._identified or not self._bridge or not self._bridge.is_connected():
+            QMessageBox.warning(self, "未连接", "尚未完成连接或身份认证。")
             return
         if self._voice_call.state != CallState.IDLE:
             QMessageBox.information(self, "通话中", "当前已有通话进行中。")
             return
         room_id = self._chat.current_room_id or ""
-        self._voice_call.start_call(peer, room_id)
+        if not self._voice_call.start_call(peer, room_id):
+            QMessageBox.warning(self, "无法呼叫", "呼叫发送失败，请检查网络连接。")
+
+    def _on_private_voice_button_clicked(self) -> None:
+        room_id = self._chat.current_room_id or ""
+        if not room_id.startswith("@"):
+            return
+        peer = self._dms.get(room_id, room_id[1:])
+        if peer:
+            self._start_voice_call(peer)
+
+    def _update_private_voice_button(self) -> None:
+        chat = getattr(self, "_chat", None)
+        if chat is None:
+            return
+        room_id = chat.current_room_id or ""
+        is_dm = room_id.startswith("@")
+        connected = bool(
+            self._identified
+            and self._bridge
+            and self._bridge.is_connected()
+        )
+        chat.composer.set_voice_context(is_dm, connected)
 
     # ── Room management ───────────────────────────────────────────────────────
 
@@ -2581,6 +2689,7 @@ class MainWindow(QMainWindow):
         self._conv.set_active(dm_id)
         self._current_peer = peer
         self._chat.open_room(dm_id, f"@ {peer}", [peer, self._username], False)
+        self._update_private_voice_button()
         self._refresh_ttl_policy(dm_id)
         self._request_current_ttl(dm_id)
         self._rail.set_active("chats")
@@ -3204,6 +3313,7 @@ class MainWindow(QMainWindow):
             peer = self._dms.get(room_id, room_id[1:])
             self._current_peer = peer
             self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
+            self._update_private_voice_button()
             self._refresh_ttl_policy(room_id)
             self._request_current_ttl(room_id)
             return

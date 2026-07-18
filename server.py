@@ -640,7 +640,18 @@ class ChatServer:
 
     async def _forward_to_user(self, ws, username: str, to_user: str, msg_type: T, **payload) -> bool:
         if to_user not in self._name_to_ws:
-            await self._send(ws, T.ERROR, message=f"User '{to_user}' not connected")
+            error_payload = {"message": f"User '{to_user}' not connected"}
+            if msg_type in {
+                T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT, T.CALL_HANGUP,
+                T.CALL_ICE, T.CALL_MEDIA_READY, T.CALL_MUTE_STATE, T.VOICE_CHUNK,
+            }:
+                error_payload.update(
+                    code="CALL_UNREACHABLE",
+                    call_id=str(payload.get("call_id", "")),
+                    peer=to_user,
+                    recoverable=True,
+                )
+            await self._send(ws, T.ERROR, **error_payload)
             return False
         target_ws = self._name_to_ws[to_user]
         fwd_payload = dict(payload)
@@ -651,7 +662,18 @@ class ChatServer:
         except websockets.exceptions.ConnectionClosed:
             await self._evict(to_user)
             self._name_to_ws.pop(to_user, None)
-            await self._send(ws, T.ERROR, message=f"User '{to_user}' disconnected")
+            error_payload = {"message": f"User '{to_user}' disconnected"}
+            if msg_type in {
+                T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT, T.CALL_HANGUP,
+                T.CALL_ICE, T.CALL_MEDIA_READY, T.CALL_MUTE_STATE, T.VOICE_CHUNK,
+            }:
+                error_payload.update(
+                    code="CALL_UNREACHABLE",
+                    call_id=str(payload.get("call_id", "")),
+                    peer=to_user,
+                    recoverable=True,
+                )
+            await self._send(ws, T.ERROR, **error_payload)
             return False
 
     @staticmethod
@@ -1460,7 +1482,8 @@ class ChatServer:
                     await self._handle_direct_file(ws, username, mtype, payload)
 
                 elif mtype in (T.CALL_OFFER, T.CALL_ANSWER, T.CALL_REJECT,
-                               T.CALL_HANGUP, T.CALL_ICE, T.VOICE_CHUNK,
+                               T.CALL_HANGUP, T.CALL_ICE, T.CALL_MEDIA_READY,
+                               T.CALL_MUTE_STATE, T.VOICE_CHUNK,
                                T.WEBRTC_OFFER, T.WEBRTC_ANSWER, T.WEBRTC_ICE,
                                T.WEBRTC_CLOSE, T.WEBRTC_ERROR):
                     if not username:
@@ -1482,6 +1505,10 @@ class ChatServer:
                             voice.get("sender") != username
                             or voice.get("recipient") != to_user
                             or voice.get("direction") != f"{username}->{to_user}"
+                            or (
+                                payload.get("call_id")
+                                and voice.get("call_id") != payload.get("call_id")
+                            )
                         ):
                             await self._send(
                                 ws,

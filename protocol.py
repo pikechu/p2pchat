@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 CLIENT_VERSION = "1.2.0"
 BASE_CAPABILITIES = [
     "authenticated_key_exchange",
@@ -81,12 +81,14 @@ class T(str, Enum):
     SET_AVATAR     = "SET_AVATAR"     # {data: base64 PNG} — client → server
 
     # voice call (client↔server, user-to-user relay like FILE_*)
-    CALL_OFFER   = "CALL_OFFER"   # {to, room_id?}
-    CALL_ANSWER  = "CALL_ANSWER"  # {to}
-    CALL_REJECT  = "CALL_REJECT"  # {to, reason?}
-    CALL_HANGUP  = "CALL_HANGUP"  # {to}
-    CALL_ICE     = "CALL_ICE"     # {to, candidate: {ip, port}}
-    VOICE_CHUNK  = "VOICE_CHUNK"  # {to, voice: VOICE-AEAD-v1 payload}
+    CALL_OFFER       = "CALL_OFFER"       # {to, room_id?, call_id}
+    CALL_ANSWER      = "CALL_ANSWER"      # {to, call_id}
+    CALL_REJECT      = "CALL_REJECT"      # {to, call_id, reason?}
+    CALL_HANGUP      = "CALL_HANGUP"      # {to, call_id}
+    CALL_ICE         = "CALL_ICE"         # {to, call_id, candidate: {ip, port}}
+    CALL_MEDIA_READY = "CALL_MEDIA_READY" # {to, call_id}
+    CALL_MUTE_STATE  = "CALL_MUTE_STATE"  # {to, call_id, muted}
+    VOICE_CHUNK      = "VOICE_CHUNK"      # {to, call_id, voice: VOICE-AEAD-v1 payload}
 
     # WebRTC signaling (client↔server, user-to-user relay only)
     WEBRTC_OFFER = "WEBRTC_OFFER"  # {to, session_id, sdp}

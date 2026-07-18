@@ -48,6 +48,9 @@ class CallWidget(QWidget):
         # ── Status row ────────────────────────────────────────────
         status = QHBoxLayout()
         status.setSpacing(8)
+        self._status_lbl = QLabel("正在呼叫…")
+        self._status_lbl.setObjectName("CallStatus")
+        status.addWidget(self._status_lbl)
         self._mode_lbl = QLabel("中继 ●")
         self._mode_lbl.setObjectName("CallModeBadge")
         status.addWidget(self._mode_lbl)
@@ -76,6 +79,7 @@ class CallWidget(QWidget):
 
         self.setFixedWidth(220)
         self.adjustSize()
+        self.set_state("CALLING")
 
     # ── Public update methods ─────────────────────────────────────────────────
 
@@ -103,6 +107,21 @@ class CallWidget(QWidget):
             self._mute_btn.setObjectName("CallMuteBtn")
         self._mute_btn.style().unpolish(self._mute_btn)
         self._mute_btn.style().polish(self._mute_btn)
+
+    def set_state(self, state: str) -> None:
+        labels = {
+            "CALLING": "正在呼叫…",
+            "ICE": "正在连接…",
+            "CONNECTED": "通话中",
+        }
+        self._status_lbl.setText(labels.get(state, "通话中"))
+        connected = state == "CONNECTED"
+        self._mode_lbl.setVisible(connected)
+        self._dur_lbl.setVisible(connected)
+        self._mute_btn.setEnabled(connected)
+
+    def set_remote_muted(self, muted: bool) -> None:
+        self._status_lbl.setText("对方已静音" if muted else "通话中")
 
     # ── Drag ──────────────────────────────────────────────────────────────────
 
@@ -173,3 +192,7 @@ class IncomingCallDialog(QDialog):
         self._auto_timer.stop()
         self.rejected_signal.emit()
         self.reject()
+
+    def stop_timer(self) -> None:
+        """关闭已失效来电弹窗时取消迟到的自动拒绝。"""
+        self._auto_timer.stop()
