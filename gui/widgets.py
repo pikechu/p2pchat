@@ -165,7 +165,7 @@ class BubbleWidget(QFrame):
         self.setMaximumWidth(720)  # tightened to natural width by _update_max_width()
 
         vlay = QVBoxLayout(self)
-        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setContentsMargins(12, 8, 12, 8)
         vlay.setSpacing(2)
 
         # Sender name (incoming group messages)
@@ -310,6 +310,74 @@ class BubbleWidget(QFrame):
             QApplication.clipboard().setText(self._text)
         elif chosen == reply_act:
             self.reply_requested.emit(self._sender, self._text, self._seq)
+
+
+# ── Unified message row ───────────────────────────────────────────────────────
+
+class MessageRow(QWidget):
+    """统一承载文本、图片、视频和文件内容，并负责头像与方向对齐。"""
+
+    AVATAR_SIZE = 32
+
+    def __init__(self, content: QWidget, sender: str = "",
+                 outgoing: bool = False, show_avatar: bool = True,
+                 avatar_pixmap: QPixmap | None = None,
+                 reserve_avatar: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MessageRow")
+        self._content = content
+        self._sender = sender
+        self._outgoing = outgoing
+        self._avatar: Avatar | None = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(6)
+
+        avatar = self._make_avatar(show_avatar, avatar_pixmap, reserve_avatar)
+        if outgoing:
+            lay.addStretch(1)
+            lay.addWidget(content)
+            if avatar is not None:
+                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+        else:
+            if avatar is not None:
+                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+            lay.addWidget(content)
+            lay.addStretch(1)
+
+    def _make_avatar(self, show_avatar: bool, pixmap: QPixmap | None,
+                     reserve_avatar: bool) -> QWidget | None:
+        if show_avatar and self._sender:
+            self._avatar = Avatar(self._sender, self.AVATAR_SIZE)
+            if pixmap:
+                self._avatar.set_pixmap(pixmap)
+            return self._avatar
+        if reserve_avatar:
+            placeholder = QWidget()
+            placeholder.setFixedWidth(self.AVATAR_SIZE)
+            return placeholder
+        return None
+
+    @property
+    def content(self) -> QWidget:
+        return self._content
+
+    @property
+    def avatar(self) -> Avatar | None:
+        return self._avatar
+
+    def replace_content(self, content: QWidget) -> None:
+        """原位替换消息内容，同时保留头像、方向和行间距。"""
+        lay = self.layout()
+        index = lay.indexOf(self._content)
+        if index < 0:
+            return
+        old_content = self._content
+        lay.removeWidget(old_content)
+        old_content.setParent(None)
+        lay.insertWidget(index, content)
+        self._content = content
 
 
 # ── Typing indicator ──────────────────────────────────────────────────────────
@@ -556,8 +624,8 @@ class FileCard(QFrame):
         self._theme     = theme
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setMinimumWidth(200)
-        self.setMaximumWidth(360)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
@@ -697,8 +765,9 @@ class ImageCard(QFrame):
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setMinimumWidth(200)
-        self.setMaximumWidth(360)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
@@ -759,8 +828,9 @@ class VideoCard(QFrame):
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setMinimumWidth(200)
-        self.setMaximumWidth(360)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)

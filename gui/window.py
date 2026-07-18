@@ -65,7 +65,7 @@ from .theme import make_qss, TOKENS
 from .widgets import (
     Avatar, StatusDot, BubbleWidget, SysMsgWidget,
     DayMarkWidget, ConvRowWidget, TypingWidget, EmojiPanel,
-    FileCard, ImageCard, VideoCard,
+    FileCard, ImageCard, VideoCard, MessageRow,
 )
 from .popups import popup_above_global_pos, popup_above_widget
 from voice_call import VoiceCall, CallState
@@ -651,38 +651,16 @@ class MessagesArea(QScrollArea):
         bubble = BubbleWidget(sender, text, ts, outgoing, show_sender,
                               self._theme, seq=seq, quote=quote)
         bubble.reply_requested.connect(self.reply_requested)
-        # Wrap in a row widget so heightForWidth() propagates through the layout.
-        # Passing alignment= directly to insertWidget() wraps the bubble in a
-        # fixed-size container using sizeHint() height, which truncates wrapped text.
-        row = QWidget()
-        row_lay = QHBoxLayout(row)
-        row_lay.setContentsMargins(0, 0, 0, 0)
-        row_lay.setSpacing(6)
-        if outgoing:
-            row_lay.addStretch()
-            row_lay.addWidget(bubble)
-            if show_av:
-                own_av = Avatar(self._own_name or sender, 32)
-                if self._own_pixmap:
-                    own_av.set_pixmap(self._own_pixmap)
-                row_lay.addWidget(own_av, 0, Qt.AlignmentFlag.AlignTop)
-            else:
-                ph = QWidget()
-                ph.setFixedWidth(32)
-                row_lay.addWidget(ph)
-        else:
-            if show_sender:
-                av = Avatar(sender, 32)
-                if sender in self._peer_pixmaps:
-                    av.set_pixmap(self._peer_pixmaps[sender])
-                self._peer_avatar_widgets.setdefault(sender, []).append(av)
-                row_lay.addWidget(av, 0, Qt.AlignmentFlag.AlignTop)
-            else:
-                placeholder = QWidget()
-                placeholder.setFixedWidth(32)
-                row_lay.addWidget(placeholder)
-            row_lay.addWidget(bubble)
-            row_lay.addStretch()
+        avatar_pixmap = self._own_pixmap if outgoing else self._peer_pixmaps.get(sender)
+        row = MessageRow(
+            bubble,
+            sender=self._own_name or sender if outgoing else sender,
+            outgoing=outgoing,
+            show_avatar=show_av,
+            avatar_pixmap=avatar_pixmap,
+        )
+        if not outgoing and row.avatar is not None:
+            self._peer_avatar_widgets.setdefault(sender, []).append(row.avatar)
         self._lay.insertWidget(self._lay.count() - 1, row)
         self._last_sender = sender
         QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
@@ -696,27 +674,22 @@ class MessagesArea(QScrollArea):
         self._last_sender = None
 
     def add_file_card(self, card):
-        wrapper = QWidget()
-        lay = QHBoxLayout(wrapper)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(6)
         sender = getattr(card, "_sender", "") or (self._own_name if card._outgoing else "")
-        if card._outgoing:
-            lay.addStretch()
-        lay.addWidget(card)
+        show_avatar = bool(sender) and sender != self._last_sender
+        avatar_pixmap = self._own_pixmap if card._outgoing else self._peer_pixmaps.get(sender)
+        row = MessageRow(
+            card,
+            sender=sender,
+            outgoing=card._outgoing,
+            show_avatar=show_avatar,
+            avatar_pixmap=avatar_pixmap,
+            reserve_avatar=bool(sender),
+        )
+        if not card._outgoing and row.avatar is not None:
+            self._peer_avatar_widgets.setdefault(sender, []).append(row.avatar)
+        self._lay.insertWidget(self._lay.count() - 1, row)
         if sender:
-            avatar = Avatar(sender, 32)
-            if card._outgoing and self._own_pixmap:
-                avatar.set_pixmap(self._own_pixmap)
-            elif not card._outgoing and sender in self._peer_pixmaps:
-                avatar.set_pixmap(self._peer_pixmaps[sender])
-            if card._outgoing:
-                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
-            else:
-                lay.insertWidget(0, avatar, 0, Qt.AlignmentFlag.AlignTop)
-        if not card._outgoing:
-            lay.addStretch()
-        self._lay.insertWidget(self._lay.count() - 1, wrapper)
+            self._last_sender = sender
         QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
             self.verticalScrollBar().maximum()))
 
@@ -1001,7 +974,9 @@ class RoomInfoPanel(QWidget):
     def __init__(self, theme: str = "light", parent=None):
         super().__init__(parent)
         self.setObjectName("RoomInfoPanel")
-        self.setFixedWidth(240)
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(320)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._room_id  = ""
         self._is_creator = False
 
@@ -1345,21 +1320,23 @@ class ChatPanel(QWidget):
         self._emoji_panel.emoji_selected.connect(self._composer.insert_emoji)
         self._emoji_panel.emoji_selected.connect(lambda _: self._emoji_panel.hide())
 
-        # Middle row: messages + collapsible info panel
-        middle = QWidget()
-        middle.setObjectName("ChatMiddle")
-        middle_lay = QHBoxLayout(middle)
-        middle_lay.setContentsMargins(0, 0, 0, 0)
-        middle_lay.setSpacing(0)
-        middle_lay.addWidget(self._msgs_stack, 1)
+        # 消息区与信息面板独立伸缩，避免信息面板挤压聊天内容。
+        self._middle_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._middle_splitter.setObjectName("ChatContentSplitter")
+        self._middle_splitter.setChildrenCollapsible(False)
+        self._middle_splitter.setHandleWidth(1)
+        self._middle_splitter.addWidget(self._msgs_stack)
         self._info_panel = RoomInfoPanel(theme)
         self._info_panel.hide()
-        middle_lay.addWidget(self._info_panel)
+        self._middle_splitter.addWidget(self._info_panel)
+        self._middle_splitter.setStretchFactor(0, 1)
+        self._middle_splitter.setStretchFactor(1, 0)
+        self._middle_splitter.setSizes([720, 240])
 
         self._header.info_toggled.connect(self._toggle_info_panel)
 
         chat_lay.addWidget(self._header)
-        chat_lay.addWidget(middle, 1)
+        chat_lay.addWidget(self._middle_splitter, 1)
         chat_lay.addWidget(self._typing)
         chat_lay.addWidget(self._emoji_panel)
         chat_lay.addWidget(self._composer)
@@ -1399,7 +1376,12 @@ class ChatPanel(QWidget):
         self._emoji_panel.setVisible(not self._emoji_panel.isVisible())
 
     def _toggle_info_panel(self):
-        self._info_panel.setVisible(not self._info_panel.isVisible())
+        opening = self._info_panel.isHidden()
+        self._info_panel.setVisible(opening)
+        if opening:
+            available = max(self._middle_splitter.width(), 440)
+            panel_width = min(240, max(200, available // 3))
+            self._middle_splitter.setSizes([available - panel_width, panel_width])
 
     def open_room(self, room_id: str, name: str, members: list[str], locked: bool,
                   conn_state: str = "ok", creator: str = "",
@@ -1747,7 +1729,9 @@ class MainWindow(QMainWindow):
 
         side_col_lay.addWidget(self._side_stack)
         self._content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._content_splitter.setObjectName("ContentSplitter")
         self._content_splitter.setChildrenCollapsible(False)
+        self._content_splitter.setHandleWidth(1)
         self._content_splitter.addWidget(side_col)
 
         self._chat = ChatPanel(self._theme)
@@ -3204,18 +3188,25 @@ class MainWindow(QMainWindow):
             return
 
         if card := self._ft_cards.pop(tid, None):
+            row = card.parentWidget()
             if mime.startswith("image/"):
                 data = save_path.read_bytes()
                 new_card = ImageCard(tid, filename, data, outgoing=False)
+                new_card._sender = from_user
                 new_card.set_done(save_path=str(save_path))
-                self._chat.add_file_card(new_card)
-                card.setParent(None)
+                if isinstance(row, MessageRow):
+                    row.replace_content(new_card)
+                else:
+                    self._chat.add_file_card(new_card)
                 card.deleteLater()
             elif mime.startswith("video/"):
                 new_card = VideoCard(tid, filename, size, outgoing=False)
+                new_card._sender = from_user
                 new_card.set_done(save_path=str(save_path))
-                self._chat.add_file_card(new_card)
-                card.setParent(None)
+                if isinstance(row, MessageRow):
+                    row.replace_content(new_card)
+                else:
+                    self._chat.add_file_card(new_card)
                 card.deleteLater()
             else:
                 card.set_done(save_path=str(save_path))

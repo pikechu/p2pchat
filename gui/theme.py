@@ -168,8 +168,7 @@ def make_qss(theme: str = "light") -> str:
     #ChatHeader {{
         background: {t['bg_chat']};
         border-bottom: 1px solid {t['line']};
-        padding: 0 16px;
-        min-height: 52px; max-height: 52px;
+        padding: 0;
     }}
     #ChatName {{ font-size: 14.5px; font-weight: 600; color: {t['fg']}; }}
     #ChatSub  {{ font-family: "IBM Plex Mono", monospace; font-size: 11px; color: {t['fg3']}; }}
@@ -193,11 +192,11 @@ def make_qss(theme: str = "light") -> str:
     /* Bubbles */
     #BubbleIn  {{
         background: {t['bubble_in']}; border-radius: 14px;
-        border-bottom-left-radius: 4px; padding: 8px 12px;
+        border-bottom-left-radius: 4px;
     }}
     #BubbleOut {{
         background: {t['bubble_out']}; border-radius: 14px;
-        border-bottom-right-radius: 4px; padding: 8px 12px;
+        border-bottom-right-radius: 4px;
     }}
     #BubbleSender {{ font-size: 12px; font-weight: 600; color: {t['accent']}; margin-bottom: 2px; }}
     #BubbleText   {{ font-size: 13.5px; color: {t['fg']}; line-height: 1.45; }}
@@ -439,6 +438,16 @@ def make_qss(theme: str = "light") -> str:
     }}
     QProgressBar#UpdateProgress::chunk {{
         background: {t['accent']}; border-radius: 3px;
+    }}
+
+    QSplitter#ContentSplitter::handle,
+    QSplitter#ChatContentSplitter::handle {{
+        background: {t['line']};
+        width: 1px;
+    }}
+    QSplitter#ContentSplitter::handle:hover,
+    QSplitter#ChatContentSplitter::handle:hover {{
+        background: {t['accent']};
     }}
 
     /* ── Room info panel ──────────────────────────────────── */
