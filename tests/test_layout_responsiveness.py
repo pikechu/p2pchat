@@ -83,3 +83,20 @@ def test_file_card_can_shrink_and_expand():
 
     assert card.minimumWidth() <= 160
     assert card.maximumWidth() >= 400
+
+
+def test_delayed_scroll_is_cancelled_when_chat_view_is_deleted(monkeypatch):
+    """快速关闭聊天时，文字和文件的延迟滚动不能再访问已销毁视图。"""
+    from PyQt6 import sip
+    from PyQt6.QtTest import QTest
+
+    failures = []
+    monkeypatch.setattr(sys, "excepthook", lambda *error: failures.append(error))
+    messages = MessagesArea(own_name="me")
+    messages.add_message("me", "hello", 1, outgoing=True)
+    messages.add_file_card(FileCard("transfer", "notes.txt", 128, outgoing=True))
+
+    sip.delete(messages)
+    QTest.qWait(100)
+
+    assert failures == []

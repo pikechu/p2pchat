@@ -2,6 +2,7 @@ import os
 import pathlib
 import sys
 import types
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,6 +57,9 @@ def _make_window_stub():
     window.isActiveWindow = MagicMock(return_value=True)
     window.isVisible = MagicMock(return_value=True)
     window._webrtc_file_pending = {}
+    window._ft_cards = {}
+    # 分发测试同步执行协程；持久循环与线程安全另有真实循环回归覆盖。
+    window._run_webrtc_task = MagicMock(side_effect=lambda coro: asyncio.run(coro))
     window._webrtc_transfer = MagicMock()
     window._webrtc_transfer.handle_offer = AsyncMock()
     window._webrtc_transfer.handle_answer = AsyncMock()

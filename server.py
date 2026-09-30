@@ -81,6 +81,8 @@ class Room:
     seq: int = 0
     # username → websocket
     members: Dict[str, object] = field(default_factory=dict)
+    # 成员身份独立于在线连接保存，只有显式退群才移除。
+    member_identities: Dict[str, str] = field(default_factory=dict)
 
 
 # ── Server ───────────────────────────────────────────────────────────────────
@@ -115,8 +117,10 @@ class ChatServer:
         self._name_to_ws: Dict[str, object] = {}
         # 仅保存已就绪在线用户的公开密钥包，连接关闭时立即删除。
         self._public_key_directory: Dict[str, dict] = {}
-        # username → room_id
+        # 保留最近访问的群作为旧协议省略 room_id 时的兼容路由。
         self._user_room: Dict[str, str] = {}
+        # 同一用户可以同时加入多个群。
+        self._user_rooms: Dict[str, set[str]] = {}
         # room_id → {seq: sender_username}  — for ack routing
         self._seq_to_sender: Dict[str, Dict[int, str]] = {}
         # username → base64-encoded PNG avatar (set via SET_AVATAR)
@@ -498,68 +502,29 @@ class ChatServer:
                 after = self._safe_int(scope.get("after_message_id", 0), default=0) or 0
                 if scope_type not in {"room", "dm"} or not scope_id:
                     continue
+                after_time = self._safe_int(scope.get("after_created_at", 0), default=0) or 0
+                filters = [
+                    "scope_type = ?", "scope_id = ?", "deleted_at IS NULL",
+                    "(expires_at IS NULL OR expires_at > ?)",
+                ]
+                params = [scope_type, scope_id, now_i]
+                if after > 0:
+                    filters.append("id > ?")
+                    params.append(after)
+                elif after_time > 0:
+                    # 秒级时间戳可能相同，包含边界后由客户端按消息 ID 去重。
+                    filters.append("created_at >= ?")
+                    params.append(after_time)
                 if scope_type == "dm" and requester:
-                    if after <= 0:
-                        rows = db.execute(
-                            """
-                            SELECT * FROM (
-                              SELECT * FROM messages
-                              WHERE scope_type = ?
-                                AND scope_id = ?
-                                AND deleted_at IS NULL
-                                AND (expires_at IS NULL OR expires_at > ?)
-                                AND (sender_name = ? OR recipient_name = ?)
-                              ORDER BY id DESC
-                              LIMIT ?
-                            ) ORDER BY id ASC
-                            """,
-                            (scope_type, scope_id, now_i, requester, requester, limit_i - len(out)),
-                        ).fetchall()
-                    else:
-                        rows = db.execute(
-                            """
-                            SELECT * FROM messages
-                            WHERE scope_type = ?
-                              AND scope_id = ?
-                              AND id > ?
-                              AND deleted_at IS NULL
-                              AND (expires_at IS NULL OR expires_at > ?)
-                              AND (sender_name = ? OR recipient_name = ?)
-                            ORDER BY id ASC
-                            LIMIT ?
-                            """,
-                            (scope_type, scope_id, after, now_i, requester, requester, limit_i - len(out)),
-                        ).fetchall()
-                else:
-                    if after <= 0:
-                        rows = db.execute(
-                            """
-                            SELECT * FROM (
-                              SELECT * FROM messages
-                              WHERE scope_type = ?
-                                AND scope_id = ?
-                                AND deleted_at IS NULL
-                                AND (expires_at IS NULL OR expires_at > ?)
-                              ORDER BY id DESC
-                              LIMIT ?
-                            ) ORDER BY id ASC
-                            """,
-                            (scope_type, scope_id, now_i, limit_i - len(out)),
-                        ).fetchall()
-                    else:
-                        rows = db.execute(
-                            """
-                            SELECT * FROM messages
-                            WHERE scope_type = ?
-                              AND scope_id = ?
-                              AND id > ?
-                              AND deleted_at IS NULL
-                              AND (expires_at IS NULL OR expires_at > ?)
-                            ORDER BY id ASC
-                            LIMIT ?
-                            """,
-                            (scope_type, scope_id, after, now_i, limit_i - len(out)),
-                        ).fetchall()
+                    filters.append("(sender_name = ? OR recipient_name = ?)")
+                    params.extend([requester, requester])
+                forward = after > 0 or after_time > 0 or scope.get("history_mode") == "all"
+                order = "ASC" if forward else "DESC"
+                query = f"SELECT * FROM messages WHERE {' AND '.join(filters)} ORDER BY id {order} LIMIT ?"
+                params.append(limit_i - len(out))
+                rows = db.execute(query, params).fetchall()
+                if not forward:
+                    rows.reverse()
                 for row in rows:
                     try:
                         crypto_meta = json.loads(row["crypto_meta"] or "{}")
@@ -582,6 +547,32 @@ class ChatServer:
                     if len(out) >= limit_i:
                         return out
         return out
+
+    def _sync_messages_page(self, scopes: list[dict], *, limit: int = 200,
+                            requester: str | None = None) -> tuple[list[dict], list[dict]]:
+        """按各群游标续拉，避免全局页大小使后面的群丢失离线消息。"""
+        limit_i = max(1, min(int(limit or 200), 500))
+        messages: list[dict] = []
+        next_scopes: list[dict] = []
+        for scope in scopes[:50]:
+            remaining = limit_i - len(messages)
+            if remaining <= 0:
+                next_scopes.append(dict(scope))
+                continue
+            page = self._load_messages_for_sync([scope], limit=remaining, requester=requester)
+            messages.extend(page)
+            if not page:
+                continue
+            after = self._safe_int(scope.get("after_message_id"), default=0) or 0
+            after_time = self._safe_int(scope.get("after_created_at"), default=0) or 0
+            if after <= 0 and after_time <= 0 and scope.get("history_mode") != "all":
+                # 首次打开群沿用最近一页历史；离线补收使用正向游标或 all。
+                continue
+            next_scope = dict(scope, after_message_id=page[-1]["message_id"])
+            if self._load_messages_for_sync([next_scope], limit=1, requester=requester):
+                next_scopes.append(next_scope)
+        messages.sort(key=lambda message: message["message_id"])
+        return messages, next_scopes
 
     def _delete_expired_messages(self, *, now: int | float | None = None) -> int:
         if not self._enable_message_persistence:
@@ -891,8 +882,11 @@ class ChatServer:
                     access_token_hash=r.get("access_token_hash", ""),
                     created_at=r.get("created_at", time.time()),
                     icon=r.get("icon", ""),
+                    member_identities=r.get("member_identities") or {},
                 )
                 self._rooms[room.id] = room
+                for member in room.member_identities:
+                    self._user_rooms.setdefault(member, set()).add(room.id)
             log.info("loaded %d room(s) from %s", len(self._rooms), _ROOMS_FILE)
         except Exception as exc:
             log.error("failed to load rooms: %s", exc)
@@ -905,7 +899,8 @@ class ChatServer:
                  "locked": r.locked, "salt": r.salt,
                  "encrypted_access_token": r.encrypted_access_token or {},
                  "access_token_hash": r.access_token_hash,
-                 "created_at": r.created_at, "icon": r.icon}
+                 "created_at": r.created_at, "icon": r.icon,
+                 "member_identities": r.member_identities}
                 for r in self._rooms.values()
             ]}
             _ROOMS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
@@ -936,27 +931,64 @@ class ChatServer:
             try:
                 await ws.send(pack(msg_type, **payload))
             except websockets.exceptions.ConnectionClosed:
-                dead.append(uname)
-        for u in dead:
-            await self._evict(u)
+                dead.append((uname, ws))
+        for uname, dead_ws in dead:
+            await self._evict(uname, dead_ws)
 
     async def _broadcast_global(self, msg_type: T, **payload):
         """Broadcast to every connected user."""
         for ws in list(self._name_to_ws.values()):
             await self._send(ws, msg_type, **payload)
 
-    async def _evict(self, username: str):
-        """Remove a user from their room without sending a LEAVE frame."""
-        room_id = self._user_room.pop(username, None)
-        if room_id and room_id in self._rooms:
+    def _joined_rooms(self, username: str) -> set[str]:
+        """兼容旧单群索引，同时返回用户保留的全部成员关系。"""
+        room_ids = set(self._user_rooms.get(username, set()))
+        current = self._user_room.get(username)
+        if current:
+            room_ids.add(current)
+        return room_ids
+
+    def _has_room_membership(self, username: str, room_id: str) -> bool:
+        room = self._rooms.get(room_id)
+        return room is not None and username in room.members
+
+    async def _disconnect_room(self, username: str, room_id: str, expected_ws=None):
+        """移除群内在线连接，不改变保存的成员身份。"""
+        if room_id in self._rooms:
             room = self._rooms[room_id]
-            room.members.pop(username, None)
-            # Rooms persist even when empty — never auto-delete
+            if expected_ws is not None and room.members.get(username) is not expected_ws:
+                return
+            if room.members.pop(username, None) is None:
+                return
             if room.members:
                 await self._broadcast(room, T.USER_LEFT, username=username,
                                       room_id=room_id)
             else:
                 log.info("room %s is now empty (persisted)", room_id)
+
+    async def _restore_memberships(self, username: str, ws, key_bundle: dict):
+        """重连只恢复同一设备身份曾加入的群，不能凭同名取得成员权限。"""
+        for room_id in sorted(self._joined_rooms(username)):
+            room = self._rooms.get(room_id)
+            if room is None or not self._same_identity(
+                {"identity_public": room.member_identities.get(username)}, key_bundle
+            ):
+                continue
+            room.members[username] = ws
+            self._user_room[username] = room_id
+            await self._broadcast(room, T.USER_JOINED, exclude=username,
+                                  username=username, room_id=room_id)
+
+    async def _evict(self, username: str, expected_ws=None):
+        """断线时清理在线连接与传输，保留群成员身份供重连恢复。"""
+        if expected_ws is not None and self._name_to_ws.get(username) is not expected_ws:
+            return
+        room_ids = self._joined_rooms(username)
+        self._user_room.pop(username, None)
+        for room_id in room_ids:
+            await self._disconnect_room(username, room_id, expected_ws)
+        if expected_ws is not None and self._name_to_ws.get(username) is not expected_ws:
+            return
         # Clean up any in-progress transfers started by this user
         stale = [t for t, m in self._transfer_meta.items() if m["from_user"] == username]
         for tid in stale:
@@ -992,16 +1024,38 @@ class ChatServer:
                                  transfer_id=tid,
                                  message=f"User '{username}' disconnected")
 
-    async def _leave(self, username: str, ws):
-        """Graceful leave — also notifies remaining members."""
-        await self._evict(username)
-        await self._send(ws, T.ROOM_LEFT)
+    async def _leave(self, username: str, ws, room_id: str = ""):
+        """显式退群只删除指定群的成员身份，其他群与私聊保持在线。"""
+        room_id = room_id or self._user_room.get(username, "")
+        if not room_id:
+            await self._send(ws, T.ROOM_LEFT, room_id="")
+            return
+        if not self._has_room_membership(username, room_id):
+            await self._send(ws, T.ERROR, code="ROOM_NOT_JOINED", room_id=room_id,
+                             message="尚未加入指定群")
+            return
+        await self._disconnect_room(username, room_id)
+        self._rooms[room_id].member_identities.pop(username, None)
+        room_ids = self._user_rooms.get(username, set())
+        room_ids.discard(room_id)
+        if not room_ids:
+            self._user_rooms.pop(username, None)
+        if self._user_room.get(username) == room_id:
+            self._user_room.pop(username, None)
+            if room_ids:
+                self._user_room[username] = sorted(room_ids)[-1]
+        for transfer_id, meta in list(self._transfer_meta.items()):
+            if meta["room_id"] == room_id and meta["from_user"] == username:
+                await self._fail_room_transfer(ws, transfer_id, "发送者已退出群聊")
+        self._save_rooms()
+        await self._send(ws, T.ROOM_LEFT, room_id=room_id)
 
     async def _rename_ready_user(self, old_name: str, new_name: str, ws) -> None:
         """同步已就绪连接改名后依赖用户名索引的内存状态。"""
         if old_name == new_name:
             return
 
+        key_bundle = self._public_key_directory.get(old_name)
         self._ws_to_name[ws] = new_name
         self._name_to_ws.pop(old_name, None)
         self._name_to_ws[new_name] = ws
@@ -1011,25 +1065,52 @@ class ChatServer:
         if old_name in self._user_avatar:
             self._user_avatar[new_name] = self._user_avatar.pop(old_name)
 
-        room_id = self._user_room.pop(old_name, None)
-        if room_id:
-            self._user_room[new_name] = room_id
-            room = self._rooms.get(room_id)
-            if room is not None:
-                was_member = old_name in room.members
-                if old_name in room.members:
+        room_ids = self._joined_rooms(old_name)
+        active_room = self._user_room.pop(old_name, None)
+        migrated_rooms = set()
+        changed = False
+        for room_id, room in self._rooms.items():
+            was_member = room.members.get(old_name) is ws
+            member_identity = room.member_identities.get(old_name, "")
+            owns_member = self._same_identity({"identity_public": member_identity}, key_bundle) or (
+                not member_identity and was_member
+            )
+            owns_creator = room.creator == old_name and (
+                self._same_identity({"identity_public": room.creator_identity}, key_bundle)
+                or (not room.creator_identity and owns_member)
+            )
+            if owns_member:
+                # 同名离线身份不能被当前连接改名；旧在线成员可在此绑定身份。
+                room.member_identities.pop(old_name, None)
+                room.member_identities[new_name] = member_identity or str((key_bundle or {}).get("identity_public", ""))
+                migrated_rooms.add(room_id)
+                changed = True
+                if was_member:
                     room.members.pop(old_name, None)
                     room.members[new_name] = ws
-                if room.creator == old_name:
-                    room.creator = new_name
-                    self._save_rooms()
-                if was_member:
                     await self._broadcast(room, T.USER_LEFT, exclude=new_name,
                                           username=old_name, room_id=room_id)
                     await self._broadcast(room, T.USER_JOINED, exclude=new_name,
                                           username=new_name, room_id=room_id)
+            if owns_creator:
+                room.creator = new_name
+                if not room.creator_identity:
+                    room.creator_identity = str((key_bundle or {}).get("identity_public", ""))
+                changed = True
+        remaining_rooms = room_ids - migrated_rooms
+        if remaining_rooms:
+            self._user_rooms[old_name] = remaining_rooms
+        else:
+            self._user_rooms.pop(old_name, None)
+        if migrated_rooms:
+            self._user_rooms.setdefault(new_name, set()).update(migrated_rooms)
+        if active_room in migrated_rooms:
+            self._user_room[new_name] = active_room
+        if changed:
+            self._save_rooms()
 
-        for room_senders in self._seq_to_sender.values():
+        for room_id in migrated_rooms:
+            room_senders = self._seq_to_sender.get(room_id, {})
             for seq, sender in list(room_senders.items()):
                 if sender == old_name:
                     room_senders[seq] = new_name
@@ -1187,7 +1268,7 @@ class ChatServer:
                             await old_ws.close(code=4000, reason="replaced by new connection")
                         except Exception:
                             pass
-                        await self._evict(name)
+                        await self._evict(name, old_ws)
                         self._ws_to_name.pop(old_ws, None)
                         self._name_to_ws.pop(name, None)
                     old_username = username
@@ -1200,6 +1281,8 @@ class ChatServer:
                     self._public_key_directory[username] = key_bundle
                     state = "READY"
                     await self._send(ws, T.READY, name=username)
+                    if not old_username:
+                        await self._restore_memberships(username, ws, key_bundle)
                     log.info("user '%s' connected", username)
 
                 elif state != "READY":
@@ -1244,9 +1327,6 @@ class ChatServer:
                     ):
                         await self._send(ws, T.ERROR, code="INVALID_ROOM_METADATA", message="房间加密元数据无效")
                         continue
-                    # leave current room if any
-                    if username in self._user_room:
-                        await self._leave(username, ws)
                     rid = requested_id
                     room = Room(id=rid, name=room_name, creator=username,
                                 creator_identity=str(key_bundle.get("identity_public", "")),
@@ -1254,8 +1334,10 @@ class ChatServer:
                                 encrypted_access_token=encrypted_access_token,
                                 access_token_hash=access_token_hash)
                     room.members[username] = ws
+                    room.member_identities[username] = str(key_bundle.get("identity_public", ""))
                     self._rooms[rid]       = room
                     self._user_room[username] = rid
+                    self._user_rooms.setdefault(username, set()).add(rid)
                     await self._send(ws, T.ROOM_CREATED,
                                      room_id=rid, name=room_name, locked=locked,
                                      creator=username, created_at=room.created_at)
@@ -1269,19 +1351,22 @@ class ChatServer:
                         continue
                     rid = str(payload.get("room_id", "")).strip().upper()
                     if rid not in self._rooms:
-                        await self._send(ws, T.ERROR,
-                                         message=f"Room '{rid}' does not exist")
+                        await self._send(ws, T.ERROR, code="ROOM_NOT_FOUND", room_id=rid,
+                                         message=f"群 '{rid}' 不存在")
                         continue
                     room = self._rooms[rid]
                     access_token = str(payload.get("access_token", ""))
                     supplied_hash = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
                     if not access_token or not hmac.compare_digest(supplied_hash, room.access_token_hash):
-                        await self._send(ws, T.ERROR, code="ROOM_ACCESS_DENIED", message="房间访问令牌无效")
+                        await self._send(ws, T.ERROR, code="ROOM_ACCESS_DENIED", room_id=rid,
+                                         message="房间访问令牌无效")
                         continue
-                    if username in self._user_room:
-                        await self._leave(username, ws)
+                    already_online = username in room.members
                     room.members[username] = ws
+                    room.member_identities[username] = str(key_bundle.get("identity_public", ""))
                     self._user_room[username] = rid
+                    self._user_rooms.setdefault(username, set()).add(rid)
+                    self._save_rooms()
                     await self._send(ws, T.ROOM_JOINED,
                                      room_id=rid,
                                      name=room.name,
@@ -1290,9 +1375,10 @@ class ChatServer:
                                      created_at=room.created_at,
                                      icon=room.icon,
                                      members=list(room.members))
-                    await self._broadcast(room, T.USER_JOINED,
-                                          exclude=username, username=username,
-                                          room_id=rid)
+                    if not already_online:
+                        await self._broadcast(room, T.USER_JOINED,
+                                              exclude=username, username=username,
+                                              room_id=rid)
                     # Send the joiner's avatar to existing members, and existing
                     # members' avatars to the joiner.
                     if username in self._user_avatar:
@@ -1310,7 +1396,7 @@ class ChatServer:
                 # ── LEAVE_ROOM ───────────────────────────────────────────────
                 elif mtype == T.LEAVE_ROOM:
                     if username:
-                        await self._leave(username, ws)
+                        await self._leave(username, ws, str(payload.get("room_id", "")).strip().upper())
 
                 # ── SEND_MSG ─────────────────────────────────────────────────
                 elif mtype == T.SEND_MSG:
@@ -1328,8 +1414,9 @@ class ChatServer:
                         await self._send(ws, T.ERROR, message="Invalid encrypted message payload")
                         continue
                     recipient_name = None
-                    if scope_type == "room" and self._user_room.get(username) != scope_id:
-                        await self._send(ws, T.ERROR, message="Not in requested room")
+                    if scope_type == "room" and not self._has_room_membership(username, scope_id):
+                        await self._send(ws, T.ERROR, code="ROOM_NOT_JOINED", room_id=scope_id,
+                                         message="尚未加入指定群")
                         continue
                     if scope_type == "dm":
                         recipient_name = str(payload.get("to", "")).strip()[:32]
@@ -1416,7 +1503,7 @@ class ChatServer:
                                 allowed.append(scope)
                         elif scope_type == "dm":
                             allowed.append(scope)
-                    messages = self._load_messages_for_sync(
+                    messages, next_scopes = self._sync_messages_page(
                         allowed,
                         limit=self._safe_int(payload.get("limit"), default=200) or 200,
                         requester=username,
@@ -1425,7 +1512,8 @@ class ChatServer:
                         ws,
                         T.SYNC_MESSAGES_RESULT,
                         messages=messages,
-                        has_more=False,
+                        has_more=bool(next_scopes),
+                        next_scopes=next_scopes,
                     )
 
                 # ── SET_MESSAGE_TTL / GET_MESSAGE_TTL ─────────────────────
@@ -1509,8 +1597,8 @@ class ChatServer:
                 # ── TYPING ───────────────────────────────────────────────────
                 elif mtype == T.TYPING:
                     if username:
-                        rid = self._user_room.get(username)
-                        if rid and rid in self._rooms:
+                        rid = str(payload.get("room_id") or self._user_room.get(username, ""))
+                        if self._has_room_membership(username, rid):
                             room = self._rooms[rid]
                             await self._broadcast(room, T.USER_TYPING,
                                                   exclude=username,
@@ -1521,10 +1609,10 @@ class ChatServer:
                 # ── MSG_ACK ──────────────────────────────────────────────────
                 elif mtype == T.MSG_ACK:
                     if username:
-                        rid = self._user_room.get(username)
+                        rid = str(payload.get("room_id") or self._user_room.get(username, ""))
                         seq = payload.get("seq")
                         status = str(payload.get("status", "delivered"))
-                        if rid and seq is not None:
+                        if self._has_room_membership(username, rid) and seq is not None:
                             sender_name = self._seq_to_sender.get(rid, {}).get(int(seq))
                             if sender_name and sender_name != username \
                                     and sender_name in self._name_to_ws:
@@ -1588,12 +1676,7 @@ class ChatServer:
                     if not username:
                         await self._send(ws, T.ERROR, message="SET_NAME first")
                         continue
-                    rid = self._user_room.get(username, "")
-                    if not rid:
-                        await self._send(ws, T.FILE_ROOM_ERROR,
-                                         transfer_id=payload.get("transfer_id", ""),
-                                         message="Not in a room")
-                        continue
+                    rid = str(payload.get("room_id") or self._user_room.get(username, ""))
                     if self._has_legacy_file_fields(payload, {"filename", "mime", "sha256", "data"}):
                         await self._send(ws, T.FILE_ROOM_ERROR,
                                          transfer_id=payload.get("transfer_id", ""),
@@ -1628,6 +1711,11 @@ class ChatServer:
                         await self._send(ws, T.FILE_ROOM_ERROR,
                                          transfer_id=payload.get("transfer_id", ""),
                                          message=f"文件过大（最大 {MAX_FILE_BYTES//1024//1024} MB）")
+                        continue
+                    if not self._has_room_membership(username, rid):
+                        await self._send(ws, T.FILE_ROOM_ERROR,
+                                         transfer_id=payload.get("transfer_id", ""),
+                                         message="尚未加入指定群")
                         continue
                     tid = str(payload.get("transfer_id", ""))
                     self._transfer_meta[tid] = {
@@ -1805,12 +1893,11 @@ class ChatServer:
                             )
                             continue
                         self._user_avatar[username] = data
-                        # Broadcast to everyone in the user's current room
-                        rid = self._user_room.get(username)
-                        if rid and rid in self._rooms:
-                            await self._broadcast(self._rooms[rid], T.USER_AVATAR,
-                                                  exclude=username,
-                                                  name=username, data=data)
+                        for rid in self._joined_rooms(username):
+                            if self._has_room_membership(username, rid):
+                                await self._broadcast(self._rooms[rid], T.USER_AVATAR,
+                                                      exclude=username,
+                                                      name=username, data=data)
 
                 # ── DELETE_ROOM ──────────────────────────────────────────────
                 elif mtype == T.DELETE_ROOM:
@@ -1827,10 +1914,18 @@ class ChatServer:
                         await self._send(ws, T.ERROR,
                                          message="Only the creator can delete this room")
                         continue
-                    # Kick all current members out
+                    # 删除群只移除该群的成员关系。
                     for uname, mws in list(room.members.items()):
-                        self._user_room.pop(uname, None)
-                        await self._send(mws, T.ROOM_LEFT)
+                        await self._send(mws, T.ROOM_LEFT, room_id=rid)
+                    for uname in set(room.members) | set(room.member_identities):
+                        room_ids = self._user_rooms.get(uname, set())
+                        room_ids.discard(rid)
+                        if not room_ids:
+                            self._user_rooms.pop(uname, None)
+                        if self._user_room.get(uname) == rid:
+                            self._user_room.pop(uname, None)
+                            if room_ids:
+                                self._user_room[uname] = sorted(room_ids)[-1]
                     del self._rooms[rid]
                     self._seq_to_sender.pop(rid, None)
                     self._save_rooms()
@@ -1891,10 +1986,11 @@ class ChatServer:
             pass
         finally:
             if username:
-                await self._evict(username)
                 if self._name_to_ws.get(username) is ws:
-                    self._name_to_ws.pop(username, None)
-                    self._public_key_directory.pop(username, None)
+                    await self._evict(username, ws)
+                    if self._name_to_ws.get(username) is ws:
+                        self._name_to_ws.pop(username, None)
+                        self._public_key_directory.pop(username, None)
             self._ws_to_name.pop(ws, None)
             log.info("user '%s' disconnected", username or "<anon>")
 

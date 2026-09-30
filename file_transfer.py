@@ -129,6 +129,13 @@ class EncryptedFileSender:
         return self._acked_chunks
 
     def offer_payload(self) -> dict:
+        try:
+            return self._offer_payload()
+        except (OSError, CryptoError, TypeError, ValueError) as exc:
+            self.close()
+            raise FileCryptoError("文件读取或加密失败") from exc
+
+    def _offer_payload(self) -> dict:
         if self._metadata_envelope is None:
             digest = _file_digest(self.path)
             metadata = {
@@ -152,6 +159,13 @@ class EncryptedFileSender:
         }
 
     def next_payload(self) -> Optional[dict]:
+        try:
+            return self._next_payload()
+        except (OSError, CryptoError, TypeError, ValueError) as exc:
+            self.close()
+            raise FileCryptoError("文件读取或加密失败") from exc
+
+    def _next_payload(self) -> Optional[dict]:
         if self._done_reading:
             return None
         if self._zero_chunk_pending:
@@ -282,10 +296,14 @@ class EncryptedFileReceiver:
         except (CryptoError, KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
             self.cancel()
             raise FileCryptoError("文件元数据认证失败") from exc
+        try:
+            self.temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.cancel()
+            raise FileCryptoError("无法准备文件接收目录") from exc
         self.metadata = metadata
         self.received_chunks = 0
         self._hasher = hashlib.sha256()
-        self.temp_path.unlink(missing_ok=True)
         return {
             "filename": metadata.filename,
             "size": metadata.size,
@@ -318,8 +336,12 @@ class EncryptedFileReceiver:
         except (CryptoError, TypeError, ValueError, OSError) as exc:
             self.cancel()
             raise FileCryptoError("文件分块认证失败") from exc
-        with self.temp_path.open("ab") as out:
-            out.write(chunk)
+        try:
+            with self.temp_path.open("ab") as out:
+                out.write(chunk)
+        except OSError as exc:
+            self.cancel()
+            raise FileCryptoError("文件写入失败") from exc
         self._hasher.update(chunk)
         self.received_chunks += 1
         return True
@@ -350,12 +372,21 @@ class EncryptedFileReceiver:
         while out.exists():
             out = self._dir / f"{stem}_{counter}{suffix}"
             counter += 1
-        self.temp_path.replace(out)
+        try:
+            self.temp_path.replace(out)
+        except OSError as exc:
+            self.cancel()
+            raise FileCryptoError("文件保存失败") from exc
         self.metadata = None
         return out
 
-    def cancel(self):
-        self.temp_path.unlink(missing_ok=True)
+    def cancel(self) -> None:
+        """删除未完成的临时文件；可在任意失败路径重复调用。"""
+        try:
+            self.temp_path.unlink(missing_ok=True)
+        except OSError:
+            # 清理失败不能掩盖原始传输错误，后续启动时会覆盖同名 .part 文件。
+            pass
         self.metadata = None
 
     def _context(self, purpose: str, **kwargs) -> dict:
@@ -589,7 +620,10 @@ class FileTransferManager:
             if callable(close):
                 close()
         if rec := self.incoming.pop(transfer_id, None):
-            rec["temp_path"].unlink(missing_ok=True)
+            try:
+                rec["temp_path"].unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def iter_file_chunks(path: pathlib.Path):

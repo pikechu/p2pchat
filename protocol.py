@@ -25,6 +25,7 @@ BASE_CAPABILITIES = [
     "room_message_ttl",
     "dm_message_ttl",
     "offline_message_sync",
+    "persistent_room_membership",
     "streaming_file_transfer",
     "file_room_chunk_ack",
 ]
@@ -46,6 +47,7 @@ SERVER_CAPABILITIES = [
     "room_message_ttl",
     "dm_message_ttl",
     "offline_message_sync",
+    "persistent_room_membership",
 ]
 
 TTL_VALUES = {
@@ -64,15 +66,15 @@ class T(str, Enum):
     SET_NAME    = "SET_NAME"
     CREATE_ROOM = "CREATE_ROOM"
     JOIN_ROOM   = "JOIN_ROOM"
-    LEAVE_ROOM  = "LEAVE_ROOM"
+    LEAVE_ROOM  = "LEAVE_ROOM"   # {room_id?}；显式退出指定群，省略时兼容当前群
     SEND_MSG    = "SEND_MSG"
     LIST_ROOMS  = "LIST_ROOMS"
-    TYPING      = "TYPING"       # {typing: bool}
-    MSG_ACK     = "MSG_ACK"      # {seq: int, status: "delivered"|"read"}
+    TYPING      = "TYPING"       # {room_id?, typing: bool}
+    MSG_ACK     = "MSG_ACK"      # {room_id?, seq: int, status: "delivered"|"read"}
     LIST_USERS  = "LIST_USERS"   # {} — request list of online usernames
     SEND_DM     = "SEND_DM"      # {to, text, client_mid}
     SEND_ENCRYPTED_MSG = "SEND_ENCRYPTED_MSG"  # {scope_type, scope_id, ciphertext, crypto_meta, ...}
-    SYNC_MESSAGES = "SYNC_MESSAGES"  # {scopes: [{scope_type, scope_id, after_message_id}], limit}
+    SYNC_MESSAGES = "SYNC_MESSAGES"  # {scopes: [{scope_type, scope_id, after_message_id, after_created_at?, history_mode?}], limit}
     SET_MESSAGE_TTL = "SET_MESSAGE_TTL"  # {scope_type, scope_id, ttl_seconds, to?}; ttl_seconds=0 表示永久
     GET_MESSAGE_TTL = "GET_MESSAGE_TTL"  # {scope_type, scope_id, to?}
     DELETE_ROOM    = "DELETE_ROOM"    # {room_id} — creator only
@@ -125,7 +127,7 @@ class T(str, Enum):
     ERROR        = "ERROR"
     ROOM_CREATED = "ROOM_CREATED"
     ROOM_JOINED  = "ROOM_JOINED"
-    ROOM_LEFT    = "ROOM_LEFT"
+    ROOM_LEFT    = "ROOM_LEFT"    # {room_id}；只移除该群身份
     NEW_MSG      = "NEW_MSG"
     USER_JOINED  = "USER_JOINED"
     USER_LEFT    = "USER_LEFT"
@@ -137,7 +139,7 @@ class T(str, Enum):
     RECV_DM      = "RECV_DM"      # {from, text, client_mid} — routed by server
     DM_ACK       = "DM_ACK"       # {client_mid, to} — echo back to DM sender
     NEW_ENCRYPTED_MSG = "NEW_ENCRYPTED_MSG"
-    SYNC_MESSAGES_RESULT = "SYNC_MESSAGES_RESULT"
+    SYNC_MESSAGES_RESULT = "SYNC_MESSAGES_RESULT"  # {messages, has_more, next_scopes}；用 next_scopes 续拉
     MESSAGE_TTL_UPDATED = "MESSAGE_TTL_UPDATED"
     ROOM_DELETED      = "ROOM_DELETED"      # {room_id} — broadcast when creator deletes room
     ROOM_NAME_UPDATED = "ROOM_NAME_UPDATED" # {room_id, name} — broadcast on rename

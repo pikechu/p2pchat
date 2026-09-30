@@ -18,9 +18,89 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from file_transfer import EncryptedFileReceiver, EncryptedFileSender
+from file_transfer import EncryptedFileReceiver, EncryptedFileSender, FileCryptoError
 from identity import DeviceIdentity, sign_key_bundle
 from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
+
+
+def _encrypted_pair(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    context = dict(transfer_id="disk-failure", scope_type="dm", scope_id="alice-bob",
+                   sender="alice", recipient="bob")
+    sender = EncryptedFileSender(source, b"D" * 32, **context)
+    receiver = EncryptedFileReceiver(tmp_path / "downloads", b"D" * 32, **context)
+    offer = sender.offer_payload()
+    receiver.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+    return sender, receiver
+
+
+def test_partial_disk_write_failure_cleans_plaintext_temp_file(tmp_path, monkeypatch):
+    sender, receiver = _encrypted_pair(tmp_path)
+    chunk = sender.next_payload()
+    original_open = pathlib.Path.open
+
+    class FailingWrite:
+        def __enter__(self):
+            self.stream = original_open(receiver.temp_path, "ab")
+            return self
+
+        def write(self, data):
+            self.stream.write(data[:1])
+            raise OSError("磁盘已满")
+
+        def __exit__(self, *_args):
+            self.stream.close()
+
+    def open_path(path, *args, **kwargs):
+        if path == receiver.temp_path and args == ("ab",):
+            return FailingWrite()
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "open", open_path)
+
+    with pytest.raises(FileCryptoError, match="文件写入失败"):
+        receiver.add_chunk(chunk["index"], chunk["total"], chunk["encrypted_chunk"])
+
+    assert not receiver.temp_path.exists()
+    assert receiver.metadata is None
+    assert sender._src.closed
+
+
+def test_final_rename_failure_cleans_temp_file(tmp_path, monkeypatch):
+    sender, receiver = _encrypted_pair(tmp_path)
+    chunk = sender.next_payload()
+    receiver.add_chunk(chunk["index"], chunk["total"], chunk["encrypted_chunk"])
+
+    def fail_replace(*_args):
+        raise PermissionError("文件被占用")
+
+    monkeypatch.setattr(pathlib.Path, "replace", fail_replace)
+
+    with pytest.raises(FileCryptoError, match="文件保存失败"):
+        receiver.finish(sender.done_payload()["encrypted_done"])
+
+    assert not receiver.temp_path.exists()
+    assert receiver.metadata is None
+
+
+def test_unavailable_source_closes_sender_before_offer(tmp_path, monkeypatch):
+    source = tmp_path / "removed.bin"
+    source.write_bytes(b"payload")
+    sender = EncryptedFileSender(source, b"D" * 32, transfer_id="source-removed",
+                                 scope_type="dm", scope_id="alice-bob",
+                                 sender="alice", recipient="bob")
+    def fail_digest(_path):
+        raise FileNotFoundError("源文件无法读取")
+
+    # Windows 禁止删除打开的文件，直接模拟读取失败并验证句柄释放后能删除。
+    monkeypatch.setattr("file_transfer._file_digest", fail_digest)
+
+    with pytest.raises(FileCryptoError, match="文件读取或加密失败"):
+        sender.offer_payload()
+
+    assert sender._src.closed
+    source.unlink()
 
 
 def _free_port() -> int:

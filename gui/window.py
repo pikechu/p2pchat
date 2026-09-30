@@ -32,10 +32,10 @@ from file_transfer import (
 from ice_config import load_ice_servers
 from webrtc_transfer import WebRTCTransfer
 
-from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, QTemporaryDir, pyqtSlot, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, QEvent, QUrl, QTemporaryDir, QStandardPaths, pyqtSlot, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QIcon, QPainter, QPainterPath, QLinearGradient, QBrush,
-    QAction, QPixmap,
+    QAction, QPixmap, QDesktopServices,
 )
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel,
@@ -57,6 +57,7 @@ from crypto import (
     decrypt,
 )
 from e2e_crypto import CryptoError, derive_room_root, derive_scope_keys
+from encrypted_room_state import EncryptedRoomState, retained_room_messages
 from identity import IdentityStore, TrustStore
 from secure_session import SecureSessionError, SecureSessionManager, SessionState
 from transport_security import validate_server_url
@@ -420,13 +421,14 @@ class ConvPanel(QWidget):
         self._rows: dict[str, ConvRowWidget] = {}
         self._active: str | None = None
         self._unread: dict[str, int] = {}
+        self._pinned: set[str] = set()
 
     def upsert_room(self, room_id: str, name: str, creator: str,
                     members: int = 0, locked: bool = False,
                     unread: int = 0):
         if room_id in self._rows:
             self._rows[room_id].set_members(members)
-            self._move_row_to_top(room_id)
+            self._rows[room_id].set_room_name(name)
             return
         row = ConvRowWidget(room_id, name, creator, members, locked, unread,
                             self._theme, conn_state="ok")
@@ -434,6 +436,8 @@ class ConvPanel(QWidget):
         row.right_clicked.connect(self.room_right_clicked)
         self._list_lay.insertWidget(0, row)
         self._rows[room_id] = row
+        self._unread[room_id] = unread
+        self._move_row_to_top(room_id)
 
     def update_members(self, room_id: str, count: int):
         if row := self._rows.get(room_id):
@@ -444,6 +448,8 @@ class ConvPanel(QWidget):
             row.set_room_name(name)
 
     def remove_room(self, room_id: str):
+        self._unread.pop(room_id, None)
+        self._pinned.discard(room_id)
         row = self._rows.pop(room_id, None)
         if row:
             self._list_lay.removeWidget(row)
@@ -477,15 +483,28 @@ class ConvPanel(QWidget):
             row.set_conn_state(state)
 
     def _on_row_clicked(self, room_id: str):
-        self.set_active(room_id)
+        # 成功打开会话后由窗口清除未读，密码取消不应吞掉未读消息。
         self.room_selected.emit(room_id)
+
+    def set_pinned(self, room_id: str, pinned: bool):
+        if pinned:
+            self._pinned.add(room_id)
+        else:
+            self._pinned.discard(room_id)
+        if row := self._rows.get(room_id):
+            row.setProperty("pinned", pinned)
+            row.setToolTip("已置顶" if pinned else "")
+        self._move_row_to_top(room_id)
 
     def _move_row_to_top(self, room_id: str):
         row = self._rows.get(room_id)
         if row is None:
             return
         self._list_lay.removeWidget(row)
-        self._list_lay.insertWidget(0, row)
+        index = 0 if room_id in self._pinned else sum(
+            1 for rid in self._pinned if rid in self._rows
+        )
+        self._list_lay.insertWidget(index, row)
 
     def _filter(self, query: str):
         q = query.lower()
@@ -635,7 +654,8 @@ class MessagesArea(QScrollArea):
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool = False,
                     seq: int = 0,
-                    quote: dict | None = None) -> BubbleWidget:
+                    quote: dict | None = None,
+                    message_id: int = 0) -> BubbleWidget:
         # Day separator
         day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         if day != self._last_day:
@@ -659,13 +679,58 @@ class MessagesArea(QScrollArea):
             show_avatar=show_av,
             avatar_pixmap=avatar_pixmap,
         )
+        row._message_id = int(message_id or 0)
+        row._message_time = ts
         if not outgoing and row.avatar is not None:
             self._peer_avatar_widgets.setdefault(sender, []).append(row.avatar)
         self._lay.insertWidget(self._lay.count() - 1, row)
         self._last_sender = sender
-        QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
-            self.verticalScrollBar().maximum()))
+        self._sort_message_rows()
+        QTimer.singleShot(50, self._scroll_to_bottom)
         return bubble
+
+    @pyqtSlot()
+    def _scroll_to_bottom(self):
+        """让延迟滚动随视图销毁一起取消，避免访问已释放的 Qt 对象。"""
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+    def update_message_id(self, bubble: BubbleWidget, message_id: int, ts: float):
+        """发送确认后把本地气泡纳入服务端消息顺序。"""
+        row = bubble.parentWidget()
+        if isinstance(row, MessageRow):
+            row._message_id = int(message_id)
+            row._message_time = ts
+            self._sort_message_rows()
+
+    def _sort_message_rows(self):
+        """补发历史到达时原位排序文字气泡，保留文件卡片与待发送气泡的引用。"""
+        widgets = [self._lay.itemAt(index).widget() for index in range(self._lay.count() - 1)]
+        rows = [widget for widget in widgets if isinstance(widget, MessageRow) and hasattr(widget, "_message_id")]
+        ordered = sorted(rows, key=lambda row: (
+            row._message_id if row._message_id > 0 else float("inf"), row._message_time,
+        ))
+        if rows == ordered:
+            return
+        for widget in widgets:
+            self._lay.removeWidget(widget)
+            if isinstance(widget, DayMarkWidget):
+                widget.deleteLater()
+        ordered_rows = iter(ordered)
+        last_day = None
+        for widget in widgets:
+            if isinstance(widget, DayMarkWidget):
+                continue
+            if isinstance(widget, MessageRow) and hasattr(widget, "_message_id"):
+                widget = next(ordered_rows)
+                day = datetime.fromtimestamp(widget._message_time).strftime("%Y-%m-%d")
+                if day != last_day:
+                    label = datetime.fromtimestamp(widget._message_time).strftime("%B %d, %Y")
+                    self._lay.insertWidget(self._lay.count() - 1, DayMarkWidget(label),
+                                           alignment=Qt.AlignmentFlag.AlignHCenter)
+                    last_day = day
+            self._lay.insertWidget(self._lay.count() - 1, widget)
+        self._last_day = last_day
+        self._last_sender = ordered[-1]._sender if ordered else None
 
     def add_sys_msg(self, text: str):
         self._lay.insertWidget(self._lay.count() - 1,
@@ -690,8 +755,7 @@ class MessagesArea(QScrollArea):
         self._lay.insertWidget(self._lay.count() - 1, row)
         if sender:
             self._last_sender = sender
-        QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(
-            self.verticalScrollBar().maximum()))
+        QTimer.singleShot(50, self._scroll_to_bottom)
 
     def clear(self):
         while self._lay.count() > 1:
@@ -901,9 +965,12 @@ class Composer(QWidget):
                 img = cb.image()
                 if not img.isNull():
                     if not self._clipboard_temp_dir.isValid():
+                        QMessageBox.warning(self, "图片发送失败", "无法创建临时目录，请检查磁盘空间和写入权限。")
                         return True
                     tmp = pathlib.Path(self._clipboard_temp_dir.path()) / f"{uuid.uuid4().hex}.png"
-                    img.save(str(tmp))
+                    if not img.save(str(tmp), "PNG"):
+                        QMessageBox.warning(self, "图片发送失败", "无法保存剪贴板图片，请检查磁盘空间和写入权限后重试。")
+                        return True
                     self.file_selected.emit(str(tmp))
                     return True
                 md = cb.mimeData()
@@ -1436,10 +1503,19 @@ class ChatPanel(QWidget):
 
     def add_message(self, sender: str, text: str, ts: float,
                     outgoing: bool, seq: int = 0,
-                    quote: dict | None = None) -> BubbleWidget | None:
+                    quote: dict | None = None,
+                    message_id: int = 0) -> BubbleWidget | None:
         if msgs := self._active_msgs():
-            return msgs.add_message(sender, text, ts, outgoing, seq=seq, quote=quote)
+            return msgs.add_message(sender, text, ts, outgoing, seq=seq, quote=quote, message_id=message_id)
         return None
+
+    def add_message_to_room(self, room_id: str, sender: str, text: str, ts: float,
+                            outgoing: bool, seq: int = 0, quote: dict | None = None,
+                            message_id: int = 0) -> BubbleWidget:
+        """后台房间也保存完整气泡，切换回房间时直接展示。"""
+        return self._ensure_messages_area(room_id).add_message(
+            sender, text, ts, outgoing, seq=seq, quote=quote, message_id=message_id,
+        )
 
     def add_sys(self, text: str):
         if msgs := self._active_msgs():
@@ -1526,8 +1602,15 @@ class _FileRow(QWidget):
             btn = QPushButton("打开")
             btn.setObjectName("BtnGhost")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda: os.startfile(save_path))
+            btn.clicked.connect(lambda: self._open_file(save_path))
             lay.addWidget(btn)
+
+    def _open_file(self, save_path: str) -> None:
+        """通过系统默认应用打开文件，并显示可恢复的失败提示。"""
+        if not pathlib.Path(save_path).is_file():
+            QMessageBox.warning(self, "打开失败", "文件不存在，可能已被移动或删除。")
+        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(pathlib.Path(save_path).resolve()))):
+            QMessageBox.warning(self, "打开失败", "系统无法打开此文件，请安装或选择支持该格式的应用后重试。")
 
 
 class FilesPanel(QWidget):
@@ -1576,17 +1659,31 @@ class FilesPanel(QWidget):
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    _webrtc_received = pyqtSignal(object, dict)
+    _webrtc_sent = pyqtSignal(object, dict)
+    _webrtc_progress = pyqtSignal(dict)
+    _webrtc_opened = pyqtSignal(dict)
+    _webrtc_closed = pyqtSignal(dict)
+    _webrtc_task_failed = pyqtSignal(object, object)
+
     def __init__(self, server_url: str = "ws://localhost:8765",
                  username: str = "", theme: str = "light",
                  allow_custom_server: bool = True):
         super().__init__()
+        self._webrtc_received.connect(self._on_webrtc_file_received)
+        self._webrtc_sent.connect(self._on_webrtc_file_sent)
+        self._webrtc_progress.connect(self._on_webrtc_file_progress)
+        self._webrtc_opened.connect(self._on_webrtc_channel_open)
+        self._webrtc_closed.connect(self._on_webrtc_session_closed)
+        self._webrtc_task_failed.connect(self._on_webrtc_task_failed)
         self._server_url = server_url
         self._username   = username or "me"
         self._theme      = theme
         self._allow_custom_server = allow_custom_server
         self._bridge: WSBridge | None = None
+        identity = IdentityStore(pathlib.Path.home() / ".beamchat" / "identity.json").load_or_create()
         self._secure_sessions = SecureSessionManager(
-            IdentityStore(pathlib.Path.home() / ".beamchat" / "identity.json").load_or_create(),
+            identity,
             TrustStore(pathlib.Path.home() / ".beamchat" / "trust.json"),
             self._username,
         )
@@ -1595,12 +1692,14 @@ class MainWindow(QMainWindow):
 
         # Room state: room_id → {name, members, locked, key}
         self._rooms: dict[str, dict] = {}
-        # Server-tracked room (may differ from displayed room when viewing a DM)
+        # 当前显示群与已加入群分别维护，切换会话不会移除成员关系。
         self._server_room_id: str = ""
-        # Room to re-join after auto-reconnect
         self._reconnect_room_id: str = ""
-        # True when we're leaving a room to join/create another (don't remove sidebar entry)
-        self._implicit_leave: bool = False
+        self._joined_room_ids: set[str] = set()
+        self._pending_room_focus: str = ""
+        self._room_history: dict[str, list[dict]] = {}
+        self._room_sync_offsets: dict[str, int] = {}
+        self._room_state = EncryptedRoomState(pathlib.Path.home() / ".beamchat", identity, server_url)
 
         # Bubble tracking for delivery receipts
         # client_mid (local int) → BubbleWidget, moved to seq key after SEND_ACK
@@ -1654,6 +1753,7 @@ class MainWindow(QMainWindow):
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().hide()
         self._load_avatar()
+        self._restore_room_state()
         self._setup_tray()
 
         # Clean up any leftover update temp files from a previous update attempt
@@ -1769,6 +1869,7 @@ class MainWindow(QMainWindow):
             self._bridge.wait(2000)
 
         self._bridge = WSBridge(self._server_url, username=self._username)
+        self._bridge.set_disconnect_cleanup(lambda: self._webrtc_transfer.close_all())
         self._bridge.received.connect(self._on_frame)
         self._bridge.connected.connect(self._on_connected)
         self._bridge.disconnected.connect(self._on_disconnected)
@@ -1817,30 +1918,15 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("Beam — P2P Chat  [服务器协议不兼容]")
         else:
             self.setWindowTitle("Beam — P2P Chat  [断线]")
-        # Save room for auto-reconnect before clearing server state
-        self._reconnect_room_id = self._server_room_id
+        # 断线时保留可见会话和全部已加入群；重连以断线前游标补发。
+        self._reconnect_room_id = self._chat.current_room_id or ""
         self._server_room_id = ""
-        self._implicit_leave = False
-        self._chat.close_room()
+        self._chat.composer.set_enabled(False)
         # Mark all conv rows offline
         for rid in self._rooms:
             self._conv.set_conn_state(rid, "offline")
         self._chat.set_conn_state("offline")
-        # Cancel all in-progress file transfers
-        for _tid, _card in list(self._ft_cards.items()):
-            _card.set_error("连接断开")
-            self._ft_manager.cancel(_tid)
-        for sender_info in self._room_file_senders.values():
-            close = getattr(sender_info.get("sender"), "close", None)
-            if callable(close):
-                close()
-        for sender in self._direct_file_senders.values():
-            close = getattr(sender, "close", None)
-            if callable(close):
-                close()
-        self._ft_cards.clear()
-        self._room_file_senders.clear()
-        self._direct_file_senders.clear()
+        self._close_all_file_transfers("连接断开")
 
     # ── Incoming frame dispatcher ─────────────────────────────────────────────
 
@@ -1874,20 +1960,42 @@ class MainWindow(QMainWindow):
                 self._identified = True
                 self._send_avatar()
                 self._bridge.send_frame(T.LIST_ROOMS)
+                self._message_sync_requests = []
                 self._sync_dm_messages()
                 for rid in self._rooms:
                     self._conv.set_conn_state(rid, "ok")
                 self._chat.set_conn_state("ok")
                 self._update_private_voice_button()
+                joined = self.__dict__.setdefault("_joined_room_ids", set())
                 rejoin = self._reconnect_room_id
                 self._reconnect_room_id = ""
-                if rejoin and rejoin in self._rooms:
-                    _log.info("Reconnect: re-joining room %s", rejoin)
-                    self._bridge.send_frame(T.JOIN_ROOM, room_id=rejoin,
-                                            access_token=self._rooms[rejoin].get("access_token", ""))
+                if rejoin and not rejoin.startswith("@") and rejoin in self._rooms:
+                    joined.add(rejoin)
+                self._room_sync_offsets = {
+                    rid: self.__dict__.get("_message_offsets", {}).get(self._offset_key("room", rid), 0)
+                    for rid in joined
+                }
+                for rid in sorted(joined):
+                    if rid in self._rooms:
+                        _log.info("Reconnect: re-joining room %s", rid)
+                        self._bridge.send_frame(T.JOIN_ROOM, room_id=rid,
+                                                access_token=self._rooms[rid].get("access_token", ""))
+                if self._chat.current_room_id and self._chat.current_room_id.startswith("@"):
+                    self._chat.composer.set_enabled(True)
 
         elif mtype == T.ERROR:
             msg = payload.get("message", "")
+            if payload.get("code") == "ROOM_NOT_FOUND" and payload.get("room_id"):
+                self._forget_joined_room(str(payload["room_id"]))
+                QMessageBox.warning(self, "群聊不可用", "该群聊已不存在，已移除本地群记录。")
+                return
+            if payload.get("code") == "ROOM_ACCESS_DENIED" and payload.get("room_id"):
+                rid = str(payload["room_id"])
+                self.__dict__.setdefault("_joined_room_ids", set()).discard(rid)
+                self.__dict__.setdefault("_room_sync_offsets", {}).pop(rid, None)
+                self._save_room_state()
+                QMessageBox.warning(self, "加入群聊失败", "群访问凭证已失效，请重新输入密码加入。")
+                return
             if payload.get("code") == "USERNAME_IDENTITY_MISMATCH":
                 pending_username = self.__dict__.get("_pending_username_rollback")
                 if pending_username:
@@ -1957,6 +2065,8 @@ class MainWindow(QMainWindow):
             self._conv.upsert_room(rid, name, self._username, 1, locked)
             self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
+            self._joined_room_ids.add(rid)
+            self._pending_room_focus = ""
             self._server_room_id = rid
             self._chat.open_room(rid, name, [self._username], locked,
                                  creator=self._username, created_at=created_at,
@@ -1964,6 +2074,7 @@ class MainWindow(QMainWindow):
             self._refresh_ttl_policy(rid)
             self._request_current_ttl(rid)
             self._sync_room_messages(rid)
+            self._save_room_state()
 
         elif mtype == T.ROOM_JOINED:
             rid        = payload["room_id"]
@@ -1974,7 +2085,10 @@ class MainWindow(QMainWindow):
             created_at = payload.get("created_at", 0.0)
             icon       = payload.get("icon", "")
             previous = self._rooms.get(rid, {})
-            self._rooms[rid] = {"name": name, "members": members,
+            joined = self.__dict__.setdefault("_joined_room_ids", set())
+            was_joined = rid in joined
+            joined.add(rid)
+            self._rooms[rid] = {**previous, "name": name, "members": members,
                                 "locked": locked, "metadata": previous.get("metadata", {}),
                                 "password": previous.get("password", ""),
                                 "salt": previous.get("salt", ""),
@@ -1982,34 +2096,19 @@ class MainWindow(QMainWindow):
                                 "creator": creator,
                                 "created_at": created_at, "icon": icon}
             self._conv.upsert_room(rid, name, creator, len(members), locked)
-            self._conv.set_active(rid)
             self._conv.set_conn_state(rid, "ok")
-            self._chat.open_room(rid, name, members, locked,
-                                 creator=creator, created_at=created_at, icon=icon,
-                                 is_creator=(creator == self._username))
-            self._refresh_ttl_policy(rid)
+            pending_focus = self.__dict__.get("_pending_room_focus", "")
+            if pending_focus == rid or self._chat.current_room_id == rid or (not was_joined and not pending_focus):
+                self._pending_room_focus = ""
+                self._open_joined_room(rid)
             self._request_current_ttl(rid)
-            # Track first non-self member as file transfer peer
-            others = [m for m in members if m != self._username]
-            self._current_peer = others[0] if others else ""
-            self._server_room_id = rid
             self._sync_room_messages(rid)
+            self._save_room_state()
 
         elif mtype == T.ROOM_LEFT:
-            rid = self._server_room_id
-            self._server_room_id = ""
+            rid = payload.get("room_id", self._server_room_id)
             if rid:
-                if self._implicit_leave:
-                    # Switching to another room — preserve sidebar entry and history
-                    self._implicit_leave = False
-                    if self._chat.current_room_id == rid:
-                        self._chat.close_room(remove_history=False)
-                else:
-                    # Explicit leave or room dissolved — discard
-                    self._rooms.pop(rid, None)
-                    self._conv.remove_room(rid)
-                    if self._chat.current_room_id == rid:
-                        self._chat.close_room(remove_history=True)
+                self._forget_joined_room(rid)
 
         elif mtype == T.USER_JOINED:
             uname = payload.get("username", "")
@@ -2051,6 +2150,8 @@ class MainWindow(QMainWindow):
             if message_key and message_key in self._displayed_message_ids:
                 self._update_message_offset("room", rid, message_id)
                 return
+            if self._reconcile_unconfirmed_room_message(rid, payload, ts):
+                return
 
             # Decrypt if needed
             if encrypted:
@@ -2068,26 +2169,31 @@ class MainWindow(QMainWindow):
 
             active = (rid == self._chat.current_room_id) or \
                      (rid == "" and self._chat.current_room_id is not None)
-
+            outgoing = sender == self._username
+            read = active and self.isVisible() and self.isActiveWindow()
             if active:
-                self._chat.add_message(sender, text, ts, outgoing=False,
-                                       seq=seq, quote=reply_to)
-                self._conv.set_preview(rid, f"{sender}: {text}", ts)
-                if message_key:
-                    self._displayed_message_ids.add(message_key)
-                self._update_message_offset("room", rid, message_id)
-                # Received while room is visible → mark as read
-                if seq and self._bridge:
-                    self._bridge.send_frame(T.MSG_ACK, seq=seq, status="read")
+                bubble = self._chat.add_message(sender, text, ts, outgoing=outgoing,
+                                                seq=seq, quote=reply_to, message_id=message_id)
             else:
-                self._conv.set_preview(rid, f"{sender}: {text}", ts)
+                bubble = self._chat.add_message_to_room(rid, sender, text, ts, outgoing=outgoing,
+                                                        seq=seq, quote=reply_to, message_id=message_id)
+            if bubble is not None:
+                bubble._client_msg_id = str(payload.get("client_msg_id", ""))
+            self._conv.set_preview(rid, f"{sender}: {text}", ts)
+            if not read and not outgoing:
                 self._conv.increment_unread(rid)
-                if message_key:
-                    self._displayed_message_ids.add(message_key)
-                self._update_message_offset("room", rid, message_id)
-                # Delivered but not yet read
-                if seq and self._bridge:
-                    self._bridge.send_frame(T.MSG_ACK, seq=seq, status="delivered")
+            if message_key:
+                self._displayed_message_ids.add(message_key)
+            self._record_room_message(rid, {
+                "sender": sender, "text": text, "ts": ts, "outgoing": outgoing,
+                "message_id": int(message_id or 0), "client_msg_id": payload.get("client_msg_id", ""),
+                "quote": reply_to,
+            })
+            self._update_message_offset("room", rid, message_id)
+            self._save_room_state()
+            if seq and self._bridge:
+                self._bridge.send_frame(T.MSG_ACK, room_id=rid, seq=seq,
+                                        status="read" if read else "delivered")
             # Flash taskbar / tray when window is not in focus
             if not self.isActiveWindow():
                 QApplication.alert(self, 0)
@@ -2128,12 +2234,9 @@ class MainWindow(QMainWindow):
 
         elif mtype == T.ROOM_DELETED:
             rid = payload.get("room_id", "")
-            self._rooms.pop(rid, None)
-            self._conv.remove_room(rid)
-            if rid == self._server_room_id:
-                self._server_room_id = ""
-            if self._chat.current_room_id == rid:
-                self._chat.close_room(remove_history=True)
+            was_active = self._chat.current_room_id == rid
+            self._forget_joined_room(rid)
+            if was_active:
                 QMessageBox.information(self, "聊天室已删除", "该聊天室已被创建者删除。")
 
         elif mtype == T.ROOM_NAME_UPDATED:
@@ -2184,6 +2287,17 @@ class MainWindow(QMainWindow):
                 bubble = self._pending_bubbles.pop(client_mid)
                 self._seq_bubbles[seq] = bubble
                 bubble.set_status("sent")
+            if payload.get("scope_type", "room") == "room":
+                rid = payload.get("scope_id", self._server_room_id)
+                for message in self.__dict__.get("_room_history", {}).get(rid, []):
+                    if str(message.get("client_msg_id", "")) == str(client_mid):
+                        message["message_id"] = int(payload.get("message_id", 0))
+                        message["ts"] = float(payload.get("created_at", message["ts"]))
+                        messages = self._chat._msgs_by_room.get(rid)
+                        if messages is not None and seq in self._seq_bubbles:
+                            messages.update_message_id(self._seq_bubbles[seq], message["message_id"], message["ts"])
+                        break
+                self._save_room_state()
 
         elif mtype == T.MSG_STATUS:
             seq    = payload.get("seq", 0)
@@ -2256,6 +2370,7 @@ class MainWindow(QMainWindow):
                         "room_id": rid,
                         "seq": 0,
                         "message_id": payload.get("message_id", 0),
+                        "client_msg_id": payload.get("client_msg_id", ""),
                     },
                     float(payload.get("created_at", ts)),
                 )
@@ -2263,17 +2378,7 @@ class MainWindow(QMainWindow):
                 self._show_decrypted_dm(payload, ts)
 
         elif mtype == T.SYNC_MESSAGES_RESULT:
-            for item in payload.get("messages", []):
-                if item.get("scope_type") == "room":
-                    rid = item.get("scope_id", "")
-                    room = self._rooms.get(rid, {})
-                    try:
-                        text = decrypt_room_message(rid, room.get("password", ""), decode_room_envelope(item.get("ciphertext", "")), item.get("client_msg_id", ""), room.get("salt", ""))
-                    except Exception:
-                        text = "房间消息认证失败"
-                    self._dispatch_frame(T.NEW_MSG, {"sender": item.get("sender_name", "?"), "text": text, "encrypted": False, "room_id": rid, "seq": 0, "message_id": item.get("message_id", 0)}, float(item.get("created_at", ts)))
-                elif item.get("scope_type") == "dm":
-                    self._show_decrypted_dm(item, ts)
+            self._consume_message_sync(payload, ts)
 
         elif mtype == T.MESSAGE_TTL_UPDATED:
             self._on_message_ttl_updated(payload)
@@ -2430,13 +2535,36 @@ class MainWindow(QMainWindow):
             if not self.isVisible():
                 self._notify_tray(f"@ {peer}", text)
 
-    def _run_webrtc_task(self, coro, *, raise_errors: bool = False):
+    def _run_webrtc_task(self, coro, *, raise_errors: bool = False, on_error=None):
+        """将直连任务提交到持久事件循环，避免销毁 ICE/DTLS 的后台任务。"""
+        loop = getattr(self._bridge, "_loop", None) if self._bridge else None
+        if not isinstance(loop, asyncio.AbstractEventLoop) or not loop.is_running():
+            coro.close()
+            if raise_errors:
+                raise RuntimeError("传输连接不可用")
+            return None
         try:
-            asyncio.run(coro)
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as exc:
+            coro.close()
             _log.error("WebRTC task failed: %s", exc)
             if raise_errors:
                 raise
+            return None
+
+        def finished(result):
+            if not result.cancelled() and (exc := result.exception()) is not None:
+                self._webrtc_task_failed.emit(on_error, exc)
+
+        future.add_done_callback(finished)
+        return future
+
+    @pyqtSlot(object, object)
+    def _on_webrtc_task_failed(self, callback, error):
+        """回到界面线程处理异步失败，保持卡片更新与中继回退的线程安全。"""
+        _log.error("WebRTC 任务失败：%s", error)
+        if callable(callback):
+            callback(error)
 
     def _new_webrtc_transfer(self, downloads: pathlib.Path,
                              ice_servers: list[dict] | None = None) -> WebRTCTransfer:
@@ -2444,11 +2572,11 @@ class MainWindow(QMainWindow):
             lambda msg_type, **payload: self._bridge.send_frame(msg_type, **payload)
             if self._bridge else False,
             downloads_dir=downloads,
-            on_file_received=self._on_webrtc_file_received,
-            on_file_sent=self._on_webrtc_file_sent,
-            on_file_progress=self._on_webrtc_file_progress,
-            on_channel_open=self._on_webrtc_channel_open,
-            on_session_closed=self._on_webrtc_session_closed,
+            on_file_received=self._webrtc_received.emit,
+            on_file_sent=self._webrtc_sent.emit,
+            on_file_progress=self._webrtc_progress.emit,
+            on_channel_open=self._webrtc_opened.emit,
+            on_session_closed=self._webrtc_closed.emit,
             file_key_provider=lambda peer, _session_id: self._dm_file_key(peer)[0],
             local_user=self._username,
             ice_servers=ice_servers,
@@ -2462,10 +2590,14 @@ class MainWindow(QMainWindow):
                   meta.get("transfer_id", ""), from_user, filename, size, save_path)
         self._files_panel.add_file(filename, from_user, "WebRTC", size, str(save_path))
         theme = self.__dict__.get("_theme", "light")
-        card = FileCard(str(meta.get("transfer_id", "")), filename, size,
-                        outgoing=False, theme=theme)
+        tid = str(meta.get("transfer_id", ""))
+        card = self._ft_cards.pop(tid, None)
+        existing_card = card is not None
+        if card is None:
+            card = FileCard(tid, filename, size, outgoing=False, theme=theme)
         card.set_done(save_path=str(save_path))
-        self._add_dm_file_card(from_user, card)
+        if not existing_card:
+            self._add_dm_file_card(from_user, card)
 
     def _on_webrtc_file_sent(self, source_path: pathlib.Path, meta: dict):
         tid = str(meta.get("transfer_id", ""))
@@ -2518,6 +2650,12 @@ class MainWindow(QMainWindow):
         tid = str(meta.get("transfer_id", ""))
         if not tid:
             return
+        if tid not in self._ft_cards and meta.get("direction") == "receive":
+            card = FileCard(tid, str(meta.get("filename", "文件")), int(meta.get("size", 0)),
+                            outgoing=False, theme=self._theme)
+            card.cancel_requested.connect(self._cancel_transfer)
+            self._ft_cards[tid] = card
+            self._add_dm_file_card(str(meta.get("peer", "?")), card)
         if card := self._ft_cards.get(tid):
             card.set_progress(int(meta.get("progress", 0)))
 
@@ -2672,14 +2810,81 @@ class MainWindow(QMainWindow):
 
     # ── Room management ───────────────────────────────────────────────────────
 
+    def _open_joined_room(self, room_id: str):
+        """只切换当前聊天界面，不改变其它房间的成员关系。"""
+        room = self._rooms.get(room_id, {})
+        members = room.get("members", [])
+        self._server_room_id = room_id
+        self._current_peer = next((member for member in members if member != self._username), "")
+        self._conv.set_active(room_id)
+        self._chat.open_room(
+            room_id, room.get("name", room_id), members, room.get("locked", False),
+            conn_state="ok" if self._identified else "offline",
+            creator=room.get("creator", ""), created_at=room.get("created_at", 0),
+            icon=room.get("icon", ""), is_creator=room.get("creator") == self._username,
+        )
+        self._chat.composer.set_enabled(self._identified)
+        self._refresh_ttl_policy(room_id)
+        self._update_private_voice_button()
+        self._save_room_state()
+
+    def _forget_joined_room(self, room_id: str):
+        """仅在收到显式离群或删除确认后删除本地成员关系与缓存。"""
+        self.__dict__.setdefault("_joined_room_ids", set()).discard(room_id)
+        self.__dict__.setdefault("_room_history", {}).pop(room_id, None)
+        self.__dict__.setdefault("_room_sync_offsets", {}).pop(room_id, None)
+        self._rooms.pop(room_id, None)
+        self._conv.remove_room(room_id)
+        if self._server_room_id == room_id:
+            self._server_room_id = ""
+        if self._chat.current_room_id == room_id:
+            self._chat.close_room(remove_history=True)
+        elif isinstance(self._chat, ChatPanel) and room_id in self._chat._msgs_by_room:
+            messages = self._chat._msgs_by_room.pop(room_id)
+            self._chat._msgs_stack.removeWidget(messages)
+            messages.deleteLater()
+        self.__dict__.setdefault("_message_offsets", {}).pop(self._offset_key("room", room_id), None)
+        prefix = f"room:{room_id}:"
+        self._displayed_message_ids = {key for key in self._displayed_message_ids if not key.startswith(prefix)}
+        self._save_message_offsets()
+        self._save_room_state()
+
+    def _close_room_view(self, room_id: str):
+        """关闭聊天仅隐藏界面，后台继续接收该群消息。"""
+        if self._chat.current_room_id == room_id:
+            self._on_typing_stop()
+            self._chat.close_room()
+            self._conv.set_active(None)
+            self._server_room_id = ""
+            self._current_peer = ""
+        self._save_room_state()
+
     def _on_room_right_clicked(self, room_id: str):
         room = self._rooms.get(room_id, {})
-        if room.get("creator") != self._username:
-            return
         from PyQt6.QtGui import QCursor
         menu = QMenu(self)
-        delete_action = menu.addAction("删除聊天室")
-        if popup_above_global_pos(menu, QCursor.pos()) == delete_action:
+        pinned = room_id in self._conv._pinned
+        pin_action = menu.addAction("取消置顶" if pinned else "置顶聊天")
+        close_action = menu.addAction("关闭聊天")
+        leave_action = None
+        delete_action = None
+        if room_id in self._joined_room_ids:
+            leave_action = menu.addAction("退出群聊")
+        if room.get("creator") == self._username:
+            menu.addSeparator()
+            delete_action = menu.addAction("删除聊天室")
+        selected = popup_above_global_pos(menu, QCursor.pos())
+        if selected is None:
+            return
+        if selected == pin_action:
+            self._conv.set_pinned(room_id, not pinned)
+            self._save_room_state()
+        elif selected == close_action:
+            self._close_room_view(room_id)
+        elif leave_action is not None and selected == leave_action:
+            if self._bridge:
+                self._bridge.send_frame(T.LEAVE_ROOM, room_id=room_id)
+        elif delete_action is not None and selected == delete_action:
             reply = QMessageBox.question(
                 self, "删除聊天室",
                 f"确定要永久删除聊天室「{room.get('name', room_id)}」吗？\n所有成员将被踢出，无法恢复。",
@@ -2694,7 +2899,9 @@ class MainWindow(QMainWindow):
         if not self._is_typing:
             self._is_typing = True
             if self._bridge:
-                self._bridge.send_frame(T.TYPING, typing=True)
+                rid = self._chat.current_room_id
+                if rid and not rid.startswith("@"):
+                    self._bridge.send_frame(T.TYPING, room_id=rid, typing=True)
         self._typing_timer.start()
 
     def _on_typing_stop(self):
@@ -2702,7 +2909,9 @@ class MainWindow(QMainWindow):
         if self._is_typing:
             self._is_typing = False
             if self._bridge:
-                self._bridge.send_frame(T.TYPING, typing=False)
+                rid = self._chat.current_room_id
+                if rid and not rid.startswith("@"):
+                    self._bridge.send_frame(T.TYPING, room_id=rid, typing=False)
 
     # ── Rail navigation ──────────────────────────────────────────────────────
 
@@ -2721,6 +2930,8 @@ class MainWindow(QMainWindow):
 
     def _start_dm(self, peer: str):
         """Open (or focus) a DM conversation with peer."""
+        if self.__dict__.get("_is_typing"):
+            self._on_typing_stop()
         dm_id = f"@{peer}"
         if dm_id not in self._dms:
             self._dms[dm_id] = peer
@@ -2827,7 +3038,13 @@ class MainWindow(QMainWindow):
             return
 
         source_path = pathlib.Path(path)
-        size = source_path.stat().st_size
+        try:
+            size = source_path.stat().st_size
+            if not source_path.is_file():
+                raise OSError("选择的路径不是文件")
+        except OSError as exc:
+            QMessageBox.warning(self, "发送失败", f"无法读取文件：{exc}")
+            return
         if size > 50 * 1024 * 1024:
             QMessageBox.warning(self, "文件过大", "文件大小不能超过 50 MB。")
             return
@@ -2836,19 +3053,70 @@ class MainWindow(QMainWindow):
             self._start_peer_file_send(peer, source_path)
             return
 
+        self._start_room_file_send(rid, source_path)
+
+    def _connect_file_retry(self, card, source_path: pathlib.Path, *,
+                            peer: str = "", room_id: str = "") -> None:
+        """保留原发送目标，让失败卡片可以在后台会话中直接重试。"""
+        if hasattr(card, "retry_requested") and not card.__dict__.get("_retry_connected"):
+            card.__dict__["_retry_connected"] = True
+            card.retry_requested.connect(
+                lambda _tid: self._retry_file_send(card, source_path, peer=peer, room_id=room_id)
+            )
+
+    def _retry_file_send(self, card, source_path: pathlib.Path, *,
+                         peer: str = "", room_id: str = "") -> None:
+        """使用新传输编号重试，避免旧传输的延迟回包影响新任务。"""
+        if not self._bridge or not self._bridge.is_connected():
+            card.set_error("连接不可用，请连接服务器后重试")
+            return
+        try:
+            if not source_path.is_file():
+                raise OSError("原文件已被移动或删除")
+            if source_path.stat().st_size > 50 * 1024 * 1024:
+                raise OSError("文件大小不能超过 50 MB")
+        except OSError as exc:
+            card.set_error(str(exc))
+            return
+        self._cleanup_file_transfer(card._tid)
+        self._ft_cards.pop(card._tid, None)
+        card.reset_transfer()
+        if peer:
+            self._start_peer_file_send(peer, source_path, existing_card=card)
+        elif room_id in self._rooms:
+            self._start_room_file_send(room_id, source_path, existing_card=card)
+        else:
+            card.set_error("已离开该聊天室，请重新加入后发送")
+
+    def _start_room_file_send(self, rid: str, source_path: pathlib.Path, *, existing_card=None):
+        """创建群文件发送器；重试时保留原消息卡片和目标群。"""
+        size = source_path.stat().st_size
+
         filename = source_path.name
         tid    = uuid.uuid4().hex[:12]
         try:
             file_key, scope_id = self._room_file_key(rid)
         except Exception as exc:
+            if existing_card is not None:
+                existing_card.set_error("房间文件密钥不可用，请重新加入后重试")
             QMessageBox.warning(self, "发送失败", f"房间文件密钥不可用：{exc}")
             return
-        sender = EncryptedFileSender(
-            source_path, file_key, transfer_id=tid, scope_type="room",
-            scope_id=scope_id, sender=self._username, recipient="",
-            wait_for_ack=True,
-        )
-        offer = sender.offer_payload()
+        sender = None
+        try:
+            sender = EncryptedFileSender(
+                source_path, file_key, transfer_id=tid, scope_type="room",
+                scope_id=scope_id, sender=self._username, recipient="",
+                wait_for_ack=True,
+            )
+            offer = sender.offer_payload()
+        except (OSError, FileCryptoError, ValueError) as exc:
+            if sender is not None:
+                sender.close()
+            if existing_card is not None:
+                existing_card.set_error(f"无法读取文件：{exc}")
+            else:
+                QMessageBox.warning(self, "发送失败", f"无法读取文件：{exc}")
+            return
         self._room_file_senders[tid] = {
             "sender": sender,
             "path": source_path,
@@ -2859,14 +3127,20 @@ class MainWindow(QMainWindow):
         }
 
         mime = guess_mime(filename)
-        if mime.startswith("video/"):
+        if existing_card is not None:
+            card = existing_card
+            card._tid = tid
+        elif mime.startswith("video/"):
             card = VideoCard(tid, filename, size, outgoing=True)
         else:
             card = FileCard(tid, filename, size, outgoing=True, theme=self._theme)
         if hasattr(card, "cancel_requested"):
-            card.cancel_requested.connect(self._cancel_transfer)
+            if existing_card is None:
+                card.cancel_requested.connect(self._cancel_transfer)
+        self._connect_file_retry(card, source_path, room_id=rid)
         self._ft_cards[tid] = card
-        self._chat.add_file_card(card)
+        if existing_card is None:
+            self._chat.add_file_card_to_room(rid, card)
 
         total = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE)
         _log.info("File send start: %r  size=%d  chunks=%d", filename, size, total)
@@ -2875,13 +3149,13 @@ class MainWindow(QMainWindow):
                                        **offer):
             card.set_error("连接不可用")
             self._ft_cards.pop(tid, None)
-            self._room_file_senders.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         self._pump_room_file_sender(tid)
 
-    def _start_peer_file_send(self, peer: str, source_path: pathlib.Path):
+    def _start_peer_file_send(self, peer: str, source_path: pathlib.Path, *, existing_card=None):
         if not self.__dict__.get("_webrtc_supported", True):
-            self._start_peer_file_relay(peer, source_path)
+            self._start_peer_file_relay(peer, source_path, existing_card=existing_card)
             return
 
         filename = source_path.name
@@ -2889,15 +3163,19 @@ class MainWindow(QMainWindow):
         tid = uuid.uuid4().hex[:12]
         _log.info("WEBRTC file start session=%s peer=%s filename=%s size=%d",
                   tid, peer, filename, size)
-        card = FileCard(tid, filename, size, outgoing=True, theme=self._theme)
-        if hasattr(card, "cancel_requested"):
+        card = existing_card or FileCard(tid, filename, size, outgoing=True, theme=self._theme)
+        card._tid = tid
+        if existing_card is None and hasattr(card, "cancel_requested"):
             card.cancel_requested.connect(self._cancel_transfer)
+        self._connect_file_retry(card, source_path, peer=peer)
         self._ft_cards[tid] = card
-        self._chat.add_file_card(card)
+        if existing_card is None:
+            self._chat.add_file_card(card)
         try:
             self._run_webrtc_task(
                 self._webrtc_transfer.start_offer(peer, source_path, session_id=tid),
                 raise_errors=True,
+                on_error=lambda _exc: self._fallback_webrtc_file_if_pending(tid),
             )
             self._webrtc_file_pending[tid] = {"peer": peer, "path": source_path}
             QTimer.singleShot(WEBRTC_FILE_FALLBACK_MS,
@@ -2941,10 +3219,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "发送失败", f"加密文件密钥不可用：{exc}")
             return
         if tid not in self._ft_manager.outgoing:
-            sender = EncryptedFileSender(
-                source_path, file_key, transfer_id=tid, scope_type="dm",
-                scope_id=scope_id, sender=self._username, recipient=peer,
-            )
+            sender = None
+            try:
+                sender = EncryptedFileSender(
+                    source_path, file_key, transfer_id=tid, scope_type="dm",
+                    scope_id=scope_id, sender=self._username, recipient=peer,
+                )
+                offer = sender.offer_payload()
+            except (OSError, FileCryptoError, ValueError) as exc:
+                if sender is not None:
+                    sender.close()
+                if existing_card is not None:
+                    existing_card.set_error(f"无法读取文件：{exc}")
+                else:
+                    QMessageBox.warning(self, "发送失败", f"无法读取文件：{exc}")
+                return
             self._ft_manager.outgoing[tid] = {
                 "to": peer,
                 "filename": source_path.name,
@@ -2952,7 +3241,7 @@ class MainWindow(QMainWindow):
                 "sender": sender,
                 "mime": guess_mime(source_path.name),
                 "size": source_path.stat().st_size,
-                "offer": sender.offer_payload(),
+                "offer": offer,
             }
         info = self._ft_manager.outgoing[tid]
         _log.info("Relay file offer session=%s peer=%s filename=%s size=%d",
@@ -2965,13 +3254,15 @@ class MainWindow(QMainWindow):
                 card.cancel_requested.connect(self._cancel_transfer)
             self._chat.add_file_card(card)
         self._ft_cards[tid] = card
+        card._tid = tid
+        self._connect_file_retry(card, source_path, peer=peer)
         if not self._bridge.send_frame(T.FILE_OFFER,
                                        to=peer,
                                        transfer_id=tid,
                                        **info["offer"]):
             card.set_error("连接不可用")
             self._ft_cards.pop(tid, None)
-            self._ft_manager.cancel(tid)
+            self._cleanup_file_transfer(tid)
 
     def _on_file_offer(self, p: dict):
         tid, from_user = p["transfer_id"], p["from"]
@@ -3013,14 +3304,13 @@ class MainWindow(QMainWindow):
 
         if card := self._ft_cards.pop(tid, None):
             card.set_error("文件发送器不可用")
+        self._cleanup_file_transfer(tid)
 
     def _on_file_reject(self, p: dict):
         tid = p["transfer_id"]
         if card := self._ft_cards.pop(tid, None):
             card.set_error(p.get("reason", "Rejected"))
-        self._ft_manager.cancel(tid)
-        self._direct_file_senders.pop(tid, None)
-        self._encrypted_file_receivers.pop(tid, None)
+        self._cleanup_file_transfer(tid)
 
     def _on_file_chunk(self, p: dict):
         tid = p["transfer_id"]
@@ -3028,11 +3318,11 @@ class MainWindow(QMainWindow):
         if receiver is not None:
             try:
                 receiver.add_chunk(int(p["index"]), int(p["total"]), p["encrypted_chunk"])
-            except (FileCryptoError, KeyError, TypeError, ValueError) as exc:
+            except (FileCryptoError, KeyError, TypeError, ValueError, OSError) as exc:
                 _log.warning("rejected encrypted FILE_CHUNK tid=%s index=%s error=%s", tid, p.get("index"), exc)
-                self._encrypted_file_receivers.pop(tid, None)
                 if card := self._ft_cards.pop(tid, None):
                     card.set_error("文件分块认证失败")
+                self._cleanup_file_transfer(tid)
                 return
         else:
             accepted = self._ft_manager.add_chunk(tid, p["index"], p["total"], p["data"])
@@ -3045,39 +3335,70 @@ class MainWindow(QMainWindow):
 
     def _on_file_done(self, p: dict):
         tid = p["transfer_id"]
-        receiver = self._encrypted_file_receivers.pop(tid, None)
+        receiver = self._encrypted_file_receivers.get(tid)
         if receiver is not None:
             try:
-                path = receiver.finish(p["encrypted_done"])
-            except (FileCryptoError, KeyError, TypeError, ValueError):
+                path = receiver.finish(p.get("encrypted_done"))
+            except (FileCryptoError, KeyError, TypeError, ValueError, OSError):
                 path = None
         else:
-            path = self._ft_manager.finish_incoming(tid, p["sha256"])
+            try:
+                path = self._ft_manager.finish_incoming(tid, p.get("sha256", ""))
+            except OSError:
+                path = None
         if card := self._ft_cards.pop(tid, None):
             if path:
                 card.set_done(save_path=str(path))
             else:
                 card.set_error("文件认证失败")
-        self._direct_file_senders.pop(tid, None)
+        self._cleanup_file_transfer(tid)
 
     def _on_file_error(self, p: dict):
         tid = p["transfer_id"]
         if card := self._ft_cards.pop(tid, None):
             card.set_error(p.get("message", "Transfer error"))
+        self._cleanup_file_transfer(tid)
+
+    def _cleanup_file_transfer(self, tid: str) -> None:
+        """统一释放传输资源，确保取消、断连和认证失败不会遗留句柄或临时文件。"""
+        receiver = self._encrypted_file_receivers.pop(tid, None)
+        if receiver is not None:
+            receiver.cancel()
         self._ft_manager.cancel(tid)
-        self._direct_file_senders.pop(tid, None)
-        self._encrypted_file_receivers.pop(tid, None)
+        direct_sender = self._direct_file_senders.pop(tid, None)
+        close = getattr(direct_sender, "close", None)
+        if callable(close):
+            close()
+        room_sender = self._room_file_senders.pop(tid, None)
+        if room_sender is not None:
+            close = getattr(room_sender.get("sender"), "close", None)
+            if callable(close):
+                close()
+
+    def _close_all_file_transfers(self, message: str) -> None:
+        """清理全部传输，包括后台接收和没有可见卡片的发送任务。"""
+        transfer_ids = (set(self._ft_cards) | set(self._encrypted_file_receivers)
+                        | set(self._direct_file_senders) | set(self._room_file_senders)
+                        | set(self._ft_manager.incoming) | set(self._ft_manager.outgoing))
+        for tid in transfer_ids:
+            if card := self._ft_cards.pop(tid, None):
+                card.set_error(message)
+            self._cleanup_file_transfer(tid)
+        self._webrtc_file_pending.clear()
+        self._run_webrtc_task(self._webrtc_transfer.close_all())
 
     def _cancel_transfer(self, tid: str):
         pending_webrtc = self._webrtc_file_pending.pop(tid, None)
-        if pending_webrtc is not None:
-            peer = pending_webrtc.get("peer")
+        webrtc_peer = self._webrtc_transfer.get_session_peer(tid)
+        if pending_webrtc is not None or webrtc_peer:
+            peer = pending_webrtc.get("peer") if pending_webrtc is not None else webrtc_peer
             _log.info("WEBRTC file cancel session=%s peer=%s", tid, peer or "")
             if peer:
                 self._bridge.send_frame(T.WEBRTC_CLOSE, to=peer, session_id=tid)
             self._run_webrtc_task(self._webrtc_transfer.close(tid))
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("已取消")
+            self._cleanup_file_transfer(tid)
             return
 
         info = self._ft_manager.outgoing.get(tid)
@@ -3087,23 +3408,15 @@ class MainWindow(QMainWindow):
                                     message="Cancelled by sender")
         else:
             rec = self._ft_manager.incoming.get(tid)
-            if rec:
+            receiver = self._encrypted_file_receivers.get(tid)
+            if rec or (receiver is not None and receiver.scope_type == "dm"):
                 self._bridge.send_frame(T.FILE_REJECT,
-                                        to=rec["from"], transfer_id=tid,
-                                        reason="Cancelled by receiver")
-        self._ft_manager.cancel(tid)
-        room_sender = self._room_file_senders.pop(tid, None)
-        if room_sender is not None:
-            close = getattr(room_sender.get("sender"), "close", None)
-            if callable(close):
-                close()
-        direct_sender = self._direct_file_senders.get(tid)
-        close = getattr(direct_sender, "close", None)
-        if callable(close):
-            close()
+                                        to=rec["from"] if rec else receiver.sender, transfer_id=tid,
+                                        reason="接收方已取消")
+        self._cleanup_file_transfer(tid)
+        if card := self._ft_cards.get(tid):
+            card.set_error("已取消")
         self._ft_cards.pop(tid, None)
-        self._direct_file_senders.pop(tid, None)
-        self._encrypted_file_receivers.pop(tid, None)
 
     def _on_file_room_share(self, p: dict):
         """服务端转发房间文件分享公告，客户端先认证密文元数据。"""
@@ -3128,12 +3441,14 @@ class MainWindow(QMainWindow):
         size = metadata["size"]
         self._encrypted_file_receivers[tid] = receiver
 
-        if room_id != self._chat.current_room_id:
-            return
         card = FileCard(tid, filename, size, outgoing=False, theme=self._theme)
         card._sender = from_user
+        card.cancel_requested.connect(self._cancel_transfer)
         self._ft_cards[tid] = card
-        self._chat.add_file_card(card)
+        self._chat.add_file_card_to_room(room_id, card)
+        if room_id != self._chat.current_room_id:
+            self._conv.set_preview(room_id, f"{from_user}: 📎 {filename}", time.time())
+            self._conv.increment_unread(room_id)
 
     def _on_file_room_chunk(self, p: dict):
         """服务端转发房间文件密文分块，客户端按顺序认证并写入临时文件。"""
@@ -3145,11 +3460,11 @@ class MainWindow(QMainWindow):
             return
         try:
             receiver.add_chunk(index, total, p.get("encrypted_chunk"))
-        except FileCryptoError as exc:
+        except (FileCryptoError, TypeError, ValueError, OSError) as exc:
             _log.warning("rejected encrypted FILE_ROOM_CHUNK tid=%s index=%s error=%s", tid, index, exc)
-            self._encrypted_file_receivers.pop(tid, None)
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("文件分块认证失败")
+            self._cleanup_file_transfer(tid)
             return
         pct = int((index + 1) / max(total, 1) * 100)
         if card := self._ft_cards.get(tid):
@@ -3172,7 +3487,7 @@ class MainWindow(QMainWindow):
         from_user = p.get("from_user", "?")
         room_id   = p.get("room_id", "")
 
-        receiver = self._encrypted_file_receivers.pop(tid, None)
+        receiver = self._encrypted_file_receivers.get(tid)
         if receiver is None or receiver.metadata is None:
             return
         metadata = receiver.metadata
@@ -3180,17 +3495,31 @@ class MainWindow(QMainWindow):
         size = metadata.size
         mime = metadata.mime
         try:
-            save_path = receiver.finish(p["encrypted_done"])
-        except (FileCryptoError, KeyError, TypeError, ValueError) as exc:
+            save_path = receiver.finish(p.get("encrypted_done"))
+        except (FileCryptoError, KeyError, TypeError, ValueError, OSError) as exc:
             _log.error("FILE_ROOM_DONE authentication failed tid=%s error=%s", tid, exc)
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("文件认证失败")
+            self._cleanup_file_transfer(tid)
             return
+
+        self._cleanup_file_transfer(tid)
+
+        if self._bridge and self._bridge.is_connected():
+            self._bridge.send_frame(T.FILE_ROOM_RECEIVED, transfer_id=tid)
 
         if card := self._ft_cards.pop(tid, None):
             row = card.parentWidget()
             if mime.startswith("image/"):
-                data = save_path.read_bytes()
+                try:
+                    data = save_path.read_bytes()
+                except OSError as exc:
+                    card.set_error(f"图片预览失败，文件已保存：{exc}")
+                    data = None
+                if data is None:
+                    room_name = self._rooms.get(room_id, {}).get("name", room_id)
+                    self._files_panel.add_file(filename, from_user, room_name, size, str(save_path))
+                    return
                 new_card = ImageCard(tid, filename, data, outgoing=False)
                 new_card._sender = from_user
                 new_card.set_done(save_path=str(save_path))
@@ -3214,13 +3543,12 @@ class MainWindow(QMainWindow):
         room_name = self._rooms.get(room_id, {}).get("name", room_id)
         self._files_panel.add_file(filename, from_user, room_name,
                                    size, str(save_path))
-        if self._bridge and self._bridge.is_connected():
-            self._bridge.send_frame(T.FILE_ROOM_RECEIVED,
-                                    transfer_id=tid)
 
     def _on_file_room_done_ack(self, p: dict):
         tid = p["transfer_id"]
         sender_info = self._room_file_senders.pop(tid, None)
+        if sender_info is not None:
+            sender_info["sender"].close()
         if card := self._ft_cards.pop(tid, None):
             save_path = None
             if sender_info is not None:
@@ -3238,7 +3566,7 @@ class MainWindow(QMainWindow):
 
     def _pump_room_file_sender(self, tid: str):
         if tid not in self._ft_cards:
-            self._room_file_senders.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         sender_info = self._room_file_senders.get(tid)
         if sender_info is None:
@@ -3247,7 +3575,7 @@ class MainWindow(QMainWindow):
         if not self._bridge or not self._bridge.is_connected():
             if c := self._ft_cards.pop(tid, None):
                 c.set_error("传输中断")
-            self._room_file_senders.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         q = self._bridge._queue
         if q is not None and q.qsize() >= 4:
@@ -3257,15 +3585,24 @@ class MainWindow(QMainWindow):
             if sender_info["done_sent"]:
                 return
             sender_info["done_sent"] = True
-            done_payload = sender.done_payload() if isinstance(sender, EncryptedFileSender) else {"sha256": sender.sha256_hex}
+            try:
+                done_payload = sender.done_payload() if isinstance(sender, EncryptedFileSender) else {"sha256": sender.sha256_hex}
+            except (OSError, FileCryptoError, ValueError) as exc:
+                self._on_file_error({"transfer_id": tid, "message": f"文件发送失败：{exc}"})
+                return
             if not self._bridge.send_frame(T.FILE_ROOM_DONE,
                                            transfer_id=tid, **done_payload):
                 if c := self._ft_cards.pop(tid, None):
                     c.set_error("传输中断")
-                self._room_file_senders.pop(tid, None)
+                self._cleanup_file_transfer(tid)
             return
         sent_any = False
-        for payload in sender.next_payloads():
+        try:
+            payloads = sender.next_payloads()
+        except (OSError, FileCryptoError, ValueError) as exc:
+            self._on_file_error({"transfer_id": tid, "message": f"文件读取失败：{exc}"})
+            return
+        for payload in payloads:
             if isinstance(sender, EncryptedFileSender):
                 index = payload["index"]
                 total_chunks = payload["total"]
@@ -3281,15 +3618,14 @@ class MainWindow(QMainWindow):
                                                     total=total_chunks, **frame_payload)):
                 if c := self._ft_cards.pop(tid, None):
                     c.set_error("传输中断")
-                self._room_file_senders.pop(tid, None)
+                self._cleanup_file_transfer(tid)
                 return
         if sent_any:
             QTimer.singleShot(5, lambda: self._pump_room_file_sender(tid))
 
     def _pump_direct_file_sender(self, tid: str):
         if tid not in self._ft_cards:
-            self._direct_file_senders.pop(tid, None)
-            self._ft_manager.outgoing.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         info = self._ft_manager.outgoing.get(tid)
         sender = self._direct_file_senders.get(tid)
@@ -3298,29 +3634,34 @@ class MainWindow(QMainWindow):
         if not self._bridge or not self._bridge.is_connected():
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("传输中断")
-            self._direct_file_senders.pop(tid, None)
-            self._ft_manager.outgoing.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         q = self._bridge._queue
         if q is not None and q.qsize() >= 4:
             QTimer.singleShot(50, lambda: self._pump_direct_file_sender(tid))
             return
         if sender.ready_to_finish():
-            done_payload = sender.done_payload() if isinstance(sender, EncryptedFileSender) else {"sha256": sender.sha256_hex}
+            try:
+                done_payload = sender.done_payload() if isinstance(sender, EncryptedFileSender) else {"sha256": sender.sha256_hex}
+            except (OSError, FileCryptoError, ValueError) as exc:
+                self._on_file_error({"transfer_id": tid, "message": f"文件发送失败：{exc}"})
+                return
             if not self._bridge.send_frame(T.FILE_DONE,
                                            to=info["to"], transfer_id=tid,
                                            **done_payload):
                 if card := self._ft_cards.pop(tid, None):
                     card.set_error("传输中断")
-                self._direct_file_senders.pop(tid, None)
-                self._ft_manager.outgoing.pop(tid, None)
+                self._cleanup_file_transfer(tid)
                 return
             if card := self._ft_cards.get(tid):
                 card.set_done()
-            self._direct_file_senders.pop(tid, None)
-            self._ft_manager.outgoing.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
-        payload = sender.next_payload()
+        try:
+            payload = sender.next_payload()
+        except (OSError, FileCryptoError, ValueError) as exc:
+            self._on_file_error({"transfer_id": tid, "message": f"文件读取失败：{exc}"})
+            return
         if payload is None:
             QTimer.singleShot(5, lambda: self._pump_direct_file_sender(tid))
             return
@@ -3336,8 +3677,7 @@ class MainWindow(QMainWindow):
                                                 index=index, total=total, **frame_payload)):
             if card := self._ft_cards.pop(tid, None):
                 card.set_error("传输中断")
-            self._direct_file_senders.pop(tid, None)
-            self._ft_manager.outgoing.pop(tid, None)
+            self._cleanup_file_transfer(tid)
             return
         if isinstance(sender, EncryptedFileSender):
             sender.acknowledge(index)
@@ -3353,6 +3693,7 @@ class MainWindow(QMainWindow):
             card.set_error(msg)
         else:
             QMessageBox.warning(self, "文件上传失败", msg)
+        self._cleanup_file_transfer(tid)
 
     # ── Reply ─────────────────────────────────────────────────────────────────
 
@@ -3365,14 +3706,23 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _on_room_selected(self, room_id: str):
         if room_id == self._chat.current_room_id:
+            self._conv.set_active(room_id)
+            self._save_room_state()
             return
+        if self.__dict__.get("_is_typing"):
+            self._on_typing_stop()
         # DM conversations are local — no server JOIN/LEAVE
         if room_id.startswith("@"):
             peer = self._dms.get(room_id, room_id[1:])
             self._current_peer = peer
             self._chat.open_room(room_id, f"@ {peer}", [peer, self._username], False)
+            self._conv.set_active(room_id)
             self._update_private_voice_button()
             self._refresh_ttl_policy(room_id)
+            self._request_current_ttl(room_id)
+            return
+        if room_id in self.__dict__.get("_joined_room_ids", set()):
+            self._open_joined_room(room_id)
             self._request_current_ttl(room_id)
             return
         room = self._rooms.get(room_id, {})
@@ -3396,12 +3746,9 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "加入房间", "房间访问令牌认证失败")
                 return
-        if self._server_room_id:
-            self._on_typing_stop()
-            self._implicit_leave = True
-            self._bridge.send_frame(T.LEAVE_ROOM)
         self._rooms.setdefault(room_id, {})["password"] = pw
         self._rooms[room_id]["access_token"] = access_token
+        self._pending_room_focus = room_id
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, access_token=access_token)
 
     def _prompt_room_password(self, label: str = "请输入房间密码：") -> str | None:
@@ -3430,8 +3777,9 @@ class MainWindow(QMainWindow):
         metadata = create_room_access_metadata(room_id, v["password"])
         self._rooms["__pending__"] = {"metadata": dict(metadata), "password": v["password"], "access_token": metadata.access_token}
         _log.info("CREATE_ROOM request: name=%r locked=%s", v["name"], bool(v["password"]))
-        if self._server_room_id:
-            self._implicit_leave = True
+        if self._is_typing:
+            self._on_typing_stop()
+        self._pending_room_focus = room_id
         self._bridge.send_frame(T.CREATE_ROOM, room_id=room_id, name=v["name"],
                                 locked=bool(v["password"]), **dict(metadata))
 
@@ -3459,8 +3807,9 @@ class MainWindow(QMainWindow):
             return
         self._rooms.setdefault(room_id, {})["password"] = password
         self._rooms[room_id]["access_token"] = access_token
-        if self._server_room_id:
-            self._implicit_leave = True
+        if self.__dict__.get("_is_typing"):
+            self._on_typing_stop()
+        self._pending_room_focus = room_id
         self._bridge.send_frame(T.JOIN_ROOM, room_id=room_id, access_token=access_token)
 
     @pyqtSlot(str, str)
@@ -3543,6 +3892,7 @@ class MainWindow(QMainWindow):
             self._refresh_ttl_policy(active_chat_id)
             if "requested_ttl_seconds" in payload:
                 self._chat.add_sys(f"消息过期时间已设置为{self._ttl_label(ttl)}")
+        self._save_room_state()
 
     @staticmethod
     def _ttl_label(ttl_seconds: int) -> str:
@@ -3575,7 +3925,7 @@ class MainWindow(QMainWindow):
         reply = self._chat.composer.pending_reply
 
         self._msg_counter += 1
-        client_mid = str(self._msg_counter)
+        client_mid = f"room-{uuid.uuid4().hex}"
         try:
             ciphertext = encode_room_envelope(encrypt_room_message(rid, room.get("password", ""), text, client_mid, room.get("salt", "")))
         except Exception:
@@ -3588,12 +3938,19 @@ class MainWindow(QMainWindow):
                                 crypto_meta={"alg": "ChaCha20-Poly1305", "version": 1})
 
         # Show locally; bubble tracked by client_mid until SEND_ACK arrives
+        message_time = time.time()
         bubble = self._chat.add_message(
-            self._username, text, time.time(),
+            self._username, text, message_time,
             outgoing=True, seq=0, quote=reply
         )
         if bubble:
+            bubble._client_msg_id = client_mid
             self._pending_bubbles[client_mid] = bubble
+        self._record_room_message(rid, {
+            "sender": self._username, "text": text, "ts": message_time, "outgoing": True,
+            "message_id": 0, "client_msg_id": client_mid, "quote": reply,
+        })
+        self._save_room_state()
 
         self._conv.set_preview(rid, f"You: {text}", time.time())
 
@@ -3676,6 +4033,7 @@ class MainWindow(QMainWindow):
 
         ice_text = v.get("ice_servers", "")
         if ice_text != self._load_ice_servers_text():
+            self._close_all_file_transfers("传输设置已更新，请重试")
             self._save_ice_servers_text(ice_text)
             self._ice_servers = load_ice_servers({"BEAM_ICE_SERVERS": ice_text})
             self._webrtc_transfer = self._new_webrtc_transfer(self._ft_manager._dir,
@@ -3710,7 +4068,10 @@ class MainWindow(QMainWindow):
     _DL_DIR_FILE = pathlib.Path.home() / ".beamchat" / "download_dir.txt"
     _ICE_FILE    = pathlib.Path.home() / ".beamchat" / "ice_servers.txt"
     _STATE_FILE  = pathlib.Path.home() / ".beamchat" / "client_state.json"
-    _DEFAULT_DL  = pathlib.Path.home() / "AppData" / "Local" / "BeamChat" / "downloads"
+    _DEFAULT_DL  = pathlib.Path(
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        or str(pathlib.Path.home() / "Downloads")
+    ) / "BeamChat"
 
     def _load_download_dir(self) -> pathlib.Path:
         try:
@@ -3771,6 +4132,180 @@ class MainWindow(QMainWindow):
             return ""
         return f"{scope_type}:{scope_id}:{mid}"
 
+    def _restore_room_state(self):
+        """历史与游标一起恢复；缺失缓存时重新拉历史，避免空白会话。"""
+        state = self._room_state.load()
+        rooms = state.get("rooms", {})
+        histories = state.get("history", {})
+        offsets = state.get("offsets", {})
+        unread = state.get("unread", {})
+        if not all(isinstance(value, dict) for value in (rooms, histories, offsets, unread)):
+            return
+        for rid, room in rooms.items():
+            if not isinstance(rid, str) or rid.startswith("@") or not isinstance(room, dict):
+                continue
+            self._rooms[rid] = room
+            self._joined_room_ids.add(rid)
+            ttl = int(room.get("message_ttl_seconds", TTL_VALUES["week"]))
+            history = histories.get(rid, [])
+            self._room_history[rid] = retained_room_messages(history if isinstance(history, list) else [], ttl)
+            self._message_offsets[self._offset_key("room", rid)] = int(offsets.get(rid, 0))
+            self._conv.upsert_room(rid, room.get("name", rid), room.get("creator", ""),
+                                   len(room.get("members", [])), room.get("locked", False),
+                                   unread=max(0, int(unread.get(rid, 0))))
+            for message in self._room_history[rid]:
+                bubble = self._chat.add_message_to_room(
+                    rid, message.get("sender", "?"), message.get("text", ""), float(message.get("ts", 0)),
+                    outgoing=bool(message.get("outgoing")), quote=message.get("quote"),
+                    message_id=int(message.get("message_id", 0)),
+                )
+                bubble._client_msg_id = str(message.get("client_msg_id", ""))
+                key = self._displayed_message_key("room", rid, message.get("message_id", 0))
+                if key:
+                    self._displayed_message_ids.add(key)
+            if self._room_history[rid]:
+                last = self._room_history[rid][-1]
+                self._conv.set_preview(rid, f"{last.get('sender', '?')}: {last.get('text', '')}", last.get("ts", 0))
+            self._conv.set_conn_state(rid, "offline")
+        for rid in state.get("pinned", []):
+            if rid in self._joined_room_ids:
+                self._conv.set_pinned(rid, True)
+
+    def _reconcile_unconfirmed_room_message(self, room_id: str, payload: dict, ts: float) -> bool:
+        """补发确认原有待发送气泡，避免发送确认前退出后出现重复消息。"""
+        client_msg_id = str(payload.get("client_msg_id", ""))
+        message_id = int(payload.get("message_id", 0))
+        sender = payload.get("sender", "?")
+        if not client_msg_id or message_id <= 0:
+            return False
+        message = next((item for item in self.__dict__.get("_room_history", {}).get(room_id, [])
+                        if str(item.get("client_msg_id", "")) == client_msg_id
+                        and item.get("sender") == sender and not item.get("message_id")), None)
+        if message is None:
+            return False
+        messages = self._chat._msgs_by_room.get(room_id)
+        if messages is None:
+            return False
+        bubble = None
+        for index in range(messages._lay.count() - 1):
+            row = messages._lay.itemAt(index).widget()
+            if isinstance(row, MessageRow) and isinstance(row.content, BubbleWidget):
+                candidate = row.content
+                if candidate._sender == sender and getattr(candidate, "_client_msg_id", "") == client_msg_id:
+                    bubble = candidate
+                    break
+        if bubble is None:
+            return False
+        message["message_id"] = message_id
+        message["ts"] = ts
+        self._room_history[room_id] = retained_room_messages(
+            self._room_history[room_id],
+            int(self._rooms.get(room_id, {}).get("message_ttl_seconds", TTL_VALUES["week"])),
+        )
+        messages.update_message_id(bubble, message_id, ts)
+        bubble.set_status("sent")
+        self._pending_bubbles.pop(client_msg_id, None)
+        self._seq_bubbles[int(payload.get("seq", 0)) or message_id] = bubble
+        self._displayed_message_ids.add(self._displayed_message_key("room", room_id, message_id))
+        self._update_message_offset("room", room_id, message_id)
+        self._save_room_state()
+        return True
+
+    def _record_room_message(self, room_id: str, message: dict):
+        """保留后台消息内容；服务端序号和本地发送标识共同消除重复。"""
+        history = self.__dict__.setdefault("_room_history", {}).setdefault(room_id, [])
+        message_id = int(message.get("message_id", 0))
+        client_msg_id = message.get("client_msg_id", "")
+        for existing in history:
+            if (message_id > 0 and existing.get("message_id") == message_id) or (
+                client_msg_id and existing.get("client_msg_id") == client_msg_id
+                and existing.get("sender") == message.get("sender")
+            ):
+                existing.update(message)
+                return
+        history.append(message)
+        self._room_history[room_id] = retained_room_messages(
+            history, int(self._rooms.get(room_id, {}).get("message_ttl_seconds", TTL_VALUES["week"])),
+        )
+
+    def _request_message_sync(self, scopes: list[dict]):
+        """记录请求顺序，使空历史响应也能确认对应群的同步完成。"""
+        if self._bridge and self._bridge.send_frame(T.SYNC_MESSAGES, scopes=scopes, limit=200):
+            self.__dict__.setdefault("_message_sync_requests", []).append(scopes)
+
+    def _consume_message_sync(self, payload: dict, ts: float):
+        """分页消息按序展示，仅已确认的同步页推进持久游标。"""
+        requests = self.__dict__.setdefault("_message_sync_requests", [])
+        requested = requests.pop(0) if requests else []
+        messages = sorted(payload.get("messages", []), key=lambda message: int(message.get("message_id", 0)))
+        next_scopes = payload.get("next_scopes", []) if payload.get("has_more") else []
+        self._room_sync_batch = True
+        try:
+            for item in messages:
+                if item.get("scope_type") == "room":
+                    rid = item.get("scope_id", "")
+                    room = self._rooms.get(rid, {})
+                    try:
+                        text = decrypt_room_message(
+                            rid, room.get("password", ""), decode_room_envelope(item.get("ciphertext", "")),
+                            item.get("client_msg_id", ""), room.get("salt", ""),
+                        )
+                    except Exception:
+                        text = "房间消息认证失败"
+                    self._dispatch_frame(T.NEW_MSG, {
+                        "sender": item.get("sender_name", "?"), "text": text, "encrypted": False,
+                        "room_id": rid, "seq": 0, "message_id": item.get("message_id", 0),
+                        "client_msg_id": item.get("client_msg_id", ""),
+                    }, float(item.get("created_at", ts)))
+                elif item.get("scope_type") == "dm":
+                    self._show_decrypted_dm(item, ts)
+            pending = self.__dict__.setdefault("_room_sync_offsets", {})
+            offsets = self.__dict__.setdefault("_message_offsets", {})
+            for scope in requested:
+                if scope.get("scope_type") != "room":
+                    continue
+                rid = scope["scope_id"]
+                last_id = max([int(scope.get("after_message_id", 0))] + [
+                    int(message.get("message_id", 0)) for message in messages
+                    if message.get("scope_type") == "room" and message.get("scope_id") == rid
+                ])
+                offsets[self._offset_key("room", rid)] = last_id
+                if any(next_scope.get("scope_type") == "room" and next_scope.get("scope_id") == rid for next_scope in next_scopes):
+                    pending[rid] = last_id
+                else:
+                    pending.pop(rid, None)
+        finally:
+            self._room_sync_batch = False
+            self._save_message_offsets()
+            self._save_room_state()
+        if next_scopes:
+            self._request_message_sync(next_scopes)
+
+    def _save_room_state(self):
+        state_file = self.__dict__.get("_room_state")
+        if state_file is None or self.__dict__.get("_room_sync_batch"):
+            return
+        try:
+            joined = self.__dict__.get("_joined_room_ids", set())
+            fields = ("name", "members", "locked", "metadata", "password", "salt", "access_token",
+                      "creator", "created_at", "icon", "message_ttl_seconds")
+            rooms = {rid: {field: self._rooms[rid][field] for field in fields if field in self._rooms[rid]}
+                     for rid in joined if rid in self._rooms}
+            history = {
+                rid: retained_room_messages(
+                    self.__dict__.get("_room_history", {}).get(rid, []),
+                    int(room.get("message_ttl_seconds", TTL_VALUES["week"])),
+                ) for rid, room in rooms.items()
+            }
+            state_file.save({
+                "rooms": rooms, "history": history,
+                "offsets": {rid: self._message_offsets.get(self._offset_key("room", rid), 0) for rid in rooms},
+                "unread": {rid: self._conv._unread.get(rid, 0) for rid in rooms},
+                "pinned": sorted(self._conv._pinned.intersection(rooms)),
+            })
+        except (OSError, ValueError, TypeError) as exc:
+            _log.warning("保存加密群缓存失败：%s", exc)
+
     def _load_message_offsets(self) -> dict[str, int]:
         try:
             data = json.loads(self._STATE_FILE.read_text(encoding="utf-8"))
@@ -3804,6 +4339,9 @@ class MainWindow(QMainWindow):
         mid = int(message_id or 0)
         if mid <= 0 or not scope_id:
             return
+        if scope_type == "room" and scope_id in self.__dict__.get("_room_sync_offsets", {}):
+            # 补发期间可能先收到更晚的实时消息，不能越过尚未收到的历史游标。
+            return
         key = self._offset_key(scope_type, scope_id)
         if mid > self._message_offsets.get(key, 0):
             self._message_offsets[key] = mid
@@ -3812,15 +4350,19 @@ class MainWindow(QMainWindow):
     def _sync_room_messages(self, room_id: str):
         if not self._bridge or not room_id:
             return
-        self._bridge.send_frame(
-            T.SYNC_MESSAGES,
-            scopes=[{
-                "scope_type": "room",
-                "scope_id": room_id,
-                "after_message_id": 0,
-            }],
-            limit=200,
-        )
+        has_history = any(message.get("message_id", 0) for message in
+                          self.__dict__.get("_room_history", {}).get(room_id, []))
+        offsets = self.__dict__.get("_message_offsets", {})
+        after = self.__dict__.get("_room_sync_offsets", {}).get(
+            room_id, offsets.get(self._offset_key("room", room_id), 0)
+        ) if has_history else 0
+        scope = {"scope_type": "room", "scope_id": room_id, "after_message_id": after}
+        if after == 0 and room_id in self.__dict__.get("_joined_room_ids", set()):
+            scope["history_mode"] = "all"
+        self.__dict__.setdefault("_room_sync_offsets", {})[room_id] = after
+        self.__dict__.setdefault("_message_offsets", {})[self._offset_key("room", room_id)] = after
+        self._request_message_sync([scope])
+        self._save_room_state()
 
     def _sync_dm_messages(self):
         if not self._bridge:
@@ -3834,7 +4376,7 @@ class MainWindow(QMainWindow):
                 "after_message_id": self._message_offsets.get(self._offset_key("dm", scope_id), 0),
             })
         if scopes:
-            self._bridge.send_frame(T.SYNC_MESSAGES, scopes=scopes, limit=200)
+            self._request_message_sync(scopes)
 
     def _setup_tray(self):
         from PyQt6.QtWidgets import QSystemTrayIcon
@@ -3868,6 +4410,9 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        if self._chat.current_room_id:
+            self._conv.set_active(self._chat.current_room_id)
+            self._save_room_state()
 
     def _tray_quit(self):
         self._tray_flash_timer.stop()
@@ -4028,6 +4573,7 @@ class MainWindow(QMainWindow):
             self.hide()
         else:
             self._on_typing_stop()
+            self._close_all_file_transfers("程序已退出")
             if self._bridge:
                 self._bridge.close()
                 self._bridge.wait(1500)
@@ -4036,6 +4582,7 @@ class MainWindow(QMainWindow):
 
     def _do_quit(self):
         self._on_typing_stop()
+        self._close_all_file_transfers("程序已退出")
         if self._bridge:
             self._bridge.close()
             self._bridge.wait(1500)
