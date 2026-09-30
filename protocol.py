@@ -14,7 +14,7 @@ import time
 import uuid
 
 PROTOCOL_VERSION = 5
-CLIENT_VERSION = "1.2.1"
+CLIENT_VERSION = "1.2.2"
 BASE_CAPABILITIES = [
     "authenticated_key_exchange",
     "encrypted_files",
@@ -35,6 +35,7 @@ REQUIRED_CAPABILITIES = [
     "encrypted_voice",
     "voice_aead_v1",
     "ttl_policy",
+    "persistent_room_membership",
 ]
 CLIENT_CAPABILITIES = list(BASE_CAPABILITIES)
 SERVER_CAPABILITIES = [

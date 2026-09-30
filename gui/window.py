@@ -667,7 +667,8 @@ class MessagesArea(QScrollArea):
             self._last_sender = None
 
         show_av     = sender != self._last_sender
-        show_sender = show_av and not outgoing
+        # 姓名控件始终创建，补发历史重排后可以重新显示发送者分组。
+        show_sender = not outgoing
         bubble = BubbleWidget(sender, text, ts, outgoing, show_sender,
                               self._theme, seq=seq, quote=quote)
         bubble.reply_requested.connect(self.reply_requested)
@@ -676,13 +677,14 @@ class MessagesArea(QScrollArea):
             bubble,
             sender=self._own_name or sender if outgoing else sender,
             outgoing=outgoing,
-            show_avatar=show_av,
+            show_avatar=True,
             avatar_pixmap=avatar_pixmap,
         )
         row._message_id = int(message_id or 0)
         row._message_time = ts
         if not outgoing and row.avatar is not None:
             self._peer_avatar_widgets.setdefault(sender, []).append(row.avatar)
+        self._set_row_grouping(row, show_av)
         self._lay.insertWidget(self._lay.count() - 1, row)
         self._last_sender = sender
         self._sort_message_rows()
@@ -705,10 +707,10 @@ class MessagesArea(QScrollArea):
     def _sort_message_rows(self):
         """补发历史到达时原位排序文字气泡，保留文件卡片与待发送气泡的引用。"""
         widgets = [self._lay.itemAt(index).widget() for index in range(self._lay.count() - 1)]
+        # 未确认气泡和无持久化消息没有可比较的服务端序号，保持彼此的到达顺序。
+        # 服务端时间只有秒精度，不能用它重排本地毫秒时间与同秒回复。
         rows = [widget for widget in widgets if isinstance(widget, MessageRow) and hasattr(widget, "_message_id")]
-        ordered = sorted(rows, key=lambda row: (
-            row._message_id if row._message_id > 0 else float("inf"), row._message_time,
-        ))
+        ordered = sorted(rows, key=lambda row: row._message_id if row._message_id > 0 else float("inf"))
         if rows == ordered:
             return
         for widget in widgets:
@@ -722,6 +724,7 @@ class MessagesArea(QScrollArea):
                 continue
             if isinstance(widget, MessageRow) and hasattr(widget, "_message_id"):
                 widget = next(ordered_rows)
+            if isinstance(widget, MessageRow) and hasattr(widget, "_message_time"):
                 day = datetime.fromtimestamp(widget._message_time).strftime("%Y-%m-%d")
                 if day != last_day:
                     label = datetime.fromtimestamp(widget._message_time).strftime("%B %d, %Y")
@@ -730,7 +733,32 @@ class MessagesArea(QScrollArea):
                     last_day = day
             self._lay.insertWidget(self._lay.count() - 1, widget)
         self._last_day = last_day
-        self._last_sender = ordered[-1]._sender if ordered else None
+        self._refresh_message_groups()
+
+    def _set_row_grouping(self, row: MessageRow, show_avatar: bool):
+        """同步姓名与头像，隐藏头像时仍保留左右对齐的宽度。"""
+        if isinstance(row.content, BubbleWidget) and not row._outgoing:
+            if label := row.content.findChild(QLabel, "BubbleSender"):
+                label.setVisible(show_avatar)
+        if avatar := row.avatar:
+            policy = avatar.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            avatar.setSizePolicy(policy)
+            avatar.setVisible(show_avatar)
+
+    def _refresh_message_groups(self):
+        """按最终显示顺序重算分组，系统消息和日期分隔会中断连续发送者。"""
+        last_sender = None
+        for index in range(self._lay.count() - 1):
+            widget = self._lay.itemAt(index).widget()
+            if not isinstance(widget, MessageRow):
+                last_sender = None
+                continue
+            sender = (widget.content._sender if isinstance(widget.content, BubbleWidget)
+                      else widget._sender)
+            self._set_row_grouping(widget, bool(sender) and sender != last_sender)
+            last_sender = sender or None
+        self._last_sender = last_sender
 
     def add_sys_msg(self, text: str):
         self._lay.insertWidget(self._lay.count() - 1,
@@ -746,12 +774,13 @@ class MessagesArea(QScrollArea):
             card,
             sender=sender,
             outgoing=card._outgoing,
-            show_avatar=show_avatar,
+            show_avatar=bool(sender),
             avatar_pixmap=avatar_pixmap,
             reserve_avatar=bool(sender),
         )
         if not card._outgoing and row.avatar is not None:
             self._peer_avatar_widgets.setdefault(sender, []).append(row.avatar)
+        self._set_row_grouping(row, show_avatar)
         self._lay.insertWidget(self._lay.count() - 1, row)
         if sender:
             self._last_sender = sender
@@ -1655,6 +1684,14 @@ class FilesPanel(QWidget):
         row = _FileRow(filename, from_user, room_name, size, save_path)
         self._inner_lay.insertWidget(1, row)   # newest at top, after hidden empty
 
+    def clear(self):
+        """切换服务器时移除旧会话的文件列表，保留磁盘上已经保存的文件。"""
+        while self._inner_lay.count() > 2:
+            item = self._inner_lay.takeAt(1)
+            if widget := item.widget():
+                widget.deleteLater()
+        self._empty_lbl.show()
+
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
@@ -1865,16 +1902,104 @@ class MainWindow(QMainWindow):
 
     def _connect(self):
         if self._bridge:
-            self._bridge.close()
-            self._bridge.wait(2000)
+            self._retire_bridge(self._bridge)
 
-        self._bridge = WSBridge(self._server_url, username=self._username)
-        self._bridge.set_disconnect_cleanup(lambda: self._webrtc_transfer.close_all())
-        self._bridge.received.connect(self._on_frame)
-        self._bridge.connected.connect(self._on_connected)
-        self._bridge.disconnected.connect(self._on_disconnected)
-        self._bridge.reconnecting.connect(self._on_reconnecting)
-        self._bridge.start()
+        bridge = WSBridge(self._server_url, username=self._username)
+        self._bridge = bridge
+        # 旧线程延迟退出时，只能清理它当时所属的传输实例。
+        bridge.set_disconnect_cleanup(self._webrtc_transfer.close_all)
+        for signal, callback in (
+            (bridge.received, self._on_frame),
+            (bridge.connected, self._on_connected),
+            (bridge.disconnected, self._on_disconnected),
+            (bridge.reconnecting, self._on_reconnecting),
+        ):
+            signal.connect(lambda *args, source=bridge, target=callback:
+                           self._forward_bridge_signal(source, target, *args))
+        bridge.start()
+
+    def _forward_bridge_signal(self, bridge, callback, *args):
+        """已入 Qt 队列的旧连接回调也必须核对当前桥接对象。"""
+        if self._bridge is bridge:
+            callback(*args)
+
+    def _retire_bridge(self, bridge):
+        """退出中的线程由窗口持有，避免等待超时后销毁仍运行的 QThread。"""
+        if self._bridge is bridge:
+            self._bridge = None
+        retired = self.__dict__.setdefault("_retired_bridges", set())
+        retired.add(bridge)
+        bridge.finished.connect(lambda source=bridge: self._release_retired_bridge(source))
+        bridge.close()
+        bridge.wait(2000)
+        if not bridge.isRunning():
+            self._release_retired_bridge(bridge)
+
+    def _release_retired_bridge(self, bridge):
+        retired = self.__dict__.setdefault("_retired_bridges", set())
+        if bridge not in retired:
+            return
+        retired.discard(bridge)
+        bridge.deleteLater()
+
+    def _close_retired_bridges(self):
+        """退出程序时再次通知旧连接结束，并回收已经停止的线程。"""
+        for bridge in list(self.__dict__.get("_retired_bridges", set())):
+            bridge.close()
+            bridge.wait(1500)
+            if not bridge.isRunning():
+                self._release_retired_bridge(bridge)
+
+    def _switch_server_state(self, server_url: str):
+        """保存原服务器群缓存，再恢复新服务器独立的凭证、历史与游标。"""
+        self._save_room_state()
+        self._on_typing_stop()
+        voice_call = self.__dict__.get("_voice_call")
+        if voice_call is not None and voice_call.state is not CallState.IDLE:
+            voice_call.hangup()
+        self._close_all_file_transfers("服务器已切换")
+        if self._bridge:
+            self._retire_bridge(self._bridge)
+        self._identified = False
+        self._server_generation = self.__dict__.get("_server_generation", 0) + 1
+        self._server_url = server_url
+        self._server_room_id = self._reconnect_room_id = self._pending_room_focus = ""
+        self._current_peer = ""
+        self._chat.close_room()
+        for messages in self._chat._msgs_by_room.values():
+            self._chat._msgs_stack.removeWidget(messages)
+            messages.deleteLater()
+        self._chat._msgs_by_room.clear()
+        self._chat._peer_pixmaps.clear()
+        for rid in list(self._conv._rows):
+            self._conv.remove_room(rid)
+        self._conv.set_active(None)
+        if files := self.__dict__.get("_files_panel"):
+            files.clear()
+        self._rooms.clear()
+        self._joined_room_ids.clear()
+        self._room_history.clear()
+        self._room_sync_offsets.clear()
+        # 切服不重载全局旧私聊文件，防止旧服务器的对端和游标进入新连接。
+        self._message_offsets.clear()
+        self._dm_peers.clear()
+        self._dms.clear()
+        self._pending_dms.clear()
+        self._pending_key_requests.clear()
+        self._pending_bubbles.clear()
+        self._seq_bubbles.clear()
+        self._displayed_message_ids.clear()
+        self._message_sync_requests = []
+        self._room_sync_batch = False
+        self._webrtc_supported = True
+        self._tray_msgs = []
+        identity = self._secure_sessions._identity
+        trust_store = self._secure_sessions._trust_store
+        self._secure_sessions = SecureSessionManager(identity, trust_store, self._username)
+        self._webrtc_transfer = self._new_webrtc_transfer(self._ft_manager._dir, self._ice_servers)
+        self._room_state = EncryptedRoomState(self._room_state.path.parent, identity, server_url)
+        self._restore_room_state()
+        self._update_private_voice_button()
 
     @pyqtSlot()
     def _on_connected(self):
@@ -2537,6 +2662,7 @@ class MainWindow(QMainWindow):
 
     def _run_webrtc_task(self, coro, *, raise_errors: bool = False, on_error=None):
         """将直连任务提交到持久事件循环，避免销毁 ICE/DTLS 的后台任务。"""
+        generation = self.__dict__.get("_server_generation", 0)
         loop = getattr(self._bridge, "_loop", None) if self._bridge else None
         if not isinstance(loop, asyncio.AbstractEventLoop) or not loop.is_running():
             coro.close()
@@ -2554,7 +2680,7 @@ class MainWindow(QMainWindow):
 
         def finished(result):
             if not result.cancelled() and (exc := result.exception()) is not None:
-                self._webrtc_task_failed.emit(on_error, exc)
+                self._webrtc_task_failed.emit((generation, on_error), exc)
 
         future.add_done_callback(finished)
         return future
@@ -2562,27 +2688,52 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object, object)
     def _on_webrtc_task_failed(self, callback, error):
         """回到界面线程处理异步失败，保持卡片更新与中继回退的线程安全。"""
+        if isinstance(callback, tuple) and len(callback) == 2:
+            generation, callback = callback
+            if generation != self.__dict__.get("_server_generation", 0):
+                return
         _log.error("WebRTC 任务失败：%s", error)
         if callable(callback):
             callback(error)
 
     def _new_webrtc_transfer(self, downloads: pathlib.Path,
                              ice_servers: list[dict] | None = None) -> WebRTCTransfer:
+        generation = self.__dict__.get("_server_generation", 0)
+
+        def emit_result(signal, *args):
+            # 信号可能已排队到界面线程，随元数据保留所属服务器代次。
+            signal.emit(*args[:-1], dict(args[-1], _server_generation=generation))
+
+        def send_frame(msg_type, **payload):
+            if generation != self.__dict__.get("_server_generation", 0) or not self._bridge:
+                return False
+            return self._bridge.send_frame(msg_type, **payload)
+
+        def file_key(peer, _session_id):
+            if generation != self.__dict__.get("_server_generation", 0):
+                raise RuntimeError("文件传输所属服务器已切换")
+            return self._dm_file_key(peer)[0]
+
         return WebRTCTransfer(
-            lambda msg_type, **payload: self._bridge.send_frame(msg_type, **payload)
-            if self._bridge else False,
+            send_frame,
             downloads_dir=downloads,
-            on_file_received=self._webrtc_received.emit,
-            on_file_sent=self._webrtc_sent.emit,
-            on_file_progress=self._webrtc_progress.emit,
-            on_channel_open=self._webrtc_opened.emit,
-            on_session_closed=self._webrtc_closed.emit,
-            file_key_provider=lambda peer, _session_id: self._dm_file_key(peer)[0],
+            on_file_received=lambda *args: emit_result(self._webrtc_received, *args),
+            on_file_sent=lambda *args: emit_result(self._webrtc_sent, *args),
+            on_file_progress=lambda *args: emit_result(self._webrtc_progress, *args),
+            on_channel_open=lambda *args: emit_result(self._webrtc_opened, *args),
+            on_session_closed=lambda *args: emit_result(self._webrtc_closed, *args),
+            file_key_provider=file_key,
             local_user=self._username,
             ice_servers=ice_servers,
         )
 
+    def _is_current_webrtc_result(self, meta: dict) -> bool:
+        generation = self.__dict__.get("_server_generation", 0)
+        return meta.get("_server_generation", generation) == generation
+
     def _on_webrtc_file_received(self, save_path: pathlib.Path, meta: dict):
+        if not self._is_current_webrtc_result(meta):
+            return
         filename = str(meta.get("filename", save_path.name))
         from_user = str(meta.get("from_user", "?"))
         size = int(meta.get("size", save_path.stat().st_size))
@@ -2600,6 +2751,8 @@ class MainWindow(QMainWindow):
             self._add_dm_file_card(from_user, card)
 
     def _on_webrtc_file_sent(self, source_path: pathlib.Path, meta: dict):
+        if not self._is_current_webrtc_result(meta):
+            return
         tid = str(meta.get("transfer_id", ""))
         self._webrtc_file_pending.pop(tid, None)
         filename = str(meta.get("filename", source_path.name))
@@ -2639,6 +2792,8 @@ class MainWindow(QMainWindow):
                 conv.increment_unread(dm_id)
 
     def _on_webrtc_channel_open(self, meta: dict):
+        if not self._is_current_webrtc_result(meta):
+            return
         session_id = str(meta.get("session_id", ""))
         if session_id:
             _log.info("WEBRTC channel open session=%s peer=%s filename=%s size=%s",
@@ -2647,6 +2802,8 @@ class MainWindow(QMainWindow):
             self._webrtc_file_pending.pop(session_id, None)
 
     def _on_webrtc_file_progress(self, meta: dict):
+        if not self._is_current_webrtc_result(meta):
+            return
         tid = str(meta.get("transfer_id", ""))
         if not tid:
             return
@@ -2667,6 +2824,8 @@ class MainWindow(QMainWindow):
             card.set_error(message)
 
     def _on_webrtc_session_closed(self, meta: dict):
+        if not self._is_current_webrtc_result(meta):
+            return
         session_id = str(meta.get("session_id", ""))
         if session_id:
             self._mark_webrtc_transfer_closed(session_id, str(meta.get("message", "WebRTC 传输已关闭")))
@@ -4017,7 +4176,6 @@ class MainWindow(QMainWindow):
             return
         changed_server = v["server_url"] != self._server_url
         old_username = self._username
-        self._server_url = v["server_url"]
         new_username = v["username"] or self._username
         self._theme      = v["theme"]
 
@@ -4045,6 +4203,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
 
         if changed_server:
+            self._switch_server_state(v["server_url"])
             self._connect()
         elif self._username != old_username:
             self._bridge.send_frame(T.SET_NAME, name=self._username)
@@ -4577,6 +4736,7 @@ class MainWindow(QMainWindow):
             if self._bridge:
                 self._bridge.close()
                 self._bridge.wait(1500)
+            self._close_retired_bridges()
             self._tray.hide()
             event.accept()
 
@@ -4586,4 +4746,5 @@ class MainWindow(QMainWindow):
         if self._bridge:
             self._bridge.close()
             self._bridge.wait(1500)
+        self._close_retired_bridges()
         QApplication.quit()

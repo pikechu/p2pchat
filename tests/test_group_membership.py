@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import server as server_module
 from crypto import create_room_access_metadata, encode_room_envelope, encrypt_room_message
+from file_transfer import EncryptedFileSender
 from identity import DeviceIdentity, sign_key_bundle
 from protocol import CLIENT_CAPABILITIES, CLIENT_VERSION, PROTOCOL_VERSION, T, pack, unpack
 from server import ChatServer
@@ -266,6 +267,234 @@ def test_time_cursor_includes_equal_second_messages_and_id_cursor_takes_preceden
         "after_created_at": 9999,
     }], now=1003)
     assert [message["message_id"] for message in messages] == [3, 4]
+
+
+@pytest.mark.parametrize("done_before_leave", [False, True])
+def test_receiver_leave_preserves_other_group_and_unblocks_file_completion(chat_server, tmp_path, done_before_leave):
+    """接收者退群后不再等待其回执，其他群传输继续等待正常确认。"""
+    async def run():
+        async with websockets.serve(chat_server.handle, "127.0.0.1", 0) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            alice = await _connect(port, "alice", _identity())
+            bob = await _connect(port, "bob", _identity())
+            senders = {}
+            try:
+                source = tmp_path / "正常群文件.txt"
+                source.write_bytes(b"normal file")
+                for room_id in ("ABCDEF", "GHJKMN"):
+                    metadata = await _create(alice, room_id)
+                    await _join(bob, room_id, metadata)
+                    assert (await _recv(alice))["type"] == T.USER_JOINED
+                    sender = EncryptedFileSender(
+                        source, b"S" * 32, transfer_id=room_id,
+                        scope_type="room", scope_id=room_id, sender="alice",
+                    )
+                    senders[room_id] = sender
+                    await alice.send(pack(
+                        T.FILE_ROOM_SHARE, room_id=room_id, transfer_id=room_id,
+                        **sender.offer_payload(),
+                    ))
+                    assert (await _recv(bob))["type"] == T.FILE_ROOM_SHARE
+                    chunk = sender.next_payload()
+                    await alice.send(pack(
+                        T.FILE_ROOM_CHUNK, transfer_id=room_id, index=chunk["index"],
+                        total=chunk["total"], encrypted_chunk=chunk["encrypted_chunk"],
+                    ))
+                    assert (await _recv(alice))["type"] == T.FILE_ROOM_CHUNK_ACK
+                    assert (await _recv(bob))["type"] == T.FILE_ROOM_CHUNK
+                    if room_id == "GHJKMN" or done_before_leave:
+                        await alice.send(pack(T.FILE_ROOM_DONE, transfer_id=room_id, **sender.done_payload()))
+                        assert (await _recv(bob))["type"] == T.FILE_ROOM_DONE
+
+                await bob.send(pack(T.LEAVE_ROOM, room_id="ABCDEF"))
+                assert (await _recv(bob))["payload"]["room_id"] == "ABCDEF"
+                assert (await _recv(alice))["type"] == T.USER_LEFT
+                assert chat_server._user_rooms["bob"] == {"GHJKMN"}
+                assert "bob" in chat_server._rooms["GHJKMN"].members
+                assert chat_server._transfer_meta["GHJKMN"]["pending_receivers"] == {"bob"}
+                if not done_before_leave:
+                    assert not chat_server._transfer_meta["ABCDEF"]["pending_receivers"]
+                    await alice.send(pack(
+                        T.FILE_ROOM_DONE, transfer_id="ABCDEF", **senders["ABCDEF"].done_payload(),
+                    ))
+                completion = await _recv(alice)
+                assert completion["type"] == T.FILE_ROOM_DONE_ACK
+                assert completion["payload"]["transfer_id"] == "ABCDEF"
+                assert "ABCDEF" not in chat_server._transfer_meta
+                await bob.send(pack(T.FILE_ROOM_RECEIVED, transfer_id="GHJKMN"))
+                completion = await _recv(alice)
+                assert completion["type"] == T.FILE_ROOM_DONE_ACK
+                assert completion["payload"]["transfer_id"] == "GHJKMN"
+            finally:
+                for sender in senders.values():
+                    sender.close()
+                await bob.close()
+                await alice.close()
+
+    asyncio.run(run())
+
+
+def test_rename_to_offline_member_name_preserves_both_identities(chat_server):
+    """正常改名遇到同群离线成员名称时拒绝覆盖，双方原成员关系均可恢复。"""
+    async def run():
+        async with websockets.serve(chat_server.handle, "127.0.0.1", 0) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            bob_identity = _identity()
+            alice = await _connect(port, "alice", _identity())
+            bob = await _connect(port, "bob", bob_identity)
+            try:
+                metadata = await _create(alice, "ABCDEF")
+                await _join(bob, "ABCDEF", metadata)
+                assert (await _recv(alice))["type"] == T.USER_JOINED
+                other_metadata = await _create(alice, "GHJKMN")
+                await bob.close()
+                assert (await _recv(alice))["type"] == T.USER_LEFT
+                saved_rooms = server_module._ROOMS_FILE.read_bytes()
+                saved_members = dict(chat_server._rooms["ABCDEF"].member_identities)
+                await alice.send(pack(T.SET_NAME, name="bob"))
+                rejected = await _recv(alice)
+                assert rejected["type"] == T.ERROR
+                assert rejected["payload"]["code"] == "USERNAME_IDENTITY_MISMATCH"
+                assert rejected["payload"]["recoverable"] is True
+                assert chat_server._rooms["ABCDEF"].member_identities == saved_members
+                assert server_module._ROOMS_FILE.read_bytes() == saved_rooms
+                assert set(chat_server._name_to_ws) == {"alice"}
+                assert chat_server._user_rooms["alice"] == {"ABCDEF", "GHJKMN"}
+                assert chat_server._rooms["ABCDEF"].creator == "alice"
+                await _send(alice, "GHJKMN", other_metadata, "拒绝后连接仍可用")
+                bob = await _connect(port, "bob", bob_identity)
+                assert (await _recv(alice))["type"] == T.USER_JOINED
+                assert "bob" in chat_server._rooms["ABCDEF"].members
+                await alice.send(pack(T.SET_NAME, name="alice-renamed"))
+                assert (await _recv(bob))["type"] == T.USER_LEFT
+                assert (await _recv(bob))["type"] == T.USER_JOINED
+                assert (await _recv(alice))["payload"]["name"] == "alice-renamed"
+                restored = ChatServer(message_db_path=chat_server._message_db_path)
+                assert restored._user_rooms["bob"] == {"ABCDEF"}
+                assert restored._user_rooms["alice-renamed"] == {"ABCDEF", "GHJKMN"}
+                assert restored._rooms["ABCDEF"].member_identities["bob"] == saved_members["bob"]
+            finally:
+                await bob.close()
+                await alice.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("room_operation", ["create", "delete"])
+def test_rename_completes_during_other_users_room_changes(chat_server, monkeypatch, room_operation):
+    """改名通知等待网络发送时，其他用户正常建群或删群不会打断成员迁移。"""
+    async def run():
+        async with websockets.serve(chat_server.handle, "127.0.0.1", 0) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            alice = await _connect(port, "alice", _identity())
+            bob = await _connect(port, "bob", _identity())
+            charlie = await _connect(port, "charlie", _identity())
+            notification_started = asyncio.Event()
+            finish_notification = asyncio.Event()
+            original_broadcast = chat_server._broadcast
+
+            async def wait_during_rename_notification(room, msg_type, **payload):
+                await original_broadcast(room, msg_type, **payload)
+                if msg_type == T.USER_LEFT and payload.get("username") == "alice" \
+                        and not notification_started.is_set():
+                    notification_started.set()
+                    await finish_notification.wait()
+
+            try:
+                metadata = await _create(alice, "ABCDEF")
+                await _join(bob, "ABCDEF", metadata)
+                assert (await _recv(alice))["type"] == T.USER_JOINED
+                await _create(alice, "GHJKMN")
+                await _create(charlie, "PQRSTU")
+                monkeypatch.setattr(chat_server, "_broadcast", wait_during_rename_notification)
+                await alice.send(pack(T.SET_NAME, name="alice-renamed"))
+                await asyncio.wait_for(notification_started.wait(), timeout=3)
+                assert (await _recv(bob))["type"] == T.USER_LEFT
+                if room_operation == "create":
+                    await _create(charlie, "VWXYZ2")
+                else:
+                    await charlie.send(pack(T.DELETE_ROOM, room_id="PQRSTU"))
+                    assert (await _recv(charlie))["type"] == T.ROOM_LEFT
+                    for member in (charlie, alice, bob):
+                        assert (await _recv(member))["type"] == T.ROOM_DELETED
+                finish_notification.set()
+                assert (await _recv(bob))["type"] == T.USER_JOINED
+                renamed = await _recv(alice)
+                assert renamed["type"] == T.READY
+                assert renamed["payload"]["name"] == "alice-renamed"
+                assert chat_server._user_rooms["alice-renamed"] == {"ABCDEF", "GHJKMN"}
+                for room_id in ("ABCDEF", "GHJKMN"):
+                    room = chat_server._rooms[room_id]
+                    assert room.creator == "alice-renamed"
+                    assert "alice-renamed" in room.members
+                    assert "alice" not in room.member_identities
+                await alice.send(pack(T.LIST_ROOMS))
+                assert (await _recv(alice))["type"] == T.ROOM_LIST
+                restored = ChatServer(message_db_path=chat_server._message_db_path)
+                assert restored._user_rooms["alice-renamed"] == {"ABCDEF", "GHJKMN"}
+                assert restored._user_rooms.get("charlie", set()) == (
+                    {"PQRSTU", "VWXYZ2"} if room_operation == "create" else set()
+                )
+            finally:
+                finish_notification.set()
+                await charlie.close()
+                await bob.close()
+                await alice.close()
+
+    asyncio.run(run())
+
+
+def test_leave_completes_when_creator_deletes_same_group(chat_server, monkeypatch):
+    """退群广播等待期间创建者删群，退群者仍保持连接与其他群成员关系。"""
+    async def run():
+        async with websockets.serve(chat_server.handle, "127.0.0.1", 0) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            alice = await _connect(port, "alice", _identity())
+            bob = await _connect(port, "bob", _identity())
+            notification_started = asyncio.Event()
+            finish_notification = asyncio.Event()
+            original_broadcast = chat_server._broadcast
+
+            async def wait_during_leave_notification(room, msg_type, **payload):
+                await original_broadcast(room, msg_type, **payload)
+                if msg_type == T.USER_LEFT and payload.get("username") == "bob" \
+                        and not notification_started.is_set():
+                    notification_started.set()
+                    await finish_notification.wait()
+
+            try:
+                metadata = {}
+                for room_id in ("ABCDEF", "GHJKMN"):
+                    metadata[room_id] = await _create(alice, room_id)
+                    await _join(bob, room_id, metadata[room_id])
+                    assert (await _recv(alice))["type"] == T.USER_JOINED
+                monkeypatch.setattr(chat_server, "_broadcast", wait_during_leave_notification)
+                await bob.send(pack(T.LEAVE_ROOM, room_id="ABCDEF"))
+                await asyncio.wait_for(notification_started.wait(), timeout=3)
+                assert (await _recv(alice))["type"] == T.USER_LEFT
+                await alice.send(pack(T.DELETE_ROOM, room_id="ABCDEF"))
+                assert (await _recv(alice))["type"] == T.ROOM_LEFT
+                for member in (alice, bob):
+                    assert (await _recv(member))["type"] == T.ROOM_DELETED
+                finish_notification.set()
+                left = await _recv(bob)
+                assert left["type"] == T.ROOM_LEFT
+                assert left["payload"]["room_id"] == "ABCDEF"
+                assert chat_server._user_rooms["bob"] == {"GHJKMN"}
+                assert "bob" in chat_server._rooms["GHJKMN"].members
+                await bob.send(pack(T.LIST_ROOMS))
+                assert (await _recv(bob))["type"] == T.ROOM_LIST
+                await _send(bob, "GHJKMN", metadata["GHJKMN"], "删群后连接仍可发送")
+                assert (await _recv(alice))["type"] == T.NEW_ENCRYPTED_MSG
+                restored = ChatServer(message_db_path=chat_server._message_db_path)
+                assert "ABCDEF" not in restored._rooms
+                assert restored._user_rooms["bob"] == {"GHJKMN"}
+            finally:
+                finish_notification.set()
+                await bob.close()
+                await alice.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("legacy_creator", [False, True])

@@ -1035,7 +1035,10 @@ class ChatServer:
                              message="尚未加入指定群")
             return
         await self._disconnect_room(username, room_id)
-        self._rooms[room_id].member_identities.pop(username, None)
+        # 广播等待期间创建者可能已删群，仍需完成当前连接的退群清理与确认。
+        room = self._rooms.get(room_id)
+        if room is not None:
+            room.member_identities.pop(username, None)
         room_ids = self._user_rooms.get(username, set())
         room_ids.discard(room_id)
         if not room_ids:
@@ -1045,10 +1048,37 @@ class ChatServer:
             if room_ids:
                 self._user_room[username] = sorted(room_ids)[-1]
         for transfer_id, meta in list(self._transfer_meta.items()):
-            if meta["room_id"] == room_id and meta["from_user"] == username:
+            if meta["room_id"] != room_id:
+                continue
+            if meta["from_user"] == username:
                 await self._fail_room_transfer(ws, transfer_id, "发送者已退出群聊")
+                continue
+            pending = meta.get("pending_receivers")
+            if pending and username in pending:
+                pending.discard(username)
+                meta["last_seen"] = time.time()
+                if meta.get("done_sent") and not pending:
+                    sender_ws = self._name_to_ws.get(meta["from_user"])
+                    self._transfer_meta.pop(transfer_id, None)
+                    if sender_ws is not None:
+                        await self._send(sender_ws, T.FILE_ROOM_DONE_ACK,
+                                         transfer_id=transfer_id)
         self._save_rooms()
         await self._send(ws, T.ROOM_LEFT, room_id=room_id)
+
+    def _rename_target_conflicts(self, old_name: str, new_name: str, ws) -> bool:
+        """改名前检查目标名称，避免覆盖同群离线成员保存的其他设备身份。"""
+        key_bundle = self._public_key_directory.get(old_name)
+        for room in self._rooms.values():
+            member_identity = room.member_identities.get(old_name, "")
+            owns_member = self._same_identity({"identity_public": member_identity}, key_bundle) or (
+                not member_identity and room.members.get(old_name) is ws
+            )
+            if owns_member and new_name in room.member_identities and not self._same_identity(
+                {"identity_public": room.member_identities[new_name]}, key_bundle
+            ):
+                return True
+        return False
 
     async def _rename_ready_user(self, old_name: str, new_name: str, ws) -> None:
         """同步已就绪连接改名后依赖用户名索引的内存状态。"""
@@ -1068,8 +1098,9 @@ class ChatServer:
         room_ids = self._joined_rooms(old_name)
         active_room = self._user_room.pop(old_name, None)
         migrated_rooms = set()
+        renamed_online_rooms = []
         changed = False
-        for room_id, room in self._rooms.items():
+        for room_id, room in list(self._rooms.items()):
             was_member = room.members.get(old_name) is ws
             member_identity = room.member_identities.get(old_name, "")
             owns_member = self._same_identity({"identity_public": member_identity}, key_bundle) or (
@@ -1088,10 +1119,7 @@ class ChatServer:
                 if was_member:
                     room.members.pop(old_name, None)
                     room.members[new_name] = ws
-                    await self._broadcast(room, T.USER_LEFT, exclude=new_name,
-                                          username=old_name, room_id=room_id)
-                    await self._broadcast(room, T.USER_JOINED, exclude=new_name,
-                                          username=new_name, room_id=room_id)
+                    renamed_online_rooms.append(room)
             if owns_creator:
                 room.creator = new_name
                 if not room.creator_identity:
@@ -1127,6 +1155,16 @@ class ChatServer:
                 meta["from_user"] = new_name
             if meta.get("to_user") == old_name:
                 meta["to_user"] = new_name
+
+        # 所有索引与持久成员关系迁移完成后再发送通知，避免网络等待期间被并发群操作打断。
+        for room in renamed_online_rooms:
+            if self._rooms.get(room.id) is not room:
+                continue
+            await self._broadcast(room, T.USER_LEFT, exclude=new_name,
+                                  username=old_name, room_id=room.id)
+            if self._rooms.get(room.id) is room:
+                await self._broadcast(room, T.USER_JOINED, exclude=new_name,
+                                      username=new_name, room_id=room.id)
 
     @staticmethod
     def _valid_key_bundle_format(bundle) -> bool:
@@ -1230,7 +1268,7 @@ class ChatServer:
                     if state != "HELLO" or client_protocol != PROTOCOL_VERSION or not isinstance(capabilities, list) \
                             or not _REQUIRED_CAPABILITIES.issubset(capabilities) \
                             or not self._valid_key_bundle_format(payload.get("key_bundle")):
-                        await self._handshake_error(ws, "PROTOCOL_INCOMPATIBLE", "客户端协议版本、能力或密钥包不兼容")
+                        await self._handshake_error(ws, "PROTOCOL_INCOMPATIBLE", "客户端协议版本、能力或密钥包不兼容，请升级到最新版")
                         await ws.close()
                         break
                     key_bundle = dict(payload["key_bundle"])
@@ -1252,6 +1290,14 @@ class ChatServer:
                     name = str(payload.get("name", "")).strip()[:32]
                     if not name:
                         await self._send(ws, T.ERROR, message="Name is empty")
+                        continue
+                    if username and username != name and self._rename_target_conflicts(username, name, ws):
+                        await self._handshake_error(
+                            ws,
+                            "USERNAME_IDENTITY_MISMATCH",
+                            "该用户名已绑定到同群另一设备身份，请使用其他用户名",
+                            recoverable=True,
+                        )
                         continue
                     if name in self._name_to_ws and self._name_to_ws[name] is not ws:
                         old_ws = self._name_to_ws[name]

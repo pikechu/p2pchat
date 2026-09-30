@@ -67,8 +67,7 @@ def retained_room_messages(messages: list[dict], ttl_seconds: int, now: float | 
         if isinstance(message, dict)
         and (ttl_seconds == TTL_VALUES["permanent"] or float(message.get("ts", 0)) + ttl_seconds > now)
     ]
-    retained.sort(key=lambda message: (
-        int(message.get("message_id", 0)) if int(message.get("message_id", 0)) > 0 else float("inf"),
-        float(message.get("ts", 0)),
-    ))
+    # 无编号消息保持插入顺序，避免服务端整数秒时间超前于本地浮点时间。
+    retained.sort(key=lambda message:
+                  int(message.get("message_id", 0)) if int(message.get("message_id", 0)) > 0 else float("inf"))
     return retained[-MAX_CACHED_ROOM_MESSAGES:]

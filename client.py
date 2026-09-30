@@ -110,6 +110,7 @@ class ChatClient:
         self._url             = server_url
         self._ws              = None
         self._username: Optional[str]  = None
+        self._pending_username: Optional[str] = None
         self._room_id: Optional[str]   = None
         self._room_name: Optional[str] = None
         self._crypto_key: Optional[bytes] = None
@@ -429,6 +430,11 @@ class ChatClient:
                     await self._send(T.SET_NAME, name=self._username)
 
             elif mtype == T.READY:
+                confirmed_name = str(payload.get("name") or self._username or "")
+                if confirmed_name:
+                    self._username = confirmed_name
+                    self._secure_sessions.set_own_name(confirmed_name)
+                self._pending_username = None
                 self._ready = True
                 _sys("连接已就绪")
                 self._pending_sync_requests.clear()
@@ -455,6 +461,8 @@ class ChatClient:
                 _sys(payload.get("message", ""))
 
             elif mtype == T.ERROR:
+                if payload.get("code") == "USERNAME_IDENTITY_MISMATCH":
+                    self._pending_username = None
                 server_msg = payload.get("message", "")
                 rid = payload.get("room_id", "")
                 if rid:
@@ -712,13 +720,19 @@ class ChatClient:
                 if not args:
                     _err("Usage: /name <username>")
                     return
-                self._username = args[0]
-                self._secure_sessions = SecureSessionManager(
-                    self._identity, TrustStore(Path.home() / ".beamchat" / "trust.json"), self._username
-                )
-                log.info("SET_NAME  name=%s", self._username)
+                if self._pending_username is not None:
+                    _err("用户名变更正在确认，请稍后重试")
+                    return
+                requested_name = args[0]
+                if self._ready:
+                    # 已连接的改名等待服务端确认，拒绝时继续使用原名称与会话。
+                    self._pending_username = requested_name
+                else:
+                    self._username = requested_name
+                    self._secure_sessions.set_own_name(requested_name)
+                log.info("SET_NAME  name=%s", requested_name)
                 if self._server_hello:
-                    await self._send(T.SET_NAME, name=self._username)
+                    await self._send(T.SET_NAME, name=requested_name)
                 else:
                     _info("正在等待服务器握手完成")
 

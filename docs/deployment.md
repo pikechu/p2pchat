@@ -19,6 +19,8 @@
 
 `server.py`、`deploy.py` 和 `start.py` 提供普通 WS 后端；将 URL 的 `ws://` 改写为 `wss://` 不会为该端口启用 TLS。Nginx 使用有效域名证书提供公网 WSS，客户端通过正常证书校验后连接。
 
+从 `v1.2.2` 起，握手要求客户端声明 `persistent_room_membership`，避免旧单群客户端错误处理后台群消息和同步游标。协议版本仍为 `5`，`v1.2.1` 客户端已支持该能力；不支持的旧客户端会收到明确升级提示，应安装最新发布的 EXE。
+
 ## Nginx 反代
 
 在现有 MedGuide HTTPS `server` 块中增加独立的 BeamChat 路由，保留原根路径代理：

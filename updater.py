@@ -146,7 +146,11 @@ class UpdateDownloader(QThread):
             self.finished.emit(str(tmp))
         except Exception as exc:
             if tmp is not None:
-                tmp.unlink(missing_ok=True)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    # 临时文件被占用时仍须报告原始下载错误，恢复界面操作。
+                    pass
             self.failed.emit(str(exc))
 
 

@@ -62,3 +62,34 @@ def test_update_downloader_removes_tampered_payload(tmp_path, monkeypatch):
 
     assert "SHA-256" in failed[0]
     assert not (tmp_path / "_BeamChat_update.exe").exists()
+
+
+def test_interrupted_download_still_reports_failure_when_temporary_file_is_busy(tmp_path, monkeypatch):
+    payload = b"partial download"
+    checksum = hashlib.sha256(payload).hexdigest().encode("ascii")
+    response = _Response(payload)
+    response.headers["Content-Length"] = str(len(payload) + 10)
+    responses = iter([_Response(checksum), response])
+    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "BeamChat.exe"))
+    temporary = tmp_path / "_BeamChat_update.exe"
+    original_unlink = pathlib.Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == temporary:
+            raise PermissionError("文件正在使用")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+    finished = []
+    failed = []
+    downloader = updater.UpdateDownloader(
+        "https://example.test/BeamChat.exe",
+        checksum_url="https://example.test/BeamChat.exe.sha256",
+    )
+    downloader.finished.connect(finished.append)
+    downloader.failed.connect(failed.append)
+    downloader.run()
+
+    assert finished == []
+    assert failed == ["更新包下载不完整"]

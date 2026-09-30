@@ -68,6 +68,55 @@ async def _join(client, room_id, password):
     return metadata
 
 
+def test_rejected_rename_keeps_confirmed_name_and_session(terminal):
+    client, _shown, errors = terminal
+    client._server_hello = True
+    client._secure_sessions.set_own_name("alice")
+    sessions = client._secure_sessions
+
+    async def run():
+        await client._handle_line("/name bob")
+        assert client._ws.sent[-1]["payload"] == {"name": "bob"}
+        assert client._username == "alice"
+        assert client._secure_sessions is sessions
+        assert sessions._own_name == "alice"
+        client._ws.push(T.ERROR, code="USERNAME_IDENTITY_MISMATCH", recoverable=True,
+                        message="该用户名已绑定到同群另一设备身份")
+        await client._recv_loop()
+        assert client._username == "alice"
+        assert client._pending_username is None
+        assert client._ready
+        assert client._secure_sessions is sessions
+        assert sessions._own_name == "alice"
+        await client._handle_line("/name carol")
+        assert client._ws.sent[-1]["payload"] == {"name": "carol"}
+        assert errors == ["该用户名已绑定到同群另一设备身份"]
+
+    asyncio.run(run())
+
+
+def test_rename_commits_only_after_ready_and_prevents_overlapping_requests(terminal):
+    client, _shown, errors = terminal
+    client._server_hello = True
+    client._secure_sessions.set_own_name("alice")
+    sessions = client._secure_sessions
+
+    async def run():
+        await client._handle_line("/name bob")
+        await client._handle_line("/name carol")
+        assert len(client._ws.sent) == 1
+        assert client._username == "alice"
+        client._ws.push(T.READY, name="bob")
+        await client._recv_loop()
+        assert client._username == "bob"
+        assert client._pending_username is None
+        assert client._secure_sessions is sessions
+        assert sessions._own_name == "bob"
+        assert errors == ["用户名变更正在确认，请稍后重试"]
+
+    asyncio.run(run())
+
+
 def _message(room_id, password, metadata, message_id, text, *, sender="bob", client_msg_id=None):
     client_msg_id = client_msg_id or f"{room_id}-{message_id}"
     ciphertext = encode_room_envelope(encrypt_room_message(
