@@ -31,7 +31,7 @@ python "$(git rev-parse --show-toplevel)/build.py"
 """
 
 DEFAULT_CLIENT_CONFIG = {
-    "server_url": "wss://106.55.8.122:8765",
+    "server_url": "wss://medguide.lemon-travelhokkaido.com/beamchat/",
     "anonymous_mode": True,
     "allow_custom_server": True,
     "enable_room_password": True,

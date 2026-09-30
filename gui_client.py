@@ -38,7 +38,7 @@ def load_client_config() -> dict:
 
 def load_default_server_url() -> str:
     config = load_client_config()
-    return validate_server_url(config.get("server_url") or "wss://106.55.8.122:8765")
+    return validate_server_url(config.get("server_url") or "wss://medguide.lemon-travelhokkaido.com/beamchat/")
 
 # Windows: force UTF-8 so chat messages with any charset render correctly
 # sys.stdout/stderr are None in --windowed (no console) packaged builds
