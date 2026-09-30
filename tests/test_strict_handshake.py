@@ -108,6 +108,26 @@ def test_required_security_capabilities_are_enough_for_hello(event_loop):
     event_loop.run_until_complete(_with_server(test))
 
 
+def test_single_group_client_gets_clear_upgrade_error(event_loop):
+    """旧客户端缺少多群状态能力时应提示升级，避免接受其不支持的后台群消息。"""
+    async def test(port):
+        ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
+        payload = _hello_payload(capabilities=[
+            capability for capability in CLIENT_CAPABILITIES
+            if capability != "persistent_room_membership"
+        ])
+        payload["client_version"] = "1.2.0"
+        await ws.send(pack(T.CLIENT_HELLO, **payload))
+        frame = unpack(await ws.recv())
+        assert frame["type"] == T.ERROR
+        assert frame["payload"]["code"] == "PROTOCOL_INCOMPATIBLE"
+        assert frame["payload"]["recoverable"] is False
+        assert "升级" in frame["payload"]["message"]
+        await ws.close()
+
+    event_loop.run_until_complete(_with_server(test))
+
+
 def test_peer_key_directory_removes_disconnected_user(event_loop):
     async def test(port):
         alice = await _ready(port, "alice")

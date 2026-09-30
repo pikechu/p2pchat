@@ -46,9 +46,9 @@ def event_loop():
     loop.close()
 
 
-async def _connect_raw(port):
+async def _connect_raw(port, identity=None):
     ws = await ws_connect.connect(f"ws://127.0.0.1:{port}")
-    identity = DeviceIdentity(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
+    identity = identity or DeviceIdentity(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
     ephemeral = X25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     await ws.send(pack(T.CLIENT_HELLO,
                        client_version=CLIENT_VERSION,
@@ -63,12 +63,13 @@ async def _connect_raw(port):
 
 def test_same_name_reconnect_takes_over_old_socket(server_port, event_loop):
     async def run():
-        ws1 = await _connect_raw(server_port)
+        identity = DeviceIdentity(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
+        ws1 = await _connect_raw(server_port, identity)
         await ws1.send(pack(T.SET_NAME, name="pp"))
         first = unpack(await asyncio.wait_for(ws1.recv(), timeout=3))
         assert first["type"] == T.READY
 
-        ws2 = await _connect_raw(server_port)
+        ws2 = await _connect_raw(server_port, identity)
         await ws2.send(pack(T.SET_NAME, name="pp"))
         second = unpack(await asyncio.wait_for(ws2.recv(), timeout=3))
         assert second["type"] == T.READY
@@ -80,6 +81,26 @@ def test_same_name_reconnect_takes_over_old_socket(server_port, event_loop):
         listed = unpack(await asyncio.wait_for(ws2.recv(), timeout=3))
         assert listed["type"] == T.ROOM_LIST
 
+        await ws2.close()
+
+    event_loop.run_until_complete(run())
+
+
+def test_different_identity_cannot_take_over_online_username(server_port, event_loop):
+    async def run():
+        ws1 = await _connect_raw(server_port)
+        await ws1.send(pack(T.SET_NAME, name="identity_bound_user"))
+        assert unpack(await asyncio.wait_for(ws1.recv(), timeout=3))["type"] == T.READY
+
+        ws2 = await _connect_raw(server_port)
+        await ws2.send(pack(T.SET_NAME, name="identity_bound_user"))
+        rejected = unpack(await asyncio.wait_for(ws2.recv(), timeout=3))
+        assert rejected["type"] == T.ERROR
+        assert rejected["payload"]["code"] == "USERNAME_IDENTITY_MISMATCH"
+
+        await ws1.send(pack(T.LIST_ROOMS))
+        assert unpack(await asyncio.wait_for(ws1.recv(), timeout=3))["type"] == T.ROOM_LIST
+        await ws1.close()
         await ws2.close()
 
     event_loop.run_until_complete(run())

@@ -13,6 +13,7 @@ from build import (
     write_client_build_config,
 )
 from gui_client import load_default_server_url
+from transport_security import validate_server_url
 
 
 def test_build_config_accepts_server_url(tmp_path):
@@ -25,6 +26,16 @@ def test_build_config_accepts_server_url(tmp_path):
     config = load_build_config(config_path)
 
     assert config["server_url"] == "wss://example.com:8765"
+
+
+def test_public_ws_is_rejected_but_local_development_ws_is_allowed():
+    assert validate_server_url("ws://127.0.0.1:8765") == "ws://127.0.0.1:8765"
+    try:
+        validate_server_url("ws://example.com:8765")
+    except ValueError as exc:
+        assert "wss://" in str(exc)
+    else:
+        raise AssertionError("公网 ws:// 不应通过校验")
 
 
 def test_gui_client_reads_packaged_default_server_url(tmp_path, monkeypatch):

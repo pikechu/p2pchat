@@ -300,3 +300,29 @@ def test_bridge_reports_connected_state(app, server_port):
     assert bridge.is_connected() is True
     bridge.close()
     bridge.wait(2000)
+
+
+def test_bridge_waits_for_transfer_cleanup_and_can_close_again(app, server_port):
+    """退出应等待所属循环释放传输资源，线程结束后重复关闭仍安全。"""
+    bridge = WSBridge(f"ws://127.0.0.1:{server_port}", username="cleanup_br")
+    cleaned = threading.Event()
+    cleanup_threads = []
+
+    async def cleanup():
+        await asyncio.sleep(0.01)
+        cleanup_threads.append(threading.get_ident())
+        cleaned.set()
+
+    bridge.set_disconnect_cleanup(cleanup)
+    bridge.start()
+    try:
+        _wait_for_signal(bridge.connected, timeout_ms=3000)
+        assert bridge.is_connected()
+    finally:
+        bridge.close()
+        assert bridge.wait(3000)
+
+    assert cleaned.is_set()
+    assert all(thread != threading.get_ident() for thread in cleanup_threads)
+    assert bridge._loop.is_closed()
+    bridge.close()

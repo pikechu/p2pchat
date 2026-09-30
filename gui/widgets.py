@@ -100,6 +100,10 @@ class StatusDot(QWidget):
         self._state = state
         self.update()
 
+    def set_theme(self, theme: str):
+        self._theme = theme
+        self.update()
+
     def paintEvent(self, _):
         key = f"{'dark_' if self._theme == 'dark' else ''}{self._state}"
         color = QColor(self._COLORS.get(key, self._COLORS["offline"]))
@@ -161,7 +165,7 @@ class BubbleWidget(QFrame):
         self.setMaximumWidth(720)  # tightened to natural width by _update_max_width()
 
         vlay = QVBoxLayout(self)
-        vlay.setContentsMargins(0, 0, 0, 0)
+        vlay.setContentsMargins(12, 8, 12, 8)
         vlay.setSpacing(2)
 
         # Sender name (incoming group messages)
@@ -270,6 +274,12 @@ class BubbleWidget(QFrame):
         self._tick.style().unpolish(self._tick)
         self._tick.style().polish(self._tick)
 
+    def set_theme(self, theme: str):
+        self._theme = theme
+        if hasattr(self, "_tick") and self._tick.objectName() == "TickRead":
+            self._tick.setStyleSheet(f"color: {TOKENS[theme]['accent']};")
+        self.update()
+
     def hasHeightForWidth(self) -> bool:
         return True
 
@@ -300,6 +310,74 @@ class BubbleWidget(QFrame):
             QApplication.clipboard().setText(self._text)
         elif chosen == reply_act:
             self.reply_requested.emit(self._sender, self._text, self._seq)
+
+
+# ── Unified message row ───────────────────────────────────────────────────────
+
+class MessageRow(QWidget):
+    """统一承载文本、图片、视频和文件内容，并负责头像与方向对齐。"""
+
+    AVATAR_SIZE = 32
+
+    def __init__(self, content: QWidget, sender: str = "",
+                 outgoing: bool = False, show_avatar: bool = True,
+                 avatar_pixmap: QPixmap | None = None,
+                 reserve_avatar: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MessageRow")
+        self._content = content
+        self._sender = sender
+        self._outgoing = outgoing
+        self._avatar: Avatar | None = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(6)
+
+        avatar = self._make_avatar(show_avatar, avatar_pixmap, reserve_avatar)
+        if outgoing:
+            lay.addStretch(1)
+            lay.addWidget(content)
+            if avatar is not None:
+                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+        else:
+            if avatar is not None:
+                lay.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+            lay.addWidget(content)
+            lay.addStretch(1)
+
+    def _make_avatar(self, show_avatar: bool, pixmap: QPixmap | None,
+                     reserve_avatar: bool) -> QWidget | None:
+        if show_avatar and self._sender:
+            self._avatar = Avatar(self._sender, self.AVATAR_SIZE)
+            if pixmap:
+                self._avatar.set_pixmap(pixmap)
+            return self._avatar
+        if reserve_avatar:
+            placeholder = QWidget()
+            placeholder.setFixedWidth(self.AVATAR_SIZE)
+            return placeholder
+        return None
+
+    @property
+    def content(self) -> QWidget:
+        return self._content
+
+    @property
+    def avatar(self) -> Avatar | None:
+        return self._avatar
+
+    def replace_content(self, content: QWidget) -> None:
+        """原位替换消息内容，同时保留头像、方向和行间距。"""
+        lay = self.layout()
+        index = lay.indexOf(self._content)
+        if index < 0:
+            return
+        old_content = self._content
+        lay.removeWidget(old_content)
+        old_content.setParent(None)
+        lay.insertWidget(index, content)
+        self._content = content
 
 
 # ── Typing indicator ──────────────────────────────────────────────────────────
@@ -514,10 +592,27 @@ class ConvRowWidget(QWidget):
 
 import os as _os
 
+
+class ElidedLabel(QLabel):
+    """保留完整 tooltip，并按可用宽度省略过长文件名。"""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+
+    def resizeEvent(self, event):
+        self.setText(self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, max(0, self.width())
+        ))
+        super().resizeEvent(event)
+
 class FileCard(QFrame):
-    """Shows a file transfer in progress or completed, inside a bubble row."""
+    """显示文件传输进度、失败原因和重试入口。"""
 
     cancel_requested = pyqtSignal(str)   # transfer_id
+    retry_requested = pyqtSignal(str)
 
     def __init__(self, transfer_id: str, filename: str, size: int,
                  outgoing: bool = False, thumbnail_data: bytes | None = None,
@@ -530,7 +625,9 @@ class FileCard(QFrame):
         self._theme     = theme
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
@@ -558,7 +655,7 @@ class FileCard(QFrame):
 
         info = QVBoxLayout()
         info.setSpacing(0)
-        self._name_lbl = QLabel(filename)
+        self._name_lbl = ElidedLabel(filename)
         self._name_lbl.setObjectName("FileCardName")
         self._size_lbl = QLabel(_fmt_size(size))
         self._size_lbl.setObjectName("FileCardSize")
@@ -572,6 +669,11 @@ class FileCard(QFrame):
         self._cancel_btn.setFixedSize(22, 22)
         self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._tid))
         name_row.addWidget(self._cancel_btn)
+        self._retry_btn = QPushButton("重试")
+        self._retry_btn.setObjectName("BtnGhost")
+        self._retry_btn.clicked.connect(lambda: self.retry_requested.emit(self._tid))
+        self._retry_btn.hide()
+        name_row.addWidget(self._retry_btn)
         lay.addLayout(name_row)
 
         # Progress bar
@@ -585,40 +687,61 @@ class FileCard(QFrame):
         lay.addWidget(self._progress)
 
         # Status label
-        self._status_lbl = QLabel("Waiting…" if not outgoing else "Sending…")
+        self._status_lbl = QLabel("等待接收…" if not outgoing else "发送中…")
         self._status_lbl.setObjectName("FileCardStatus")
         lay.addWidget(self._status_lbl)
 
     def set_progress(self, pct: int):
         self._progress.setValue(pct)
         self._status_lbl.setText(
-            f"{'Sending' if self._outgoing else 'Receiving'} {pct}%"
+            f"{'发送中' if self._outgoing else '接收中'} {pct}%"
         )
 
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
         self._progress.setValue(100)
         self._cancel_btn.hide()
+        self._retry_btn.hide()
+        self._status_lbl.setObjectName("FileCardStatus")
         if save_path:
             self._status_lbl.setText(f"已保存 → 点击打开")
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
-            self._status_lbl.setText("Sent ✓")
+            self._status_lbl.setText("已发送 ✓")
 
     def mousePressEvent(self, event):
-        if self._save_path and _os.path.exists(self._save_path):
-            from PyQt6.QtGui import QDesktopServices
-            from PyQt6.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
+        if event.button() == Qt.MouseButton.LeftButton and self._save_path:
+            _open_card_file(self)
         super().mousePressEvent(event)
 
     def set_error(self, message: str):
         self._progress.hide()
         self._cancel_btn.hide()
-        self._status_lbl.setText(f"Failed: {message}")
+        self._save_path = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._retry_btn.setVisible(self._outgoing)
+        hint = "" if self._outgoing else "；请让发送方重新发送"
+        self._status_lbl.setText(f"失败：{message}{hint}")
         self._status_lbl.setObjectName("FileCardError")
         self._status_lbl.style().unpolish(self._status_lbl)
         self._status_lbl.style().polish(self._status_lbl)
+
+    def reset_transfer(self):
+        """重试时恢复原卡片的传输状态。"""
+        self._save_path = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._progress.setValue(0)
+        self._progress.show()
+        self._cancel_btn.show()
+        self._retry_btn.hide()
+        self._status_lbl.setObjectName("FileCardStatus")
+        self._status_lbl.setText("发送中…" if self._outgoing else "等待接收…")
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
+
+    def set_theme(self, theme: str):
+        self._theme = theme
+        self.update()
 
     def show_thumbnail(self, data: bytes):
         """Insert an image thumbnail at the top of the card (for images sent by self)."""
@@ -655,17 +778,41 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _open_card_file(card):
+    """通过 Qt 调用平台默认应用，并在卡片上显示打开失败的原因。"""
+    from PyQt6.QtGui import QDesktopServices
+    from PyQt6.QtCore import QUrl
+    if not card._save_path or not _os.path.exists(card._save_path):
+        message = "文件已移动或删除"
+    elif not QDesktopServices.openUrl(QUrl.fromLocalFile(_os.path.abspath(card._save_path))):
+        message = "无法打开文件，请检查默认应用"
+    else:
+        return
+    # 打开失败时保留路径，用户配置好默认应用后可以再次点击。
+    card._status_lbl.setText(f"失败：{message}")
+    card._status_lbl.setObjectName("FileCardError")
+    card._status_lbl.show()
+    card._status_lbl.style().unpolish(card._status_lbl)
+    card._status_lbl.style().polish(card._status_lbl)
+
+
 class ImageCard(QFrame):
-    """Inline image display for completed image transfers. Click to open."""
+    """显示图片及传输状态，支持取消、失败重试和点击打开。"""
+
+    cancel_requested = pyqtSignal(str)
+    retry_requested = pyqtSignal(str)
 
     def __init__(self, transfer_id: str, filename: str, image_data: bytes,
                  outgoing: bool = False, parent=None):
         super().__init__(parent)
         self._tid      = transfer_id
+        self._filename = filename
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
@@ -674,7 +821,8 @@ class ImageCard(QFrame):
 
         from PyQt6.QtGui import QPixmap
         pix = QPixmap()
-        if pix.loadFromData(image_data):
+        self._preview_error = not pix.loadFromData(image_data)
+        if not self._preview_error:
             pix = pix.scaledToWidth(268, Qt.TransformationMode.SmoothTransformation)
             img_lbl = QLabel()
             img_lbl.setPixmap(pix)
@@ -684,41 +832,93 @@ class ImageCard(QFrame):
         cap_row = QHBoxLayout()
         cap_row.setSpacing(4)
         cap_row.addWidget(QLabel("🖼"))
-        name_lbl = QLabel(filename)
+        name_lbl = ElidedLabel(filename)
         name_lbl.setObjectName("FileCardName")
         cap_row.addWidget(name_lbl, 1)
+        self._cancel_btn = QPushButton("✕")
+        self._cancel_btn.setObjectName("FileCardCancel")
+        self._cancel_btn.setFixedSize(22, 22)
+        self._cancel_btn.setVisible(outgoing)
+        self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._tid))
+        cap_row.addWidget(self._cancel_btn)
+        self._retry_btn = QPushButton("重试")
+        self._retry_btn.setObjectName("BtnGhost")
+        self._retry_btn.clicked.connect(lambda: self.retry_requested.emit(self._tid))
+        self._retry_btn.hide()
+        cap_row.addWidget(self._retry_btn)
         lay.addLayout(cap_row)
+        self._status_lbl = QLabel("")
+        self._status_lbl.setObjectName("FileCardStatus")
+        self._status_lbl.hide()
+        lay.addWidget(self._status_lbl)
+        if self._preview_error:
+            self._status_lbl.setText("图片无法预览，接收完成后可打开原文件")
+            self._status_lbl.setObjectName("FileCardError")
+            self._status_lbl.show()
 
     def set_progress(self, pct: int):
-        pass  # image is shown immediately; no progress indicator needed
+        self._status_lbl.setText(f"{'发送中' if self._outgoing else '接收中'} {pct}%")
+        self._status_lbl.show()
 
     def set_error(self, message: str):
-        pass
+        self._save_path = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._cancel_btn.hide()
+        self._retry_btn.setVisible(self._outgoing)
+        hint = "" if self._outgoing else "；请让发送方重新发送"
+        self._status_lbl.setText(f"失败：{message}{hint}")
+        self._status_lbl.setObjectName("FileCardError")
+        self._status_lbl.show()
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
 
     def set_done(self, save_path: str | None = None):
         self._save_path = save_path
+        self._cancel_btn.hide()
+        self._retry_btn.hide()
+        if self._preview_error:
+            self._status_lbl.setText("图片无法预览，点击打开原文件" if save_path else "图片无法预览，文件已发送")
+            self._status_lbl.setObjectName("FileCardError")
+            self._status_lbl.show()
+        else:
+            self._status_lbl.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor if save_path else Qt.CursorShape.ArrowCursor)
+
+    def reset_transfer(self):
+        """恢复图片发送状态，保留已有预览。"""
+        self._save_path = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._cancel_btn.setVisible(self._outgoing)
+        self._retry_btn.hide()
+        self._status_lbl.setObjectName("FileCardStatus")
+        self._status_lbl.setText("发送中…" if self._outgoing else "等待接收…")
+        self._status_lbl.show()
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
 
     def mousePressEvent(self, event):
-        if self._save_path and _os.path.exists(self._save_path):
-            from PyQt6.QtGui import QDesktopServices
-            from PyQt6.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
+        if event.button() == Qt.MouseButton.LeftButton and self._save_path:
+            _open_card_file(self)
         super().mousePressEvent(event)
 
 
 class VideoCard(QFrame):
-    """Video file card: shows progress + cancel while transferring, open button when done."""
+    """视频卡片提供传输进度、取消、失败重试和完成后打开入口。"""
 
     cancel_requested = pyqtSignal(str)   # transfer_id
+    retry_requested = pyqtSignal(str)
 
     def __init__(self, transfer_id: str, filename: str, size: int,
                  outgoing: bool = False, parent=None):
         super().__init__(parent)
         self._tid      = transfer_id
+        self._filename = filename
         self._outgoing = outgoing
         self._save_path: str | None = None
         self.setObjectName("FileCard")
-        self.setFixedWidth(280)
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(420)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
@@ -732,7 +932,7 @@ class VideoCard(QFrame):
 
         info = QVBoxLayout()
         info.setSpacing(0)
-        name_lbl = QLabel(filename)
+        name_lbl = ElidedLabel(filename)
         name_lbl.setObjectName("FileCardName")
         size_lbl = QLabel(_fmt_size(size))
         size_lbl.setObjectName("FileCardSize")
@@ -745,6 +945,11 @@ class VideoCard(QFrame):
         self._cancel_btn.setFixedSize(22, 22)
         self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._tid))
         row.addWidget(self._cancel_btn)
+        self._retry_btn = QPushButton("重试")
+        self._retry_btn.setObjectName("BtnGhost")
+        self._retry_btn.clicked.connect(lambda: self.retry_requested.emit(self._tid))
+        self._retry_btn.hide()
+        row.addWidget(self._retry_btn)
 
         self._open_btn = QPushButton("▶ 打开")
         self._open_btn.setObjectName("BtnGhost")
@@ -763,20 +968,25 @@ class VideoCard(QFrame):
         self._progress.setTextVisible(False)
         lay.addWidget(self._progress)
 
-        self._status_lbl = QLabel("Waiting…" if not outgoing else "Sending…")
+        self._status_lbl = QLabel("等待接收…" if not outgoing else "发送中…")
         self._status_lbl.setObjectName("FileCardStatus")
         lay.addWidget(self._status_lbl)
 
     def set_progress(self, pct: int):
         self._progress.setValue(pct)
         self._status_lbl.setText(
-            f"{'Sending' if self._outgoing else 'Receiving'} {pct}%"
+            f"{'发送中' if self._outgoing else '接收中'} {pct}%"
         )
 
     def set_error(self, message: str):
         self._progress.hide()
         self._cancel_btn.hide()
-        self._status_lbl.setText(f"Failed: {message}")
+        self._save_path = None
+        self._open_btn.hide()
+        self._retry_btn.setVisible(self._outgoing)
+        hint = "" if self._outgoing else "；请让发送方重新发送"
+        self._status_lbl.setText(f"失败：{message}{hint}")
+        self._status_lbl.show()
         self._status_lbl.setObjectName("FileCardError")
         self._status_lbl.style().unpolish(self._status_lbl)
         self._status_lbl.style().polish(self._status_lbl)
@@ -785,13 +995,25 @@ class VideoCard(QFrame):
         self._save_path = save_path
         self._progress.hide()
         self._cancel_btn.hide()
+        self._retry_btn.hide()
         self._status_lbl.hide()
-        self._open_btn.show()
-        if save_path:
-            self._open_btn.setEnabled(True)
+        self._open_btn.setVisible(bool(save_path))
+        self._open_btn.setEnabled(bool(save_path))
+
+    def reset_transfer(self):
+        """重试时恢复视频卡片的进度与取消入口。"""
+        self._save_path = None
+        self._progress.setValue(0)
+        self._progress.show()
+        self._cancel_btn.show()
+        self._retry_btn.hide()
+        self._open_btn.hide()
+        self._open_btn.setEnabled(False)
+        self._status_lbl.setObjectName("FileCardStatus")
+        self._status_lbl.setText("发送中…" if self._outgoing else "等待接收…")
+        self._status_lbl.show()
+        self._status_lbl.style().unpolish(self._status_lbl)
+        self._status_lbl.style().polish(self._status_lbl)
 
     def _open(self):
-        if self._save_path and _os.path.exists(self._save_path):
-            from PyQt6.QtGui import QDesktopServices
-            from PyQt6.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self._save_path))
+        _open_card_file(self)

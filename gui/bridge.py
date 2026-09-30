@@ -42,10 +42,15 @@ class WSBridge(QThread):
         self._ws    = None
         self._stop  = False
         self._connected = False
+        self._disconnect_cleanup = None
         self._identity = IdentityStore(Path.home() / ".beamchat" / "identity.json").load_or_create()
         self._ephemeral_private: X25519PrivateKey | None = None
 
     # ── public API (called from GUI thread) ───────────────────────────────────
+
+    def set_disconnect_cleanup(self, callback):
+        """注册需要在连接事件循环中完成的传输资源清理。"""
+        self._disconnect_cleanup = callback
 
     def send_frame(self, msg_type: T, **payload) -> bool:
         """Enqueue a frame to be sent. Returns False when not connected."""
@@ -96,21 +101,47 @@ class WSBridge(QThread):
     def close(self):
         self._stop = True
         self._connected = False
-        # Wake up any reconnect sleep immediately
-        if self._loop and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
-        # Send None sentinel to close the active WebSocket gracefully
-        if self._loop and self._queue:
-            asyncio.run_coroutine_threadsafe(
-                self._queue.put(None), self._loop
-            )
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+
+        def request_stop():
+            # 唤醒重连等待并关闭当前连接；全部操作留在所属事件循环内。
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._queue is not None:
+                self._queue.put_nowait(None)
+
+        try:
+            loop.call_soon_threadsafe(request_stop)
+        except RuntimeError:
+            # 连接线程可能恰好已退出，重复关闭无需再次调度。
+            if not loop.is_closed():
+                raise
 
     # ── QThread.run ───────────────────────────────────────────────────────────
 
     def run(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._run_with_reconnect())
+        try:
+            self._loop.run_until_complete(self._run_with_reconnect())
+        finally:
+            self._loop.run_until_complete(self._cleanup_transfers())
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.close()
+
+    async def _cleanup_transfers(self):
+        """在关闭或重连前等待清理，避免尚未释放的任务随事件循环一起丢失。"""
+        if self._disconnect_cleanup is not None:
+            try:
+                await self._disconnect_cleanup()
+            except Exception as exc:
+                _log.warning("文件传输清理失败：%s", exc)
 
     # ── async internals ───────────────────────────────────────────────────────
 
@@ -237,6 +268,8 @@ class WSBridge(QThread):
             _log.error("Unexpected error:\n%s", traceback.format_exc())
             self.disconnected.emit(str(exc))
             raise
+        finally:
+            await self._cleanup_transfers()
 
     async def _recv_loop(self, ws):
         async for raw in ws:

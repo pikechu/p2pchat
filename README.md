@@ -7,10 +7,14 @@ NAT 穿透 P2P 聊天应用。客户端只需出站连接到中继服务器，�
 ## 功能特性
 
 - **聊天室**：创建/加入多个聊天室，支持密码保护（端到端加密）
+- **后台群消息**：切换或关闭聊天页面后保留群成员身份，只有明确退出群聊才离群
+- **离线补收**：重连后按各群消息游标分页补收，自动去重、排序；群历史与凭证在本地加密保存
+- **未读与置顶**：后台消息显示未读徽章，右键会话可置顶或取消置顶
 - **持久聊天室**：房间永久保留，服务器重启后仍可访问
 - **房间管理**：创建者可修改聊天室名称、图标，或永久删除房间
 - **直接消息（DM）**：在线用户之间点对点私信
-- **文件传输**：支持发送图片、视频、任意文件（P2P 中继，500 MB 限制）
+- **文件传输**：支持图片、视频、任意文件，私聊优先 WebRTC 直连，失败时自动回退中继（50 MB 限制）
+- **传输恢复**：取消、断连和失败时释放句柄并清理临时文件，发送失败后可从原卡片重试
 - **表情符号**：内置 Emoji 选择面板
 - **消息回复**：引用回复特定消息
 - **已读回执**：发送/送达/已读状态标识
@@ -24,7 +28,7 @@ NAT 穿透 P2P 聊天应用。客户端只需出站连接到中继服务器，�
 ### 使用打包版（Windows）
 
 1. 从 [Releases](../../releases) 下载 `BeamChat.exe`
-2. 双击运行，填入服务器地址即可连接
+2. 双击运行，连接 `wss://medguide.lemon-travelhokkaido.com/beamchat/`
 
 ### 从源码运行
 
@@ -42,10 +46,16 @@ pip install -r requirements.txt
 python server.py
 ```
 
-**启动 GUI 客户端：**
+**连接本机测试服务：**
 
 ```bash
-python gui_client.py
+python gui_client.py --server ws://127.0.0.1:8765
+```
+
+**连接公网服务：**
+
+```bash
+python gui_client.py --server wss://medguide.lemon-travelhokkaido.com/beamchat/
 ```
 
 ---
@@ -55,7 +65,8 @@ python gui_client.py
 ### 首次连接
 
 启动后在设置中填入：
-- **服务器地址**：`ws://服务器IP:8765`
+
+- **服务器地址**：`wss://medguide.lemon-travelhokkaido.com/beamchat/`
 - **用户名**：任意名称（同一服务器上唯一）
 - **主题**：浅色 / 深色
 
@@ -88,36 +99,38 @@ python gui_client.py
 
 ## 服务端部署
 
-### 方式一：一键部署到 VPS（推荐）
+升级多群后台收信与离线补收功能时，需要同时更新客户端和服务端源码（包括 `server.py`、`protocol.py`）并重启服务。仅替换客户端 EXE，旧服务端仍会在切换群时移除其他群成员关系。
+
+当前生产入口为 `wss://medguide.lemon-travelhokkaido.com/beamchat/`。Nginx 在 HTTPS 端口终止 TLS，将 `/beamchat/` 转发到本机 WS 后端 `127.0.0.1:8765`。证书申请、自动续期、验证与回滚见 [部署维护手册](docs/deployment.md)。
+
+### 方式一：使用脚本部署 WS 后端
 
 **前提条件：**
+
 - 本机已安装 `ssh` / `scp`（Windows 10/11 内置，或 Git for Windows 自带）
 - 已配置 SSH 密钥免密登录，或准备好输入 VPS 密码
 - VPS 为 Ubuntu / Debian 系统
 
 ```bash
-# 部署并启动服务
-python deploy.py ubuntu@your-vps-ip
+# 部署并启动 WS 后端（pikastairs 是当前 VPS 的 SSH 别名）
+python deploy.py pikastairs
 
 # 自定义端口
-python deploy.py ubuntu@your-vps-ip --port 9000
-
-# 自定义 SSH 端口
-python deploy.py ubuntu@your-vps-ip:2222
+python deploy.py pikastairs --port 9000
 
 # 查看运行日志
-python deploy.py ubuntu@your-vps-ip --logs
+python deploy.py pikastairs --logs
 
 # 重启服务
-python deploy.py ubuntu@your-vps-ip --restart
+python deploy.py pikastairs --restart
 
 # 停止服务
-python deploy.py ubuntu@your-vps-ip --stop
+python deploy.py pikastairs --stop
 ```
 
-部署脚本会自动完成：上传服务文件 → 安装 Python 依赖 → 创建 systemd 服务 → 开放防火墙端口 → 输出连接地址。
+部署脚本完成上传服务文件、安装 Python 依赖、创建 systemd 服务和开放后端端口。它输出的是普通 WS 地址，并不配置 TLS；生产部署还需要 Nginx 反代和有效证书。当前客户端要求公网使用 WSS。本次发布维护既有服务时，按维护手册备份和更新源码，保留现有服务配置。
 
-### 方式二：手动部署
+### 方式二：手动运行 WS 后端
 
 ```bash
 # 在 VPS 上
@@ -125,48 +138,36 @@ git clone https://github.com/pikechu/p2pchat.git
 cd p2pchat
 pip3 install -r requirements-server.txt
 
-# 直接运行（前台）
+# 直接运行（前台，仅提供 WS）
 python3 server.py --host 0.0.0.0 --port 8765
-
-# 或使用 systemd 后台运行
-sudo tee /etc/systemd/system/p2pchat.service > /dev/null <<EOF
-[Unit]
-Description=BeamChat Relay Server
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /opt/p2pchat/server.py --host 0.0.0.0 --port 8765
-WorkingDirectory=/opt/p2pchat
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable --now p2pchat
 ```
+
+当前 VPS 通过 `/opt/p2pchat/venv/bin/python3` 和 `p2pchat.service` 运行后端。生产入口的 Nginx 与证书配置见 [部署维护手册](docs/deployment.md)。
 
 ### 方式三：本机 + SSH 隧道（无公网 IP）
 
 ```bash
-# 通过 SSH 反向隧道将本地服务暴露到公网
+# 在自己的 VPS 上建立 WS 后端隧道
 python start.py --ssh user@your-vps-ip
 python start.py --ssh user@your-vps-ip:2222 --port 9000
 ```
 
-客户端连接地址为 `ws://your-vps-ip:8765`。
+`start.py` 建立普通 WS 后端隧道，仍需在 VPS 配置 TLS 反代后向公网客户端提供 WSS 地址。当前生产 VPS 已运行后端服务，使用隧道时需选择未占用的端口并配置对应反代。
 
 ### 防火墙配置
 
 ```bash
-# Ubuntu/Debian (ufw)
-sudo ufw allow 8765/tcp
+# Ubuntu/Debian (ufw)：HTTPS 入口与证书 HTTP 验证
+sudo ufw allow 443/tcp
+sudo ufw allow 80/tcp
 
 # CentOS/RHEL (firewalld)
-sudo firewall-cmd --permanent --add-port=8765/tcp
+sudo firewall-cmd --permanent --add-port=443/tcp
+sudo firewall-cmd --permanent --add-port=80/tcp
 sudo firewall-cmd --reload
 ```
+
+`8765` 是普通 WS 后端端口。Nginx 通过本机回环地址访问它，公网客户端连接 HTTPS/WSS 的 `443` 端口。
 
 ---
 
@@ -188,7 +189,7 @@ python server.py [--host HOST] [--port PORT]
 ```
 python gui_client.py [--server URL] [--name NAME] [--theme THEME]
 
-  --server  服务器 WebSocket 地址，默认 ws://localhost:8765
+  --server  服务器 WebSocket 地址，默认 wss://medguide.lemon-travelhokkaido.com/beamchat/
   --name    预填用户名
   --theme   界面主题：light（默认）或 dark
 ```
@@ -199,8 +200,8 @@ python gui_client.py [--server URL] [--name NAME] [--theme THEME]
 
 ```bash
 pip install pyinstaller pillow
-python build.py
-# 输出：dist/BeamChat.exe
+python build.py --server-url wss://medguide.lemon-travelhokkaido.com/beamchat/
+# 输出：dist/BeamChat.exe，并复制到 F:\beam-build
 ```
 
 ---
@@ -211,7 +212,7 @@ python build.py
 
 ```bash
 pip install websockets cryptography
-python client.py --server ws://HOST:8765
+python client.py --server wss://medguide.lemon-travelhokkaido.com/beamchat/
 
 # 可用命令
 /name <用户名>       设置用户名
@@ -235,7 +236,7 @@ python client.py --server ws://HOST:8765
 客户端 C ──┘                                                      └── 客户端 D
 ```
 
-- **中继服务器**：仅做消息路由，不存储消息，不解密内容
+- **中继服务器**：路由消息并按有效期保存加密消息及群成员身份，不解密内容
 - **E2E 加密**：使用 Fernet（AES-128-CBC + HMAC-SHA256），密钥由 PBKDF2-HMAC-SHA256（20 万次迭代）从房间密码派生
 - **无密码房间**：仍会派生隔离密钥（基于 room_id），防止跨房间混淆
 - **WebSocket**：基于 `websockets` 库，协议帧为 JSON `{type, payload, ts, mid}`

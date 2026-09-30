@@ -110,6 +110,7 @@ class ChatClient:
         self._url             = server_url
         self._ws              = None
         self._username: Optional[str]  = None
+        self._pending_username: Optional[str] = None
         self._room_id: Optional[str]   = None
         self._room_name: Optional[str] = None
         self._crypto_key: Optional[bytes] = None
@@ -118,6 +119,14 @@ class ChatClient:
         self._room_access_token = ""
         self._pending_room_metadata = None
         self._known_room_metadata: dict[str, dict] = {}
+        # 当前房间与已加入群分开保存，后台消息按自己的群凭证认证。
+        self._joined_room_credentials: dict[str, dict] = {}
+        self._pending_room_credentials: dict[str, dict] = {}
+        self._pending_room_focus = ""
+        self._room_sync_offsets: dict[str, int] = {}
+        self._pending_sync_requests: list[list[dict]] = []
+        self._seen_message_ids: set[tuple[str, str, int]] = set()
+        self._seen_client_messages: set[tuple[str, str, str, str]] = set()
         self._running         = True
         self._offsets         = self._load_offsets()
         self._identity = IdentityStore(Path.home() / ".beamchat" / "identity.json").load_or_create()
@@ -163,27 +172,32 @@ class ChatClient:
     def _offset_key(self, scope_type: str, scope_id: str) -> str:
         return f"{scope_type}:{scope_id}"
 
-    def _update_offset(self, scope_type: str, scope_id: str, message_id) -> None:
+    def _update_offset(self, scope_type: str, scope_id: str, message_id, *, from_sync: bool = False) -> None:
         mid = int(message_id or 0)
-        if mid <= 0:
+        if mid <= 0 or not scope_id:
+            return
+        if scope_type == "room" and scope_id in self._room_sync_offsets and not from_sync:
+            # 补收结束前不能让新实时消息跳过仍未收齐的历史。
             return
         key = self._offset_key(scope_type, scope_id)
         if mid > self._offsets.get(key, 0):
             self._offsets[key] = mid
             self._save_offsets()
 
-    async def _sync_room_messages(self):
-        if not self._room_id:
+    async def _request_sync_messages(self, scopes: list[dict]):
+        self.__dict__.setdefault("_pending_sync_requests", []).append([dict(scope) for scope in scopes])
+        await self._send(T.SYNC_MESSAGES, scopes=scopes, limit=200)
+
+    async def _sync_room_messages(self, room_id: str | None = None):
+        room_id = room_id or self._room_id
+        if not room_id:
             return
-        await self._send(
-            T.SYNC_MESSAGES,
-            scopes=[{
-                "scope_type": "room",
-                "scope_id": self._room_id,
-                "after_message_id": self._offsets.get(self._offset_key("room", self._room_id), 0),
-            }],
-            limit=200,
+        after = self._room_sync_offsets.setdefault(
+            room_id, self._offsets.get(self._offset_key("room", room_id), 0)
         )
+        await self._request_sync_messages([{
+            "scope_type": "room", "scope_id": room_id, "after_message_id": after,
+        }])
 
     async def _sync_dm_messages(self):
         scopes = []
@@ -195,38 +209,95 @@ class ChatClient:
                 "after_message_id": self._offsets.get(self._offset_key("dm", scope_id), 0),
             })
         if scopes:
-            await self._send(T.SYNC_MESSAGES, scopes=scopes, limit=200)
+            await self._request_sync_messages(scopes)
 
     # ── display ──────────────────────────────────────────────────────────────
 
-    def _show_msg(self, sender: str, text: str, encrypted: bool, ts: float):
+    def _show_msg(self, sender: str, text: str, encrypted: bool, ts: float, room_id: str | None = None):
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
         display  = text
-        if encrypted and self._crypto_key:
-            plain = decrypt(self._crypto_key, text)
+        room_key = self._joined_room_credentials.get(room_id, {}).get("key") if room_id else self._crypto_key
+        if encrypted and room_key:
+            plain = decrypt(room_key, text)
             if plain is None:
                 display = "[bold red][wrong password — cannot decrypt][/bold red]"
                 log.warning("RECV decrypt_failed  sender=%s  room=%s", sender, self._room_id)
             else:
                 display = plain
-        elif encrypted and not self._crypto_key:
+        elif encrypted and not room_key:
             display = "[dim][encrypted — join with the room password to read][/dim]"
             log.debug("RECV encrypted_msg_no_key  sender=%s", sender)
 
         is_me      = sender == self._username
         name_style = "bold cyan" if is_me else "bold green"
         label      = "You" if is_me else sender
-        console.print(f"[dim]{time_str}[/dim]  [{name_style}]{label}[/{name_style}]: {display}")
+        room_label = f"[dim]群 {room_id}[/dim]  " if room_id and room_id != self._room_id else ""
+        console.print(f"[dim]{time_str}[/dim]  {room_label}[{name_style}]{label}[/{name_style}]: {display}")
 
-    def _show_room_aead(self, sender: str, ciphertext: str, message_id: str, ts: float):
+    def _show_room_aead(self, sender: str, ciphertext: str, message_id: str, ts: float,
+                        room_id: str | None = None) -> bool:
+        room_id = room_id or self._room_id or ""
+        room = self._joined_room_credentials.get(room_id)
+        if room is None:
+            _err(f"尚未保存群 {room_id} 的解密凭证，请先加入该群")
+            return False
         try:
             text = decrypt_room_message(
-                self._room_id or "", self._pending_pw, decode_room_envelope(ciphertext), message_id, self._room_salt
+                room_id, room["password"], decode_room_envelope(ciphertext), message_id, room["salt"]
             )
         except Exception:
-            _err("房间消息认证失败")
+            _err(f"群 {room_id} 的消息认证失败")
+            return False
+        self._show_msg(sender, text, False, ts, room_id=room_id)
+        return True
+
+    def _remember_message(self, scope_type: str, scope_id: str, message_id, sender: str = "",
+                          client_msg_id: str = ""):
+        if int(message_id or 0) > 0:
+            self._seen_message_ids.add((scope_type, scope_id, int(message_id)))
+        if client_msg_id:
+            self._seen_client_messages.add((scope_type, scope_id, sender, str(client_msg_id)))
+
+    def _receive_room_encrypted(self, payload: dict, ts: float, *, from_sync: bool = False):
+        room_id = str(payload.get("scope_id") or payload.get("room_id") or "")
+        message_id = int(payload.get("message_id", 0) or 0)
+        sender = str(payload.get("sender_name", "?"))
+        client_msg_id = str(payload.get("client_msg_id", ""))
+        duplicate = (message_id > 0 and ("room", room_id, message_id) in self._seen_message_ids) or (
+            client_msg_id and ("room", room_id, sender, client_msg_id) in self._seen_client_messages
+        )
+        if not duplicate and not self._show_room_aead(
+            sender, payload.get("ciphertext", ""), client_msg_id,
+            payload.get("created_at", ts), room_id=room_id,
+        ):
             return
-        self._show_msg(sender, text, False, ts)
+        self._remember_message("room", room_id, message_id, sender, client_msg_id)
+        self._update_offset("room", room_id, message_id, from_sync=from_sync)
+
+    def _activate_room(self, room_id: str, room_name: str):
+        room = self._joined_room_credentials[room_id]
+        room["name"] = room_name
+        self._room_id = room_id
+        self._room_name = room_name
+        self._pending_pw = room.get("password", "")
+        self._room_salt = room.get("salt", "")
+        self._room_access_token = room.get("access_token", "")
+        self._crypto_key = room.get("key")
+
+    def _forget_room(self, room_id: str):
+        self._joined_room_credentials.pop(room_id, None)
+        self._pending_room_credentials.pop(room_id, None)
+        self._room_sync_offsets.pop(room_id, None)
+        self._offsets.pop(self._offset_key("room", room_id), None)
+        self._seen_message_ids = {key for key in self._seen_message_ids if key[:2] != ("room", room_id)}
+        self._seen_client_messages = {key for key in self._seen_client_messages if key[:2] != ("room", room_id)}
+        if room_id == self._pending_room_focus:
+            self._pending_room_focus = ""
+        if room_id == self._room_id:
+            self._room_id = self._room_name = None
+            self._crypto_key = None
+            self._pending_pw = self._room_salt = self._room_access_token = ""
+        self._save_offsets()
 
     def _show_help(self):
         t = Table(title="Commands", show_header=True, header_style="bold")
@@ -359,9 +430,21 @@ class ChatClient:
                     await self._send(T.SET_NAME, name=self._username)
 
             elif mtype == T.READY:
+                confirmed_name = str(payload.get("name") or self._username or "")
+                if confirmed_name:
+                    self._username = confirmed_name
+                    self._secure_sessions.set_own_name(confirmed_name)
+                self._pending_username = None
                 self._ready = True
                 _sys("连接已就绪")
+                self._pending_sync_requests.clear()
+                self._room_sync_offsets = {
+                    rid: self._offsets.get(self._offset_key("room", rid), 0)
+                    for rid in self._joined_room_credentials
+                }
                 await self._sync_dm_messages()
+                for rid, room in self._joined_room_credentials.items():
+                    await self._send(T.JOIN_ROOM, room_id=rid, access_token=room["access_token"])
 
             elif mtype == T.PEER_KEY_BUNDLE:
                 peer = str(payload.get("name", ""))
@@ -378,18 +461,29 @@ class ChatClient:
                 _sys(payload.get("message", ""))
 
             elif mtype == T.ERROR:
+                if payload.get("code") == "USERNAME_IDENTITY_MISMATCH":
+                    self._pending_username = None
                 server_msg = payload.get("message", "")
+                rid = payload.get("room_id", "")
+                if rid:
+                    self._pending_room_credentials.pop(rid, None)
+                    if self._pending_room_focus == rid:
+                        self._pending_room_focus = ""
+                    if payload.get("code") == "ROOM_NOT_FOUND":
+                        self._forget_room(rid)
                 _err(server_msg)
                 log.warning("SERVER_ERROR  %s", server_msg)
 
             elif mtype == T.ROOM_CREATED:
-                self._room_id   = payload["room_id"]
-                self._room_name = payload["name"]
-                metadata = self._pending_room_metadata
-                self._room_salt = metadata["salt"] if metadata else ""
-                self._room_access_token = metadata.access_token if metadata else ""
-                if metadata:
-                    self._known_room_metadata[self._room_id] = dict(metadata)
+                rid = payload["room_id"]
+                room = self._pending_room_credentials.pop(rid, None)
+                if room is None:
+                    _err("缺少新建群的本地解密凭证")
+                    return
+                self._joined_room_credentials[rid] = room
+                self._known_room_metadata[rid] = dict(room["metadata"])
+                self._activate_room(rid, payload["name"])
+                self._pending_room_focus = ""
                 self._pending_room_metadata = None
                 lock_note = " [bold yellow](AEAD encrypted)[/bold yellow]"
                 console.print(Panel(
@@ -404,28 +498,38 @@ class ChatClient:
                 await self._sync_room_messages()
 
             elif mtype == T.ROOM_JOINED:
-                self._room_id   = payload["room_id"]
-                self._room_name = payload["name"]
+                rid = payload["room_id"]
+                room = self._pending_room_credentials.pop(rid, None)
+                if room is not None:
+                    self._joined_room_credentials[rid] = room
+                if rid not in self._joined_room_credentials:
+                    _err(f"缺少群 {rid} 的本地解密凭证")
+                    return
+                self._joined_room_credentials[rid]["name"] = payload["name"]
+                if self._pending_room_focus == rid or not self._room_id:
+                    self._activate_room(rid, payload["name"])
+                    self._pending_room_focus = ""
                 members         = payload.get("members", [])
                 lock_note = " [bold yellow](E2E encrypted)[/bold yellow]" if self._crypto_key else ""
                 console.print(Panel(
-                    f"Room ID: [bold yellow]{self._room_id}[/bold yellow]\n"
-                    f"Name   : {self._room_name}{lock_note}\n"
+                    f"Room ID: [bold yellow]{rid}[/bold yellow]\n"
+                    f"Name   : {payload['name']}{lock_note}\n"
                     f"Online : {', '.join(members)}",
                     title="[bold green]Joined Room[/bold green]",
                     border_style="green",
                 ))
-                log.info("ROOM_JOINED  room=%s  members=%s", self._room_id, members)
-                await self._sync_room_messages()
+                log.info("ROOM_JOINED  room=%s  members=%s", rid, members)
+                await self._sync_room_messages(rid)
 
             elif mtype == T.ROOM_LEFT:
-                _sys("You left the room")
-                log.info("ROOM_LEFT  room=%s", self._room_id)
-                self._room_id    = None
-                self._room_name  = None
-                self._crypto_key = None
-                self._room_salt = ""
-                self._room_access_token = ""
+                rid = payload.get("room_id") or self._room_id or ""
+                _sys(f"已退出群 {rid}")
+                log.info("ROOM_LEFT  room=%s", rid)
+                self._forget_room(rid)
+
+            elif mtype == T.ROOM_DELETED:
+                rid = payload.get("room_id", "")
+                self._forget_room(rid)
 
             elif mtype == T.USER_JOINED:
                 uname = payload["username"]
@@ -438,6 +542,7 @@ class ChatClient:
                 log.info("USER_LEFT  user=%s  room=%s", uname, self._room_id)
 
             elif mtype == T.NEW_MSG:
+                rid = payload.get("room_id") or self._room_id or ""
                 sender    = payload.get("sender", "?")
                 encrypted = payload.get("encrypted", False)
                 seq       = payload.get("seq", 0)
@@ -447,23 +552,16 @@ class ChatClient:
                     q_name = reply_to.get("sender", "")
                     q_text = reply_to.get("text", "")[:60]
                     console.print(f"[dim]  ↩ {q_name}: {q_text}[/dim]")
-                self._show_msg(sender, payload.get("text", ""), encrypted, ts)
-                self._update_offset("room", self._room_id or "", payload.get("message_id", 0))
+                self._show_msg(sender, payload.get("text", ""), encrypted, ts, room_id=rid)
+                self._update_offset("room", rid, payload.get("message_id", 0))
                 # Ack as read (terminal = message immediately visible)
                 if seq:
                     import asyncio
-                    asyncio.ensure_future(self._send(T.MSG_ACK, seq=seq, status="read"))
+                    asyncio.ensure_future(self._send(T.MSG_ACK, room_id=rid, seq=seq, status="read"))
 
             elif mtype == T.NEW_ENCRYPTED_MSG:
                 if payload.get("scope_type") == "room":
-                    rid = payload.get("scope_id", "")
-                    self._show_room_aead(
-                        payload.get("sender_name", "?"),
-                        payload.get("ciphertext", ""),
-                        payload.get("client_msg_id", ""),
-                        payload.get("created_at", ts),
-                    )
-                    self._update_offset("room", rid, payload.get("message_id", 0))
+                    self._receive_room_encrypted(payload, ts)
                 elif payload.get("scope_type") == "dm":
                     sender = payload.get("sender_name", "")
                     recipient = payload.get("recipient_name", "")
@@ -477,11 +575,10 @@ class ChatClient:
                         _err("加密私聊密钥不可用")
 
             elif mtype == T.SYNC_MESSAGES_RESULT:
-                for item in payload.get("messages", []):
+                requests = self._pending_sync_requests.pop(0) if self._pending_sync_requests else []
+                for item in sorted(payload.get("messages", []), key=lambda item: int(item.get("message_id", 0))):
                     if item.get("scope_type") == "room":
-                        rid = item.get("scope_id", "")
-                        self._show_room_aead(item.get("sender_name", "?"), item.get("ciphertext", ""), item.get("client_msg_id", ""), item.get("created_at", ts))
-                        self._update_offset("room", rid, item.get("message_id", 0))
+                        self._receive_room_encrypted(item, ts, from_sync=True)
                     elif item.get("scope_type") == "dm":
                         sender = item.get("sender_name", "")
                         recipient = item.get("recipient_name", "")
@@ -493,6 +590,14 @@ class ChatClient:
                             self._update_offset("dm", item.get("scope_id", ""), item.get("message_id", 0))
                         except SecureSessionError:
                             _err("加密私聊密钥不可用")
+                next_scopes = payload.get("next_scopes", []) if payload.get("has_more") else []
+                pending_rooms = {scope.get("scope_id") for scope in next_scopes if scope.get("scope_type") == "room"}
+                for scope in requests:
+                    rid = scope.get("scope_id", "")
+                    if scope.get("scope_type") == "room" and rid not in pending_rooms:
+                        self._room_sync_offsets.pop(rid, None)
+                if next_scopes:
+                    await self._request_sync_messages(next_scopes)
 
             elif mtype == T.MESSAGE_TTL_UPDATED:
                 ttl = int(payload.get("ttl_seconds", 0))
@@ -513,6 +618,10 @@ class ChatClient:
                     payload.get("scope_type", "room"),
                     payload.get("scope_id", self._room_id or ""),
                     payload.get("message_id", 0),
+                )
+                self._remember_message(
+                    payload.get("scope_type", "room"), payload.get("scope_id", self._room_id or ""),
+                    payload.get("message_id", 0), self._username or "", str(payload.get("client_mid", "")),
                 )
 
             elif mtype == T.MSG_STATUS:
@@ -582,6 +691,7 @@ class ChatClient:
                 client_msg_id=client_msg_id,
             )
             self._show_msg(self._username, line, False, datetime.now().timestamp())
+            self._remember_message("room", self._room_id, 0, self._username, client_msg_id)
             return
 
         parts = line[1:].split(maxsplit=2)
@@ -610,13 +720,19 @@ class ChatClient:
                 if not args:
                     _err("Usage: /name <username>")
                     return
-                self._username = args[0]
-                self._secure_sessions = SecureSessionManager(
-                    self._identity, TrustStore(Path.home() / ".beamchat" / "trust.json"), self._username
-                )
-                log.info("SET_NAME  name=%s", self._username)
+                if self._pending_username is not None:
+                    _err("用户名变更正在确认，请稍后重试")
+                    return
+                requested_name = args[0]
+                if self._ready:
+                    # 已连接的改名等待服务端确认，拒绝时继续使用原名称与会话。
+                    self._pending_username = requested_name
+                else:
+                    self._username = requested_name
+                    self._secure_sessions.set_own_name(requested_name)
+                log.info("SET_NAME  name=%s", requested_name)
                 if self._server_hello:
-                    await self._send(T.SET_NAME, name=self._username)
+                    await self._send(T.SET_NAME, name=requested_name)
                 else:
                     _info("正在等待服务器握手完成")
 
@@ -631,8 +747,12 @@ class ChatClient:
                 password         = args[1] if len(args) > 1 else ""
                 room_id = "".join(random.choices("ABCDEFGHJKMNPQRSTUVWXYZ23456789", k=6))
                 metadata = create_room_access_metadata(room_id, password)
-                self._pending_pw = password
                 self._pending_room_metadata = metadata
+                self._pending_room_credentials[room_id] = {
+                    "password": password, "salt": metadata["salt"],
+                    "access_token": metadata.access_token, "metadata": dict(metadata),
+                }
+                self._pending_room_focus = room_id
                 log.info("CREATE_ROOM  name=%s", room_name)
                 await self._send(T.CREATE_ROOM, room_id=room_id, name=room_name,
                                  locked=bool(password), **dict(metadata))
@@ -658,15 +778,18 @@ class ChatClient:
                 except Exception:
                     _err("房间访问令牌认证失败")
                     return
-                self._pending_pw = password
-                self._room_salt = metadata["salt"]
-                self._room_access_token = access_token
+                self._pending_room_credentials[room_id] = {
+                    "password": password, "salt": metadata["salt"],
+                    "access_token": access_token, "metadata": dict(metadata),
+                }
+                self._pending_room_focus = room_id
                 log.info("JOIN_ROOM  room=%s", room_id)
                 await self._send(T.JOIN_ROOM, room_id=room_id, access_token=access_token)
 
             elif cmd == "leave":
                 log.info("LEAVE_ROOM  room=%s", self._room_id)
-                await self._send(T.LEAVE_ROOM)
+                if self._room_id:
+                    await self._send(T.LEAVE_ROOM, room_id=self._room_id)
 
             elif cmd == "dm":
                 if len(args) < 2 or not self._ready:

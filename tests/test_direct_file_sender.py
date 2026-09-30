@@ -42,6 +42,8 @@ def _make_window_stub(tmp_path: pathlib.Path):
     window._webrtc_transfer = MagicMock()
     window._webrtc_transfer.start_offer = AsyncMock()
     window._webrtc_transfer.close = AsyncMock()
+    window._webrtc_transfer.close_all = AsyncMock()
+    window._webrtc_transfer.get_session_peer.return_value = None
     window._webrtc_file_pending = {}
     window._secure_sessions = MagicMock()
     window._secure_sessions.file_key = MagicMock(return_value=(b"D" * 32, "dm-scope"))
@@ -103,10 +105,11 @@ def test_direct_file_sender_marks_error_when_socket_write_fails(tmp_path):
     path.write_bytes(b"A" * 32)
 
     tid = "direct2"
+    sender = DirectFileSender(path)
     window._ft_manager.outgoing[tid] = {
         "to": "bob",
         "path": path,
-        "sender": DirectFileSender(path),
+        "sender": sender,
     }
     card = MagicMock()
     window._ft_cards[tid] = card
@@ -118,6 +121,36 @@ def test_direct_file_sender_marks_error_when_socket_write_fails(tmp_path):
     card.set_error.assert_called_once_with("传输中断")
     assert tid not in window._ft_manager.outgoing
     assert tid not in window._direct_file_senders
+    assert sender._src.closed
+
+
+def test_file_error_cleans_encrypted_receiver_temp_file(tmp_path):
+    window = _make_window_stub(tmp_path)
+    tid = "receive-error"
+    path = tmp_path / "incoming.bin"
+    path.write_bytes(b"payload")
+    sender = EncryptedFileSender(
+        path, b"D" * 32, transfer_id=tid,
+        scope_type="dm", scope_id="dm-scope", sender="bob", recipient="me",
+    )
+    from file_transfer import EncryptedFileReceiver
+    incoming = EncryptedFileReceiver(
+        tmp_path, b"D" * 32, transfer_id=tid,
+        scope_type="dm", scope_id="dm-scope", sender="bob", recipient="me",
+    )
+    offer = sender.offer_payload()
+    incoming.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+    chunk = sender.next_payload()
+    assert chunk is not None
+    incoming.add_chunk(chunk["index"], chunk["total"], chunk["encrypted_chunk"])
+    assert incoming.temp_path.exists()
+    window._encrypted_file_receivers[tid] = incoming
+    window._ft_cards[tid] = MagicMock()
+
+    MainWindow._on_file_error(window, {"transfer_id": tid, "message": "网络中断"})
+
+    assert not incoming.temp_path.exists()
+    assert tid not in window._encrypted_file_receivers
 
 
 def test_start_file_send_in_dm_prefers_webrtc(tmp_path):
@@ -370,3 +403,177 @@ def test_webrtc_disabled_dm_send_goes_directly_to_relay(tmp_path):
     window._bridge.send_frame.assert_called_once()
     assert window._bridge.send_frame.call_args.args[0] == T.FILE_OFFER
     window._chat.add_file_card.assert_called_once_with(card)
+
+
+def _incoming_with_temp(window, tmp_path, tid, *, scope_type="dm"):
+    """建立已收到一块数据的加密传输，用于覆盖失败清理路径。"""
+    from file_transfer import EncryptedFileReceiver
+    path = tmp_path / f"source-{tid}.txt"
+    path.write_bytes(b"partial file")
+    recipient = "me" if scope_type == "dm" else ""
+    sender = EncryptedFileSender(
+        path, b"D" * 32, transfer_id=tid,
+        scope_type=scope_type, scope_id="scope", sender="bob", recipient=recipient,
+    )
+    receiver = EncryptedFileReceiver(
+        tmp_path, b"D" * 32, transfer_id=tid,
+        scope_type=scope_type, scope_id="scope", sender="bob", recipient=recipient,
+    )
+    try:
+        offer = sender.offer_payload()
+        receiver.begin(offer["encrypted_metadata"], offer["size"], offer["total"])
+        chunk = sender.next_payload()
+        receiver.add_chunk(chunk["index"], chunk["total"], chunk["encrypted_chunk"])
+    finally:
+        sender.close()
+    window._encrypted_file_receivers[tid] = receiver
+    return receiver
+
+
+@pytest.mark.parametrize("scope_type", ["dm", "room"])
+def test_missing_encrypted_done_removes_partial_file(tmp_path, scope_type):
+    window = _make_window_stub(tmp_path)
+    tid = "missing-done"
+    receiver = _incoming_with_temp(window, tmp_path, tid, scope_type=scope_type)
+    card = MagicMock()
+    window._ft_cards[tid] = card
+    assert receiver.temp_path.exists()
+
+    handler = MainWindow._on_file_done if scope_type == "dm" else MainWindow._on_file_room_done
+    handler(window, {"transfer_id": tid})
+
+    assert not receiver.temp_path.exists()
+    assert tid not in window._encrypted_file_receivers
+    card.set_error.assert_called_once_with("文件认证失败")
+
+
+def test_disconnect_cleanup_removes_background_receiver_without_card(tmp_path):
+    window = _make_window_stub(tmp_path)
+    receiver = _incoming_with_temp(window, tmp_path, "background", scope_type="room")
+    path = tmp_path / "outgoing.txt"
+    path.write_bytes(b"pending")
+    sender = DirectFileSender(path)
+    window._ft_manager.outgoing["pending"] = {"sender": sender, "to": "bob"}
+
+    with patch.object(MainWindow, "_run_webrtc_task", side_effect=lambda coro: __import__("asyncio").run(coro)):
+        MainWindow._close_all_file_transfers(window, "连接断开")
+
+    assert not receiver.temp_path.exists()
+    assert sender._src.closed
+    assert not window._encrypted_file_receivers
+    assert not window._ft_manager.outgoing
+    window._webrtc_transfer.close_all.assert_awaited_once()
+
+
+def test_cancel_open_webrtc_file_closes_peer_connection(tmp_path):
+    window = _make_window_stub(tmp_path)
+    tid = "opened"
+    card = MagicMock()
+    window._ft_cards[tid] = card
+    window._webrtc_transfer.get_session_peer.return_value = "bob"
+    assert tid not in window._webrtc_file_pending
+
+    with patch.object(MainWindow, "_run_webrtc_task", side_effect=lambda coro: __import__("asyncio").run(coro)):
+        MainWindow._cancel_transfer(window, tid)
+
+    window._bridge.send_frame.assert_called_once_with(T.WEBRTC_CLOSE, to="bob", session_id=tid)
+    window._webrtc_transfer.close.assert_awaited_once_with(tid)
+    card.set_error.assert_called_once_with("已取消")
+    assert tid not in window._ft_cards
+
+
+def test_cancel_encrypted_receiver_notifies_sender(tmp_path):
+    window = _make_window_stub(tmp_path)
+    receiver = _incoming_with_temp(window, tmp_path, "cancel-receive")
+
+    MainWindow._cancel_transfer(window, "cancel-receive")
+
+    window._bridge.send_frame.assert_called_once_with(
+        T.FILE_REJECT, to="bob", transfer_id="cancel-receive", reason="接收方已取消",
+    )
+    assert not receiver.temp_path.exists()
+
+
+def test_room_offer_write_failure_closes_source_file(tmp_path):
+    window = _make_window_stub(tmp_path)
+    window._bridge.send_frame.return_value = False
+    path = tmp_path / "room.txt"
+    path.write_bytes(b"data")
+    captured = []
+
+    def make_sender(*args, **kwargs):
+        sender = EncryptedFileSender(*args, **kwargs)
+        captured.append(sender)
+        return sender
+
+    with patch.object(MainWindow, "_room_file_key", return_value=(b"D" * 32, "ROOM01")), \
+         patch("gui.window.EncryptedFileSender", side_effect=make_sender), \
+         patch("gui.window.FileCard", return_value=MagicMock()):
+        MainWindow._start_room_file_send(window, "ROOM01", path)
+
+    assert captured[0]._src.closed
+    assert not window._room_file_senders
+    assert not window._ft_cards
+
+
+def test_room_sender_without_card_closes_file_handle(tmp_path):
+    window = _make_window_stub(tmp_path)
+    path = tmp_path / "orphan.txt"
+    path.write_bytes(b"data")
+    sender = DirectFileSender(path)
+    window._room_file_senders["orphan"] = {"sender": sender}
+
+    MainWindow._pump_room_file_sender(window, "orphan")
+
+    assert sender._src.closed
+    assert not window._room_file_senders
+
+
+def test_retry_preserves_original_room_after_navigation(tmp_path):
+    window = _make_window_stub(tmp_path)
+    window._rooms = {"ROOM01": {}}
+    window._chat.current_room_id = "@someone-else"
+    path = tmp_path / "retry.txt"
+    path.write_bytes(b"data")
+    card = MagicMock()
+    card._tid = "old"
+
+    with patch.object(MainWindow, "_start_room_file_send") as send:
+        MainWindow._retry_file_send(window, card, path, room_id="ROOM01")
+
+    send.assert_called_once_with("ROOM01", path, existing_card=card)
+    card.reset_transfer.assert_called_once()
+
+
+def test_selected_missing_file_has_visible_failure(tmp_path):
+    window = _make_window_stub(tmp_path)
+    window._chat.current_room_id = "@bob"
+
+    with patch("gui.window.QMessageBox.warning") as warning:
+        MainWindow._start_file_send(window, str(tmp_path / "deleted.txt"))
+
+    warning.assert_called_once()
+    assert "无法读取文件" in warning.call_args.args[2]
+    window._webrtc_transfer.start_offer.assert_not_called()
+
+
+def test_webrtc_receiver_progress_and_completion_share_one_cancelable_card(tmp_path):
+    window = _make_window_stub(tmp_path)
+    path = tmp_path / "received.bin"
+    path.write_bytes(b"data")
+    card = MagicMock()
+    with patch("gui.window.FileCard", return_value=card) as make_card:
+        MainWindow._on_webrtc_file_progress(window, {
+            "transfer_id": "receiving", "direction": "receive", "peer": "bob",
+            "filename": "received.bin", "size": 4, "progress": 50,
+        })
+        MainWindow._on_webrtc_file_received(window, path, {
+            "transfer_id": "receiving", "from_user": "bob", "filename": "received.bin", "size": 4,
+        })
+
+    make_card.assert_called_once()
+    card.cancel_requested.connect.assert_called_once_with(window._cancel_transfer)
+    card.set_progress.assert_called_once_with(50)
+    card.set_done.assert_called_once_with(save_path=str(path))
+    window._chat.add_file_card_to_room.assert_called_once_with("@bob", card)
+    assert "receiving" not in window._ft_cards

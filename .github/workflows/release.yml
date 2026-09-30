@@ -70,11 +70,19 @@ jobs:
           }
           Get-Item "dist/BeamChat.exe" | Format-List FullName,Length,LastWriteTime
 
+      - name: 生成更新完整性清单
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/BeamChat.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  BeamChat.exe" | Set-Content "dist/BeamChat.exe.sha256" -Encoding ascii -NoNewline
+
       - name: 保存 Actions 构建产物
         uses: actions/upload-artifact@v4
         with:
           name: BeamChat-${{ env.RELEASE_TAG }}
-          path: dist/BeamChat.exe
+          path: |
+            dist/BeamChat.exe
+            dist/BeamChat.exe.sha256
           if-no-files-found: error
 
       - name: 创建 GitHub Release 并上传 EXE
@@ -87,6 +95,8 @@ jobs:
           make_latest: true
           overwrite_files: true
           fail_on_unmatched_files: true
-          files: dist/BeamChat.exe
+          files: |
+            dist/BeamChat.exe
+            dist/BeamChat.exe.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

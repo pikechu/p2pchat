@@ -53,6 +53,18 @@ def test_manager_register_outgoing():
     assert len(mgr.outgoing[tid]["chunks"]) >= 1
 
 
+def test_cancel_closes_outgoing_sender(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    manager = FileTransferManager(downloads_dir=tmp_path / "downloads")
+    sender = DirectFileSender(source)
+    manager.outgoing["transfer"] = {"sender": sender}
+
+    manager.cancel("transfer")
+
+    assert sender._src.closed
+
+
 def test_manager_begin_incoming():
     mgr = FileTransferManager(downloads_dir=pathlib.Path(tempfile.mkdtemp()))
     mgr.begin_incoming("t1", "alice", "file.txt", 10, "text/plain")
