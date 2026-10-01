@@ -235,4 +235,6 @@ FFmpeg、PyAV、aiortc 及 NumPy 的 OpenBLAS 未直接删减：原生 DLL 存�
 
 发布步骤为：合并已评审的源码，按合并提交创建 `v1.2.3` 草稿 Release，上传本地验收过的 EXE 和摘要，核对资产后发布并设为 latest。标签构建仍保存 Actions 产物；工作流在发布前检查已有正式或草稿 Release，发现同标签时跳过上传，避免覆盖本地验收包。API 查询异常会使流程失败，不能当作“不存在”继续发布。
 
-验证范围：隔离依赖验证未使用麦克风或生产 WebRTC；冻结引导器由 `--help` 启动检查覆盖。远程发布后还需使用旧版本更新器验证公开 latest 检测、下载及摘要，不在维护环境替换用户正在运行的客户端。
+验证范围：隔离依赖验证未使用麦克风或生产 WebRTC；冻结引导器由 `--help` 启动检查覆盖。正式发布后，使用与 `v1.2.2` 完全相同的更新器代码并注入旧版本号，实测公开 latest 检测、完整下载及摘要校验均通过：发现 `1.2.3`，下载 72,934,583 字节，SHA-256 与本地发布归档一致。未调用安装逻辑或替换用户正在运行的客户端。报告保留在 `F:\beam-build\release-v1.2.3\online-update-verification.json`。
+
+Windows Actions 的 Python 输出固定 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`，避免构建成功后打印中文日志时因 runner 默认 `cp1252` 编码失败。
