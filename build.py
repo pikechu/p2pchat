@@ -121,11 +121,34 @@ EXCLUDES = [
     "PIL",
     "scipy",
     "pandas",
+    # NumPy 测试与 Fortran 构建工具不会被客户端调用。
+    "numpy.testing",
+    "numpy.f2py",
+    "numpy._pyinstaller",
+    "numpy.tests",
 ]
 
 
 def _run(cmd: list, **kw):
     subprocess.check_call([str(c) for c in cmd], **kw)
+
+
+def verify_windows_executable(exe: pathlib.Path) -> None:
+    """复制前验证冻结程序可启动，避免发布缺少运行依赖的 EXE。"""
+    if sys.platform != "win32":
+        return
+    result = subprocess.run(
+        [str(exe), "--help"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"EXE 启动检查失败（退出码 {result.returncode}）：{exe}\n{detail}")
+    print("EXE 启动检查通过（--help）")
 
 
 def _ensure_pyinstaller():
@@ -192,11 +215,14 @@ def build(debug: bool = False, config: dict | None = None):
 
     build_dist = pyinstaller_dist_dir()
 
+    # Windows 使用项目入口处理 EXE 写头时的短暂共享锁。
+    entry = [str(ROOT / "build_windows.py")] if sys.platform == "win32" else ["-m", "PyInstaller"]
     cmd = [
-        sys.executable, "-m", "PyInstaller",
+        sys.executable, *entry,
         "--onefile",
         f"--name={APP_NAME}",
         f"--distpath={build_dist}",
+        f"--additional-hooks-dir={ROOT / 'build_hooks'}",
     ]
 
     if not debug:
@@ -225,14 +251,11 @@ def build(debug: bool = False, config: dict | None = None):
 
     built_exe = build_dist / expected_executable_path().name
     if built_exe.exists():
+        verify_windows_executable(built_exe)
         exe = expected_executable_path()
         if built_exe.resolve() != exe.resolve():
             exe.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(built_exe, exe)
-            except PermissionError as exc:
-                print(f"WARN: cannot update {exe}: {exc}")
-                exe = built_exe
+            shutil.copy2(built_exe, exe)
         mb = exe.stat().st_size / 1024 / 1024
         print(f"\nOK: {exe.name}   {mb:.0f} MB   built in {elapsed:.0f}s")
         print(f"    {exe}\n")
@@ -242,7 +265,7 @@ def build(debug: bool = False, config: dict | None = None):
         if debug:
             print("Debug build: run the exe from a terminal to see crash output.")
     else:
-        print(f"\nFAIL: {exe} not found")
+        print(f"\nFAIL: {built_exe} not found")
         sys.exit(1)
 
 

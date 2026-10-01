@@ -157,3 +157,82 @@ sudo systemctl reload nginx
 ```
 
 该旧配置引用已过期的 TrustAsia 证书，恢复后会失去当前有效的 WSS 入口。只需回滚应用代码时，保留新证书、续期定时器和 Nginx 的 `/beamchat/` 路由；恢复旧站点配置用于配置故障回退，并需重新核验 TLS 与原站点状态。
+
+## Windows 本地打包：工具与缓存固定到 F 盘
+
+从实际项目目录 `F:\claude projects\p2pchat` 执行：
+
+```powershell
+.\build-local.ps1
+# 需要调试控制台时：
+.\build-local.ps1 -DebugBuild
+```
+
+该入口使用独立的 F 盘 Python 3.11 工具链，环境变量只对本次构建生效。构建 `PATH` 仅包含该 Python、其 DLL 目录与 Windows 系统目录，防止桌面应用附加的 DLL 路径污染打包结果。
+
+| 内容 | 路径 |
+|---|---|
+| Python 与 PyInstaller、项目依赖 | `F:\beam-build\toolchain\python311` |
+| 工具链版本清单 | `F:\beam-build\toolchain\packages.json` |
+| pip 缓存 | `F:\beam-build\cache\pip` |
+| PyInstaller 缓存 | `F:\beam-build\cache\pyinstaller` |
+| 临时目录 | `F:\beam-build\tmp` |
+| 中间文件与配置 | `F:\claude projects\p2pchat\build`、`BeamChat.spec` |
+| EXE 组装目录 | `F:\beam-build\local-build\dist` |
+| 最终产物与额外副本 | 项目 `dist\BeamChat.exe`、`F:\beam-build\BeamChat.exe` |
+| 完整构建日志 | `F:\beam-build\build-local.log` |
+
+EXE 组装完成后，先以 `--help` 验证冻结程序可以启动；非零退出或超时会让构建失败，停止复制正式产物。复制失败也会明确报错。构建成功后核对组装目录与两份最终 EXE 的 SHA-256，并为最终产物生成相邻 `.sha256` 文件。构建失败会返回错误，不能将组装目录中的未完成 EXE 当作发布包。现有 GitHub Release 的版本归档保留在 `F:\beam-build\release-v版本号`。
+
+切换执行环境后，如果显示 `C:\mnt\f\...`，这是 WSL 路径被错误转换得到的目录；本地执行应使用真实的 `F:\...` 项目路径。
+2026-10-01 已修复 Windows 本地打包并完成正常版构建，工具链为 Python 3.11.3、PyInstaller 6.20.0。排查确认了两个问题：
+
+- EXE 写头时存在短暂文件共享冲突。独立大文件副本的 Windows 原始错误为 `ERROR_SHARING_VIOLATION (32)`，等待后写入恢复。`build_windows.py` 保留文件头及已有调试时间戳、系统算法计算的完整 PE 校验和，仅写入需要修改的等长字段；最多等待 30 秒，超时明确失败且不被 PyInstaller 外层重试放大。未确认占用者，不以此推断具体防护软件。
+- 构建继承了 Codex 的 Poppler DLL 搜索路径，错误打包其 `icuuc.dll`。该库提供带 `_78` 后缀的符号，而 Qt 6.10 需要 Windows 系统 ICU 的无后缀符号，因此冻结程序导入 QtWidgets 时失败。Windows 入口隔离 `PATH` 后，新包不再包含这些外部 ICU DLL，启动检查通过。兼容处理仅作用于本次构建进程，结束时恢复原环境与函数，不修改已安装的 PyInstaller。
+
+瘦身前的构建验证结果：内嵌版本 `1.2.2` 与默认 WSS 地址正确，PE 校验和匹配，附加 PKG 与组装前文件逐字节一致，319 个归档条目可完整读取，`--help` 启动退出码为 `0`。组装目录、项目 `dist` 与 `F:\beam-build` 的 EXE 均为 86,696,276 字节，SHA-256 为 `0bf3db71dca99742fa95f84678a0f487c27189d0bde150ab9b56bf0dd29046cf`。这是本地重新构建的产物；已有 GitHub `v1.2.2` 发布归档仍保留在 `F:\beam-build\release-v1.2.2`。
+
+### Windows 包瘦身（2026-10-01）
+
+使用同一 F 盘工具链重建，EXE 从 **86,696,276 字节（82.68 MiB）缩小到 72,934,836 字节（69.56 MiB）**，减少 **15.87%**。该本地 `1.2.2` 瘦身试包的 SHA-256 为 `6482986fe1167db6ad90f80904cf3e04000c7dc220890acbd042c267f71b2133`；下方 `1.2.3` 发布验收记录为最终包信息。瘦身前的本地包保留在 `F:\beam-build\local-build\before-slimming`。
+
+`build.py` 默认启用 `build_hooks` 内的 Qt 收集规则，仍使用 PyInstaller 的 Qt 依赖分析，收集后只裁剪本项目没有使用的资源：
+
+- 软件 OpenGL 库 `opengl32sw.dll`。界面只使用普通 Qt Widgets、QPainter 和 QPixmap，没有 QOpenGL 或 Qt Quick；Qt Widgets 使用软件光栅绘制，见 [Qt 图形说明](https://doc.qt.io/qt-6/topics-graphics.html)。
+- PDF 图片解码插件和未使用的 TUIO 网络输入插件，避免连带打包 Qt6Pdf、Qt6Network。PDF 仍作为文件发送，并由系统默认程序打开；普通 Windows 鼠标、键盘与触屏平台插件保留。
+- 中英文以外的 Qt 翻译，以及 NumPy 测试和 Fortran 构建模块。Qt 核心、常用图片格式、语音所需 NumPy 和 PortAudio 均保留。
+
+FFmpeg、PyAV、aiortc 及 NumPy 的 OpenBLAS 未直接删减：原生 DLL 存在直接链接依赖，删除所谓“未使用”的编码器 DLL 会使整套媒体库加载失败。聊天、语音、图片、视频文件与 WebRTC 文件传输的应用代码没有改动，91 个关键原生依赖与瘦身前包逐字节相同。新包的 203 个归档条目全部可读取，PE 校验和及 `--help` 启动检查通过。
+
+
+瘦身后使用 `verify_package_runtime.py` 提取本次可信构建的依赖，在同一 F 盘 Python 的 `-I -S` 子进程中验证，禁止第三方包回退到工具链的 site-packages：
+
+```powershell
+& 'F:\beam-build\toolchain\python311\python.exe' -B .\verify_package_runtime.py 'F:\beam-build\BeamChat.exe'
+```
+
+2026-10-01 的隔离验证退出码为 `0`：QWidget/QPainter/QPixmap 光栅绘制，PNG/JPEG/GIF/WebP/TIFF 实际解析，NumPy 语音 PCM 转换、PyAV 音频帧及 Fernet 加密均通过。两端只使用 `127.0.0.1`、不配置 STUN/TURN 的 WebRTC DataChannel 完成消息传输。它验证包内依赖，不替代 EXE 引导器检查；引导器由构建时的 `--help` 检查覆盖。未启动实际麦克风或连接生产服务。
+
+验证临时文件位于 `F:\beam-build\tmp`，成功后清理本次提取目录，JSON 结果保留在 `F:\beam-build\tmp\beam-package-runtime-report.json`。体积与保留依赖对照位于 `F:\beam-build\local-build\slimming-report.json`。构建相关的 32 项回归测试已通过。
+### v1.2.3 发布包与在线更新验收（2026-10-01）
+
+最终包内嵌 `version.__version__` 与 `protocol.CLIENT_VERSION` 均为 `1.2.3`，默认 WSS 地址保持不变，协议版本仍为 `5`。本次只发布客户端；服务端不依据客户端补丁版本拒绝连接，无需重启 VPS。
+
+| 项目 | 验收结果 |
+|---|---|
+| EXE 大小 | 72,934,583 字节（69.56 MiB） |
+| SHA-256 | `a19a8551eab9e8f9be5aaa44ba83981d6a263af18dae8ca5c6ecbaf5c146ad52` |
+| 本地发布归档 | `F:\beam-build\release-v1.2.3\BeamChat.exe` 与相邻 `.sha256` |
+| 构建与版本、更新器、发布流程、协议测试 | 71 项通过 |
+| EXE 启动与内嵌版本、WSS 地址、摘要检查 | 通过 |
+| 包内 Qt、图片、语音 PCM、PyAV、Fernet、本机 WebRTC 验证 | 通过 |
+
+与 GitHub 已发布的 `v1.2.2`（84,455,656 字节）相比，最终包减少约 **13.6%**。瘦身前后本地 `1.2.2` 的 15.87% 对比仅用于构建优化记录。
+
+启动时的更新检测改为通过 Qt 信号把结果派发到界面线程，解决新版本自动更新横幅的回调问题。该修复随 `1.2.3` 生效；现有 `1.2.2` 用户通过 **设置 → 检查更新 → 立即更新** 升级。
+
+更新器读取 `https://api.github.com/repos/pikechu/p2pchat/releases/latest`，只接受版本号更高且同时包含 `BeamChat.exe` 和 `BeamChat.exe.sha256` 的正式 Release，下载后验证长度和 SHA-256，再允许安装。检查结果缓存 10 分钟。
+
+发布步骤为：合并已评审的源码，按合并提交创建 `v1.2.3` 草稿 Release，上传本地验收过的 EXE 和摘要，核对资产后发布并设为 latest。标签构建仍保存 Actions 产物；工作流在发布前检查已有正式或草稿 Release，发现同标签时跳过上传，避免覆盖本地验收包。API 查询异常会使流程失败，不能当作“不存在”继续发布。
+
+验证范围：隔离依赖验证未使用麦克风或生产 WebRTC；冻结引导器由 `--help` 启动检查覆盖。远程发布后还需使用旧版本更新器验证公开 latest 检测、下载及摘要，不在维护环境替换用户正在运行的客户端。

@@ -14,7 +14,7 @@ import time
 import uuid
 
 PROTOCOL_VERSION = 5
-CLIENT_VERSION = "1.2.2"
+CLIENT_VERSION = "1.2.3"
 BASE_CAPABILITIES = [
     "authenticated_key_exchange",
     "encrypted_files",

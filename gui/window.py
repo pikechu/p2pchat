@@ -1696,6 +1696,7 @@ class FilesPanel(QWidget):
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    _update_found = pyqtSignal(str, str)
     _webrtc_received = pyqtSignal(object, dict)
     _webrtc_sent = pyqtSignal(object, dict)
     _webrtc_progress = pyqtSignal(dict)
@@ -1707,6 +1708,7 @@ class MainWindow(QMainWindow):
                  username: str = "", theme: str = "light",
                  allow_custom_server: bool = True):
         super().__init__()
+        self._update_found.connect(self._on_update_found)
         self._webrtc_received.connect(self._on_webrtc_file_received)
         self._webrtc_sent.connect(self._on_webrtc_file_sent)
         self._webrtc_progress.connect(self._on_webrtc_file_progress)
@@ -4609,13 +4611,18 @@ class MainWindow(QMainWindow):
                 from updater import check_update
                 ver, url, _ = check_update()
                 if ver and url:
-                    self._update_available_ver = ver
-                    self._update_available_url = url
-                    # Marshal back to GUI thread
-                    QTimer.singleShot(0, lambda: self._show_update_bar(ver))
+                    # QObject 信号将结果排入界面线程，工作线程无需 Qt 事件循环。
+                    self._update_found.emit(ver, url)
             except Exception:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
+
+    @pyqtSlot(str, str)
+    def _on_update_found(self, ver: str, url: str):
+        """在界面线程保存下载地址并显示新版本通知。"""
+        self._update_available_ver = ver
+        self._update_available_url = url
+        self._show_update_bar(ver)
 
     def _show_update_bar(self, ver: str):
         from version import __version__

@@ -50,11 +50,22 @@ jobs:
       - name: 写入版本文件
         shell: python
         run: |
-          import os, re
-          tag = os.environ["RELEASE_TAG"]
-          ver = tag.lstrip("v")
-          with open("version.py", "w") as f:
-              f.write(f'__version__ = "{ver}"\n')
+          import os
+          import re
+          from pathlib import Path
+
+          ver = os.environ["RELEASE_VERSION"]
+          protocol_path = Path("protocol.py")
+          protocol, count = re.subn(
+              r'^CLIENT_VERSION = [^\n]+$',
+              f'CLIENT_VERSION = "{ver}"',
+              protocol_path.read_text(encoding="utf-8"),
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise RuntimeError("protocol.py 必须包含唯一的 CLIENT_VERSION 声明")
+          protocol_path.write_text(protocol, encoding="utf-8")
+          Path("version.py").write_text(f'__version__ = "{ver}"\n', encoding="utf-8")
 
       - name: 构建 EXE
         shell: pwsh
@@ -85,7 +96,69 @@ jobs:
             dist/BeamChat.exe.sha256
           if-no-files-found: error
 
+      - name: 检查是否已有发布或草稿
+        id: existing_release
+        shell: python
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import json
+          import os
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          api_url = os.environ["GITHUB_API_URL"].rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["RELEASE_TAG"]
+          base_url = f"{api_url}/repos/{repository}/releases"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f'Bearer {os.environ["GITHUB_TOKEN"]}',
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          not_found = object()
+
+          def get_json(url, allow_missing=False):
+              try:
+                  with urlopen(Request(url, headers=headers), timeout=30) as response:
+                      return json.load(response)
+              except HTTPError as exc:
+                  if allow_missing and exc.code == 404:
+                      return not_found
+                  raise RuntimeError(f"检查 Release 失败：GitHub API HTTP {exc.code}") from None
+              except URLError:
+                  raise RuntimeError("检查 Release 失败：无法连接 GitHub API") from None
+
+          release = get_json(f"{base_url}/tags/{quote(tag, safe='')}", allow_missing=True)
+          exists = release is not not_found
+          if exists:
+              if not isinstance(release, dict) or release.get("tag_name") != tag:
+                  raise RuntimeError("检查 Release 失败：标签查询返回的数据不完整")
+          else:
+              # 按标签查询只保证返回已发布版本；有写入权限的列表查询同时包含草稿。
+              page = 1
+              while True:
+                  releases = get_json(f"{base_url}?per_page=100&page={page}")
+                  if not isinstance(releases, list) or any(
+                      not isinstance(item, dict) or not isinstance(item.get("tag_name"), str)
+                      for item in releases
+                  ):
+                      raise RuntimeError("检查 Release 失败：发布列表返回的数据不完整")
+                  if any(item["tag_name"] == tag for item in releases):
+                      exists = True
+                      break
+                  if len(releases) < 100:
+                      break
+                  page += 1
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"exists={str(exists).lower()}\n")
+          if exists:
+              print(f"{tag} 已有发布或草稿，保留现有资产并跳过自动发布。")
+
       - name: 创建 GitHub Release 并上传 EXE
+        if: ${{ steps.existing_release.outputs.exists == 'false' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -93,7 +166,7 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
-          overwrite_files: true
+          overwrite_files: false
           fail_on_unmatched_files: true
           files: |
             dist/BeamChat.exe
